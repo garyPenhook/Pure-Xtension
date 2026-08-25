@@ -78,6 +78,7 @@ export class PureBasicDebugSession extends DebugSession {
     // No dedicated step opcode confirmed yet (PLAN.md M5 "still open" list) —
     // only run/continue is exposed until one is found.
     response.body.supportsStepInTargetsRequest = false;
+    response.body.supportsEvaluateForHovers = true;
     this.sendResponse(response);
     this.sendEvent(new InitializedEvent());
   }
@@ -215,6 +216,24 @@ export class PureBasicDebugSession extends DebugSession {
     response.body = {
       variables: vars.map((v) => new Variable(v.name, v.value)),
     };
+    this.sendResponse(response);
+  }
+
+  protected async evaluateRequest(
+    response: DebugProtocol.EvaluateResponse,
+    args: DebugProtocol.EvaluateArguments,
+  ): Promise<void> {
+    // frameId isn't threaded through here yet — every evaluate runs against
+    // the currently-stopped line (frameContext -1), the only case PLAN.md's
+    // M5 spike live-tested. Evaluating in an outer frame's context is an
+    // open question, not a confirmed capability, so it's not wired up as
+    // if it were.
+    const result = await this.pb.evaluate(args.expression);
+    if (result.kind === 0) {
+      this.sendErrorResponse(response, 1004, result.error ?? "evaluate failed");
+      return;
+    }
+    response.body = { result: result.value ?? "", variablesReference: 0 };
     this.sendResponse(response);
   }
 

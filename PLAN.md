@@ -45,9 +45,22 @@ help, IntelliSense, build/run tasks, and a native debugger bridge.**
   live-tested, but blocked on an unexplained `ModifyVariable` failure that
   needs a gdb trace to resolve, not more static reading. Opcode `8` was
   ruled out as an evaluator — it's the memory-inspector's address/length
-  field, live-confirmed by its own error message. Next: wire `pbDebugAdapter.ts`'s
-  `evaluateRequest` up to opcodes `33`/`34` now that they're confirmed;
-  gdb-trace `ModifyVariable`'s failure to unblock `setVariable`; then
+  field, live-confirmed by its own error message. **`pbDebugAdapter.ts`'s
+  `evaluateRequest` is now wired to opcode `33`**
+  (`PbDebugSession.evaluate()` in `src/debug/pbSession.ts`), and doing so
+  surfaced a real wire-framing bug the single-shot spike script never hit:
+  the request's `len` header field must count the **full byte length sent,
+  including the NUL terminator** — sending `len = expression.length`
+  (excluding the NUL, the throwaway spike's convention) leaves one stray
+  byte unread in the FIFO after a successful reply, which silently shifts
+  and hangs the *next* request's header framing. Invisible with one
+  evaluate per process (each spike run was a fresh connection), but fatal
+  the moment a session issues two evaluates in a row — exactly what a real
+  debug session does. Fixed and live-verified with three sequential
+  evaluates on one connection: `a` → `5`, `a+b` → `15` (real expression
+  parsing, not bare lookup), `nosuchvar` → the target's own `"Variable not
+  found: 'nosuchvar'."` (routed to `sendErrorResponse`, not a result body).
+  Next: gdb-trace `ModifyVariable`'s failure to unblock `setVariable`; then
   compound-value expansion once a DAP `variables` request actually needs
   to expand one.
 - Target VS Code engine: `^1.85.0` (matches the existing help-viewer prototype)
@@ -1534,6 +1547,34 @@ Pure_Xtension/
     `evaluate` request (watch expressions, hover, and the Debug Console's
     REPL) needs**, and the wire format is now fully known for the
     scalar case.
+  - **2026-08-25: wired into `pbDebugAdapter.ts`'s `evaluateRequest`, and
+    that live-testing surfaced a real wire-framing bug the original
+    single-request spike script never hit.** The request header's `len`
+    field must equal the **full byte count actually written to the FIFO,
+    including the NUL terminator** — `src/debug/spike/fifo-expression.mjs`'s
+    `sendExpressionOp` (and the first pass of `PbDebugSession.evaluate()`
+    that copied its convention) sends `len = expression.length`, excluding
+    the NUL. The comm thread reads exactly `len` payload bytes per message
+    before dispatching (confirmed by `strace -f` on the target: after a
+    successful `"a"` reply, the comm thread's next `read()` sat blocked
+    forever, because the stray unread NUL byte from the previous
+    request's payload became a spurious 1-byte prefix on the *next*
+    request's 20-byte header). A single evaluate per connection never
+    exposes this — every spike run was a fresh process — but a real debug
+    session issuing more than one `evaluate` on the same connection would
+    hang on the second call. Fixed in `PbDebugSession.evaluate()`
+    (`len = payload.length`, i.e. `expression.length + 1`) and
+    live-verified with three sequential evaluates on one connection:
+    `"a"` → `5`, `"a+b"` → `15` (confirms the earlier single-shot
+    expression-parsing result still holds), `"nosuchvar"` → the target's
+    own `"Variable not found: 'nosuchvar'."` error string, routed through
+    `sendErrorResponse` rather than a result body. **Open lead this raises
+    for opcode `35`:** its own two-string payload framing (`target="a"`
+    NUL `value="99"` NUL) was never re-checked against this same
+    "`len` must be the full sent byte count" rule — it's plausible the
+    `"Missing a value to assign."` failure documented below is this exact
+    off-by-the-terminator bug rather than a genuine target-side issue, and
+    should be re-tried with a corrected `len` before reaching for gdb.
   - **Opcode `35` (modify/write) is decoded to the instruction level but
     *not yet working live* — a real target-side failure, not (yet) a
     framing bug on our side.** Statically: it expects the payload to hold
@@ -1684,12 +1725,21 @@ Pure_Xtension/
    `33`/`34`) has since been decoded and live-tested too** (see the dated
    entry at the end of the M5 section above,
    `src/debug/spike/fifo-expression.mjs`) — full expression parsing with a
-   confirmed reply wire format, ready to wire into `evaluateRequest`. Its
-   write side (opcode `35`) is decoded but not yet working live —
-   `ModifyVariable` fails with an unexplained message even with correctly
-   laid-out operands; needs a gdb trace, not more guessing. Opcode `8`
-   turned out to be the memory-inspector's address/length field, not an
-   evaluator — ruled out for this purpose.
+   confirmed reply wire format. **It's now wired into `evaluateRequest`**
+   (`PbDebugSession.evaluate()` in `src/debug/pbSession.ts`), which in
+   turn surfaced and fixed a real `len`-header framing bug that only shows
+   up across two sequential requests on one connection (see the
+   2026-08-25 dated entry in the M5 section above for the full
+   root-cause trail) — live-verified with three evaluates in a row on one
+   session (`a` → `5`, `a+b` → `15`, `nosuchvar` → the target's own error
+   string). Its write side (opcode `35`) is decoded but not yet working
+   live — `ModifyVariable` fails with an unexplained message even with
+   correctly laid-out operands. **New lead, not yet tried:** the same
+   `len`-must-include-every-terminator framing bug just found and fixed
+   for opcode `33` was never re-checked against opcode `35`'s two-string
+   payload — worth a quick retry with a corrected `len` before reaching
+   for a gdb trace. Opcode `8` turned out to be the memory-inspector's
+   address/length field, not an evaluator — ruled out for this purpose.
 2. Full in-editor GUI smoke test (M1–M4 features) is still pending a working
    X display in this sandbox — flag to the user to manually verify in a real
    VS Code session before any marketplace publish. **The new debug adapter
@@ -1698,14 +1748,16 @@ Pure_Xtension/
    Run-and-Debug-view session through VS Code's UI is unverified.
 3. Confirm scope/priorities (esp. whether the debugger or a Form Designer is
    in the 1.0 cut) before M5/M6.
-4. Next debugger work, roughly in cost order: (a) wire `pbDebugAdapter.ts`'s
-   `evaluateRequest` up to opcodes `33`/`34`, now confirmed and ready; (b)
-   gdb-trace `PB_DEBUGGER_ModifyVariable` to find why opcode `35` fails
-   with correctly-parsed operands, to unblock `setVariable`/
-   `setExpression`; (c) live-test array/list/map/structure expansion so
-   `variablesRequest` can return non-zero `variablesReference`s for
-   compound values; (d) find/confirm a clean disconnect opcode instead of
-   the FIFO-close-and-kill fallback.
+4. Next debugger work, roughly in cost order: (a) **done** —
+   `pbDebugAdapter.ts`'s `evaluateRequest` is wired to opcode `33`, which
+   also found and fixed a real `len`-header framing bug (see item 1's
+   2026-08-25 note); (b) retry opcode `35` with the same `len`-including-
+   terminators fix before reaching for a gdb trace on
+   `PB_DEBUGGER_ModifyVariable` — new lead, not yet tried, to unblock
+   `setVariable`/`setExpression`; (c) live-test array/list/map/structure
+   expansion so `variablesRequest` can return non-zero
+   `variablesReference`s for compound values; (d) find/confirm a clean
+   disconnect opcode instead of the FIFO-close-and-kill fallback.
    (Finding a real step opcode via `Control` opcode `2`'s nonzero
    sub-command is done — live-tested and ruled out; no further lead is
    known, see item 1 above.)

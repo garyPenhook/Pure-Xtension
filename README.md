@@ -6,10 +6,11 @@ inline diagnostics, and deep links into PureBasic's live online documentation.
 
 > Status: language support, IntelliSense, build/diagnostics, and help
 > integration are implemented and usable. A first debugger integration
-> (launch, breakpoints, continue, call stack, locals via VS Code's Debug
-> Adapter Protocol) is implemented but not yet verified in a real VS Code
-> session; stepping, watch expressions, and compound-value inspection are
-> not yet implemented — see [Debugger support](#debugger-support-in-progress)
+> (launch, breakpoints, continue, call stack, locals, and read-only watch/
+> hover expressions via VS Code's Debug Adapter Protocol) is implemented
+> but not yet verified in a real VS Code session; stepping, writing to
+> variables via watch/hover, and compound-value inspection are not yet
+> implemented — see [Debugger support](#debugger-support-in-progress)
 > below.
 
 ## Features
@@ -114,12 +115,18 @@ is not yet manually verified (same X-display limitation noted above for the
 language-support features). Not yet implemented: stepping (the one known
 lead — the continue opcode's nonzero sub-command — was live-tested and
 ruled out; no dedicated step opcode is known to exist), watch/`evaluate`
-expressions (the read side is now decoded and live-tested — full
-expression parsing with a confirmed wire format, not yet wired into the
-adapter; the write side, for `setVariable`, is decoded but blocked on an
-unexplained target-side failure), and array/list/map/structure value
-expansion. Throwaway protocol-spike clients remain in `src/debug/spike/`
-for anyone following along or picking up that remaining work.
+expressions for writes (`setVariable`/`setExpression` — the write-side
+opcode is decoded but blocked on an unexplained target-side failure), and
+array/list/map/structure value expansion. The **read side of `evaluate`**
+(hover, watch, and Debug Console expressions) is implemented and
+live-tested: wiring it up surfaced a real wire-framing bug (a request
+header's `len` field must count every byte sent, including string NUL
+terminators, or the next request on the same connection hangs) that a
+single-shot test script never exposed — fixed and verified with several
+expressions evaluated in a row on one live session, including full
+arithmetic (`a+b`) and the target's own error text for an unknown name.
+Throwaway protocol-spike clients remain in `src/debug/spike/` for anyone
+following along or picking up the remaining work.
 
 ## Development
 
