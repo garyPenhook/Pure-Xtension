@@ -2098,3 +2098,39 @@ Pure_Xtension/
    and setVariable; only stepping (confirmed absent from the protocol) and
    the real-VS-Code-UI verification (item 2 above) remain outstanding, and
    neither is a decoding gap.
+
+5. **2026-08-25 — `LinkedList<String>`'s "unsupported" element gap (item 4c
+   above) has been root-caused, not just decoded further.** Disassembling
+   `ExternalDebugger_SendListData` (`debugger.a`'s `ExternalDebugger.o`,
+   `+0x4f10`) shows it writes each element's 8-byte sequence-number field
+   itself, then delegates the actual value to a shared `CopyValue` helper
+   (`+0x960`) keyed off a type tag. `CopyValue`'s real String case (`+0xa50`)
+   does copy genuine characters — but for a `NewList x.s()` element,
+   whatever type tag `SendListData` passes takes `CopyValue`'s default
+   single-byte fallback (`+0x9f0`) instead, so the wire *never* carries the
+   string text for this opcode; live bytes for a 2-element `names.s()` list
+   confirm it (8-byte sequence number + 1 always-zero byte per element,
+   9 bytes/element, matching the previously-unparsed "18 bytes for 2
+   elements" observation exactly). This is a mistagged-type bug in the
+   target's own debugger runtime, not a gap in this project's decoding —
+   `ExternalDebugger_Variables`'s string handling is a separate code path
+   and unaffected. Found a confirmed, live-tested workaround, though only a
+   partial one: `PbDebugSession.evaluate("<name>()")` (Expression opcode
+   `33`, reply kind `4`, itself newly decoded and live-tested here for the
+   first time — a NUL-terminated value string followed by the echoed
+   expression, e.g. payload `"beta\0names()\0"` for this exact fixture) does
+   return the list's real *current* element text, since it isn't on
+   `SendListData`'s buggy path. It cannot enumerate every element by index
+   the way the numeric-list case does, though: the expression evaluator only
+   recognizes bare variable/array/list/map names, not function calls
+   (`SelectElement(...)`, `FirstElement(...)`, `ListSize(...)` were all
+   live-tried against this session and rejected with "Array() / LinkedList()
+   / Map() not found: '<name>'", confirming there's no way to move a list's
+   cursor through this protocol at all). `pbDebugAdapter.ts`'s
+   `variablesRequest` now surfaces both facts plainly for a `List<String>`
+   expansion: an explicit "per-element text not available (target debugger
+   bug)" marker plus a `<current element>` entry from the evaluate
+   fallback, rather than a bare "unsupported" dead end. See
+   `src/debug/pbSession.ts`'s `parseListElements` comment for the full
+   disassembly trail and `src/debug/spike/fifo-liststring-probe.mjs` for
+   the live test that produced the confirming bytes.

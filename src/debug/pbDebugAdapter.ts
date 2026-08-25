@@ -267,10 +267,20 @@ export class PureBasicDebugSession extends DebugSession {
       } else if (result.kind === "map") {
         variables = result.elements.map((e) => new Variable(e.key, e.value));
       } else if (result.kind === "unsupported") {
-        // Confirmed live only for List<String> so far (PLAN.md M5) — the
-        // element wire format wasn't decoded, so this surfaces the gap
-        // instead of guessing at a layout.
-        variables = [new Variable("<unsupported>", `element format not decoded (${result.raw.length} raw bytes)`)];
+        // Confirmed live only for List<String> so far (PLAN.md M5): the
+        // target's own SendListData mistags string elements' type and never
+        // puts the text on the wire (see parseListElements in pbSession.ts
+        // for the full root-cause trail) — this is a target-engine bug, not
+        // an undecoded format, and there's no way to recover every
+        // element's text from this opcode. The Expression evaluator (opcode
+        // 33) doesn't have that bug and can read the list's *current*
+        // element, so that's surfaced here as a labeled best-effort
+        // fallback instead of leaving this dead-ended.
+        variables = [new Variable("<unsupported>", `per-element text not available (target debugger bug, ${result.raw.length} raw bytes)`)];
+        const current = await this.pb.evaluate(handle.expression);
+        if (current.kind === 4 && current.value !== undefined) {
+          variables.push(new Variable("<current element>", current.value));
+        }
       } else {
         variables = [new Variable("<error>", result.message)];
       }

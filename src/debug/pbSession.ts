@@ -116,17 +116,22 @@ export interface PbEvaluateResult {
   kind: number;
   /** Set when kind is 0. */
   error?: string;
-  /** Set when kind is 1-3; only the raw little-endian int64 reading has been live-confirmed so far. */
+  /** Set when kind is 1-3 (raw little-endian int64) or 4 (string text). */
   value?: string;
 }
 
 // Reply format for opcodes 33/34 (PLAN.md M5, "Expression's read side"),
-// live-confirmed for the numeric case only (kind 1-3): 8-byte little-endian
-// raw value followed by the echoed expression text (payload-length bytes,
-// no null terminator). Kind 0 (error) is the PB_Language_GetKey error
-// string, NUL-terminated, followed by the echoed expression text. Kinds 4
-// (string) and 5 (structure) are decoded from the disassembly but not
-// live-tested, so they're surfaced as unsupported rather than guessed at.
+// live-confirmed for the numeric case (kind 1-3): 8-byte little-endian raw
+// value followed by the echoed expression text (payload-length bytes, no
+// null terminator). Kind 0 (error) is the PB_Language_GetKey error string,
+// NUL-terminated, followed by the echoed expression text. Kind 4 (string)
+// is now live-confirmed too — a NUL-terminated value string followed by the
+// echoed expression text (e.g. evaluating a List<String>'s bare `name()`
+// returns its *current* element this way, live-tested against
+// src/debug/spike/test-arrays.pb's `names()`: payload
+// `"beta\0names()\0"`). Kind 5 (structure) is still only decoded from the
+// disassembly, not live-tested, so it's surfaced as unsupported rather than
+// guessed at.
 function parseEvaluateReply(msg: PbMessage): PbEvaluateResult {
   if (msg.f12 === 0) {
     const nul = msg.payload.indexOf(0);
@@ -137,7 +142,12 @@ function parseEvaluateReply(msg: PbMessage): PbEvaluateResult {
     const value = msg.payload.readBigInt64LE(0).toString();
     return { kind: msg.f12, value };
   }
-  return { kind: msg.f12, error: `unsupported evaluate result kind ${msg.f12} (string/structure results are not decoded yet)` };
+  if (msg.f12 === 4) {
+    const nul = msg.payload.indexOf(0);
+    const value = nul === -1 ? msg.payload.toString("latin1") : msg.payload.toString("latin1", 0, nul);
+    return { kind: 4, value };
+  }
+  return { kind: msg.f12, error: `unsupported evaluate result kind ${msg.f12} (structure results are not decoded yet)` };
 }
 
 function parseFrames(payload: Buffer): PbFrame[] {
@@ -332,11 +342,27 @@ function parseMapElements(payload: Buffer): { name: string; elements: PbMapEleme
 // Opcode-15 List-data reply (type 0x13, the SAME tag SendListData uses for
 // its own generic error replies -- see the caller for the disambiguation
 // this requires): `<echoed expr>\0` + repeated (int64 LE index + int64 LE
-// value), 16 bytes/element. Confirmed ONLY for a numeric (.i) element type
-// -- a string-element list's reply is too short to hold real text (18
-// bytes total for a 2-element list, not a multiple of 16), so that case
-// isn't parsed as elements at all; the caller falls back to reporting it
-// as unsupported rather than guessing at a layout.
+// value), 16 bytes/element. Confirmed ONLY for a numeric (.i) element type.
+//
+// A string-element list's reply is 9 bytes/element instead (18 bytes total
+// for 2 elements): an 8-byte LE sequence number identical in shape to the
+// numeric case's index, plus a single trailing byte that's always 0 for
+// real "alpha"/"beta" strings in a live test. Disassembling
+// ExternalDebugger_SendListData (debugger.a, ExternalDebugger.o+0x4f10)
+// confirms why: it writes that 8-byte field itself, then delegates the
+// *value* to a shared `CopyValue` helper (ExternalDebugger.o+0x960) keyed
+// off a type tag. CopyValue's String case (+0xa50) does copy real
+// characters -- but for a `NewList x.s()`'s element, whatever type tag
+// SendListData actually passes takes CopyValue's default single-byte
+// fallback path (+0x9f0: `*dest = *src as byte; return 1`) instead, so the
+// wire genuinely never carries the string text; this is not a decoding
+// gap, it's a mistagged-type bug in the target's own debugger runtime.
+// (`ExternalDebugger_Variables`'s string handling is a separate code path
+// and isn't affected -- only this list-element helper is.) Confirmed
+// workaround: `PbDebugSession.evaluate("<name>()")` (Expression opcode 33,
+// kind 4) DOES return the list's real *current* element text -- live
+// output `"beta\0names()\0"` for this exact fixture -- so a per-index dump
+// isn't recoverable this way, but the current element is.
 function parseListElements(payload: Buffer, elementCount: number): { name: string; elements: PbListElement[] } | undefined {
   const nul = payload.indexOf(0);
   if (nul === -1) return undefined;
