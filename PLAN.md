@@ -3,7 +3,7 @@
 **A full-featured VS Code language extension for PureBasic with deeply integrated
 help, IntelliSense, build/run tasks, and a native debugger bridge.**
 
-- Status: M2 complete (build & diagnostics); M3 (language server IntelliSense) next
+- Status: M2 complete (build & diagnostics); M3 (language server IntelliSense) in progress
 - Target VS Code engine: `^1.85.0` (matches the existing help-viewer prototype)
 - Reference PureBasic install: `/home/gary/Apps/purebasic-v6.41` (v6.41, Linux x64)
 - Language: TypeScript (extension host) + a small Language Server (Node)
@@ -330,9 +330,45 @@ Pure_Xtension/
   limitation noted under M1). Full in-editor GUI smoke test still pending a
   working display.
 
-**M3 — Language Server IntelliSense (0.4)**
-- Symbol DB from `-lf/-ls/-li`; completion, signature help, hover, document
-  symbols, go-to-definition across includes.
+**M3 — Language Server IntelliSense (0.4)** 🚧 in progress
+- `server/`: separate `vscode-languageserver` process, bundled by esbuild to
+  `dist/server.js` and started over IPC via `vscode-languageclient` from
+  `src/client.ts`. Wired into `extension.ts` activation and into
+  `pureXtension.selectBackend`/backend config-change so the client
+  (re)starts once a compiler backend is resolved.
+- `server/src/dumpParsers.ts`: pure parsers for the `-lf`/`-ls`/`-li`/`-qs`
+  dump formats — verified against real `pbcompiler 6.41` output, not
+  guessed. Notable quirks the parser had to handle: `-lf`/`-ls`/`-li` write
+  to the file given by `-o`, not an argument of their own; some function
+  entries have no ` - description` at all (e.g. `AddSplinePoint`); param
+  lists can contain their own nested empty parens (`List()`,
+  `@Callback()`), which needs a depth-aware scan rather than a
+  first-`)`-wins regex.
+- `server/src/builtinIndex.ts`: builds the built-in symbol index by running
+  the resolved compiler once against a stub source, caches it to
+  `globalStorage` keyed by `pbcompiler -v` output (note: `-v` exits with
+  status 1 despite succeeding — verified, not assumed), and reloads from
+  cache on matching version. `pureXtension.rebuildSymbolCache` command
+  forces a rebuild.
+- `server/src/workspaceSymbols.ts`: regex/line-based extraction of
+  user-defined `Procedure`/`Structure`/`Interface`/`Macro`/`#Constant` from
+  a single document — verified against `examples/sources/*.pb`.
+- Providers wired: `completion` (built-ins + current-document symbols),
+  `hover`, `documentSymbol`, `definition` (current document only).
+- Verified: `tsc --noEmit` clean for both `tsconfig.json` and
+  `server/tsconfig.json`; esbuild bundles both entry points; parsers
+  smoke-tested against real `pbcompiler -lf/-ls/-qs` dumps (1823/571
+  entries, all edge cases above) and real example sources; `builtinIndex`
+  round-tripped through a real build + disk-cache load. Self-review caught
+  and fixed an out-of-spec LSP `uinteger` (`Number.MAX_SAFE_INTEGER` used
+  as a character offset) and an unguarded `client.start()` that could leave
+  the client in a half-started state on failure.
+- Remaining for M3: `signatureHelp`, `rename`, `references`, cross-file
+  symbol resolution via the `IncludeFile`/`XIncludeFile` graph, structure
+  field completion (via the already-parsed but not-yet-wired `-qs` field
+  data), and `-sb` standby-mode investigation for faster incremental
+  rebuilds. Full in-editor GUI smoke test still pending a working display
+  (same X/pointer limitation as M1/M2).
 
 **M4 — Deep help integration (0.5)** ← headline
 - `pbdocmaker`/`.help` pipeline → topic index; hover docs, `F1` context help, Help

@@ -103,13 +103,26 @@
       {
         "command": "pureXtension.selectBackend",
         "title": "Pure Xtension: Select Compiler Backend"
+      },
+      {
+        "command": "pureXtension.rebuildSymbolCache",
+        "title": "Pure Xtension: Rebuild Symbol Cache"
       }
     ],
     "menus": {
       "commandPalette": [
-        { "command": "pureXtension.build", "when": "editorLangId == purebasic" },
-        { "command": "pureXtension.buildAndRun", "when": "editorLangId == purebasic" },
-        { "command": "pureXtension.checkSyntax", "when": "editorLangId == purebasic" }
+        {
+          "command": "pureXtension.build",
+          "when": "editorLangId == purebasic"
+        },
+        {
+          "command": "pureXtension.buildAndRun",
+          "when": "editorLangId == purebasic"
+        },
+        {
+          "command": "pureXtension.checkSyntax",
+          "when": "editorLangId == purebasic"
+        }
       ]
     },
     "taskDefinitions": [
@@ -118,12 +131,21 @@
         "properties": {
           "mode": {
             "type": "string",
-            "enum": ["build", "buildRun", "check", "buildDebug", "buildConsole"],
+            "enum": [
+              "build",
+              "buildRun",
+              "check",
+              "buildDebug",
+              "buildConsole"
+            ],
             "description": "Which compile action to run."
           },
           "backend": {
             "type": "string",
-            "enum": ["asm", "c"],
+            "enum": [
+              "asm",
+              "c"
+            ],
             "description": "Force a specific compiler backend for this task."
           },
           "file": {
@@ -156,7 +178,7 @@
     ]
   },
   "scripts": {
-    "compile": "tsc --noEmit -p ./ && node esbuild.mjs",
+    "compile": "tsc --noEmit -p ./ && tsc --noEmit -p ./server && node esbuild.mjs",
     "watch": "node esbuild.mjs --watch",
     "package": "vsce package",
     "vscode:prepublish": "node esbuild.mjs --production"
@@ -171,5 +193,10 @@
   "allowScripts": {
     "@vscode/vsce-sign@2.1.0": true,
     "esbuild@0.28.2": true
+  },
+  "dependencies": {
+    "vscode-languageclient": "^10.1.0",
+    "vscode-languageserver": "^10.1.0",
+    "vscode-languageserver-textdocument": "^1.0.13"
   }
 }
