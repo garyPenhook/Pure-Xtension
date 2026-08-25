@@ -610,23 +610,72 @@ Pure_Xtension/
       (`GetProcedureCall`/`Name`/`ID`/`Module`), `IncomingCommand`/
       `CommandStack` with `ByteSwapIncomingCommand`/`ByteSwapOutgoingCommand`
       (binary, byte-order-aware framing after the text handshake).
-  - **Not yet established:** the exact numeric opcode values `IncomingCommand`
-    dispatches on (they're a binary switch in `Debugger.o`/`ExternalDebugger.o`,
-    not string literals — needs deeper disassembly than this pass did), and
-    the exact byte layout of `/tmp/.pbdebugger.out`. Both are well-scoped
-    follow-up spikes, not open-ended unknowns anymore.
-- **Net effect on risk 1 (§8):** downgraded from "biggest unknown" to
-  "known shape, unmapped detail" — there is a real, non-GUI, socket-based
-  external debugger protocol built into every `-d` executable; the DAP
-  adapter's job is to speak the TCP `ServerConnect` handshake ourselves
-  (skip `pbdebugger.exe`/GTK entirely) and finish mapping the binary command
-  opcodes.
-- **Next spike steps:** (1) disassemble `Debugger.o`'s `IncomingCommand`
-  dispatch to enumerate opcode numbers per `PB_DEBUGGER_*` operation: (2)
-  write a throwaway Node/TS prototype that does the `CONNECT %i DEBUGGER`
-  handshake against a real `-d` build and confirms a captured breakpoint
-  hit round-trips; (3) only then start the real `pbDebugAdapter.ts` DAP
-  scaffolding.
+  - **`IncomingCommand` opcode table — mapped (verified against the real
+    `.o`, not guessed):** `ExternalDebugger.o`'s `PB_DEBUGGER_IncomingCommand`
+    (`objdump -d -r` at offset `0x6ca0`) reads one message into a stack
+    buffer, then linear-scans a 40-entry `{opcode:int, handler:funcptr}`
+    table living in `.data.rel.ro` (relocations resolved by cross-referencing
+    `readelf -r .rela.data.rel.ro` against `nm`'s local-symbol table) and
+    calls the matching handler with `(buffer, payload, connection)`. The 40
+    opcodes group into 9 handler functions — the *category* of every opcode
+    0–40 is now known, though the sub-operation within a category isn't
+    (each handler re-decodes that from the payload itself, which needs
+    further per-handler disassembly, not just the dispatch table):
+    - `0,1,2,36` → `ExternalDebugger_Control` (connection/session control)
+    - `3` → `PB_DEBUGGER_ExternalBreakpoints` directly (breakpoint list, not
+      routed through an `ExternalDebugger_*` wrapper)
+    - `4,5,6,7` → `ExternalDebugger_Assembly`
+    - `8,33,34,35` → `ExternalDebugger_Expression` (watch/hover eval)
+    - `9,10,11,17` → `ExternalDebugger_Variables`
+    - `12,13,14,15` → `ExternalDebugger_ArraysLists`
+    - `16,28,29,30,31,32,38,39,40` → `ExternalDebugger_Misc`
+    - `18,19,20` → `ExternalDebugger_Procedures` (call stack)
+    - `21,22,23` → `ExternalDebugger_Watchlist`
+    - `24,25,26,27` → `ExternalDebugger_Libraries`
+    - opcode `37` is absent from the table (not a gap in the extraction —
+      confirmed absent from all 40 entries).
+    No SDK header (`sdk/c/PureLibraries/Debugger/DebuggerModule.h`) exposes
+    these numbers — that header is the target-side library API, not the
+    wire opcodes — so this table only exists from this disassembly.
+  - **`/tmp/.pbdebugger.out` format — decoded (verified via `FifoConnect`
+    disassembly + a real `pbcompiler -d` build, not guessed):** confirmed
+    the file-based rendezvous is FIFO-based, not the TCP path, by default —
+    `strace -f` on a plain `-d` executable run with no rendezvous file
+    present shows **zero** network/socket syscalls (only `[Debugger]`
+    stdout lines), matching the earlier "no plumbing without the handoff
+    file" finding. `FifoConnect` (`hello`'s disassembly, symbol table
+    confirms the name) does `strchr(contents, ';')`, splits the file's
+    contents into two paths on that separator, `fopen64`s the first path
+    `"wb"` (→ `OutStream`, the target-to-debugger direction) and the second
+    `"rb"` (→ `InStream`, debugger-to-target), sets both non-blocking via
+    `fcntl64`, then spawns `ExternalDebugger_CommunicationsThread` on a
+    pthread. So the rendezvous file's contents are simply
+    `<fifo-target-writes-to>;<fifo-target-reads-from>` — two named-pipe
+    paths, semicolon-separated, no length prefix or binary header. The
+    `"[PureBasic Debugger] Warning: ... is too old and will be ignored"`
+    string (found via `strings`) confirms there's an mtime freshness check
+    before this parse even runs. The TCP path (`ServerConnect`/handshake
+    strings documented above) is the *other* transport, selected by
+    `~/.pbdebugger.prefs`, not yet decoded — same file confirmed to exist
+    by name only.
+- **Net effect on risk 1 (§8):** downgraded further — the FIFO rendezvous
+  format is now fully decoded and the opcode-to-handler-category table is
+  extracted from the real binary. Remaining unknowns before a DAP adapter
+  can be built: (a) the per-opcode payload layout within each of the 9
+  handler categories (e.g. which of `18/19/20` is "get call stack" vs "get
+  frame locals"), (b) `~/.pbdebugger.prefs`' format, needed to pick the TCP
+  path instead of FIFO. Both are narrower than before — decoding a handful
+  of payload structs and one prefs file, not an unknown binary protocol.
+- **Next spike steps:** (1) disassemble one handler per category (start
+  with `ExternalDebugger_Control` and `ExternalDebugger_Procedures`, the
+  ones a minimal "launch + breakpoint + continue + stack" adapter needs
+  first) to get payload byte layouts for their opcodes; (2) write a
+  throwaway Node/TS prototype that creates the two FIFOs, writes the
+  rendezvous file to `/tmp/.pbdebugger.out`, launches a real `-d` build, and
+  confirms a captured message round-trips on the decoded opcodes; (3) only
+  then start the real `pbDebugAdapter.ts` DAP scaffolding. (TCP path via
+  `~/.pbdebugger.prefs` remains a fallback/alternative to spike later —
+  FIFO is simpler to prototype from a CLI-launched debug session.)
 - Probe pbdebugger protocol → minimal DAP (launch, breakpoint, continue, stack,
   variables) → full stepping/watch/eval.
 
