@@ -4,9 +4,11 @@
 help, IntelliSense, build/run tasks, and a native debugger bridge.**
 
 - Status: M2, M3, M4 (deep help integration) complete. M5 (debugger) protocol
-  spike well underway — wire opcodes mapped, FIFO transport decoded, and a
-  real multi-frame call-stack opcode found (opcode 16); DAP scaffolding
-  (`pbDebugAdapter.ts`) not started yet.
+  spike well underway — wire opcodes mapped, FIFO transport confirmed
+  working end to end with a real throwaway client
+  (`src/debug/spike/fifo-client.mjs`); the multi-frame call-stack opcode
+  (16) is decoded but its live behavior (why it reads back empty) is still
+  an open question. DAP scaffolding (`pbDebugAdapter.ts`) not started yet.
 - Target VS Code engine: `^1.85.0` (matches the existing help-viewer prototype)
 - Reference PureBasic install: `/home/gary/Apps/purebasic-v6.41` (v6.41, Linux x64)
 - Language: TypeScript (extension host) + a small Language Server (Node)
@@ -769,6 +771,96 @@ Pure_Xtension/
         "synthetic single-frame `stackTrace`" fallback as the default plan;
         pending only the `record+0x10` field check above, a GDB-style
         multi-frame adapter is back on the table.
+      - **Live wire test — connection setup and framing confirmed end to
+        end; opcode `16`'s data content still unconfirmed.** Ran a real
+        throwaway Node client (`src/debug/spike/fifo-client.mjs`, kept as
+        the M5 spike's throwaway prototype — see next-spike-steps item 2)
+        against a real `pbcompiler -e ./test.bin -d test.pb` build with two
+        nested procedure calls (`Outer` → `Inner`, blocked in a `Delay`
+        mid-call so there was something to inspect). Findings:
+        - **The real connection setup is far simpler than the on-disk
+          `/tmp/.pbdebugger.out` file this section previously described,
+          and that file's format claim needs correcting.** Decoding
+          `PB_DEBUGGER_InitExternal` (`ExternalDebugger.o`) shows the file
+          is only a *fallback* checked after two other paths: `argv` flags
+          (`--debuglisten`, `--debuglisten=`, `--debugconnect=`,
+          `--password=`, scanned via `PB_ArgC`/`PB_ArgV`) and an
+          environment variable, `PB_DEBUGGER_Communication`
+          (string literal confirmed at `.rodata.str1.1+0x1a8`), checked
+          *first* via `getenv`. Its value has the same shape the on-disk
+          file's inner line does: `<PluginName>;<connect-string>`, split on
+          the first `;`, where `PluginName` is matched against 4 exported
+          plugin-descriptor globals (`.data.rel.local` in
+          `UnixPipeCommunication.o`/`NetworkCommunication.o`, each
+          `{name, flags, Connect, Send, Receive, Close}`, confirmed by
+          resolving relocations rather than guessing) whose *actual* string
+          names are `"NetworkClient"`, `"NetworkServer"`, `"Pipes"`, and
+          **`"FifoFiles"`** — not the shorthand `"Fifo"` this section
+          assumed earlier. Setting `PB_DEBUGGER_Communication=
+          "FifoFiles;<outFifoPath>;<inFifoPath>"` before spawning the `-d`
+          build skips the on-disk file, its timestamp-freshness check, and
+          its multi-line format entirely — confirmed working live. The
+          on-disk-file format itself turned out to be more elaborate than
+          previously assumed too (a magic first line literally reading
+          `PB_DEBUGGER_Communication`, a `%d` timestamp line checked against
+          `PB_DEBUGGER_Timestamp()` with the same 19-second staleness
+          window as before, then the actual descriptor line) — not
+          re-verified live since the env var makes it moot for a tool that
+          controls its own launch, as a DAP adapter does.
+        - **Wire framing confirmed bidirectionally, live, not just from
+          static decode.** Every message in both directions is a fixed
+          20-byte header (`int32` type/opcode, `int32` payload length, 3
+          more `int32` fields) optionally followed by exactly `header+0x4`
+          bytes of payload — confirmed by instruction-level decoding
+          `UnixPipeCommunication.o`'s `Send` (two `fwrite`s: `fwrite(header,
+          1, 0x14, out)` unconditionally, then `fwrite(payload, 1,
+          header[1], out)` only if length `>0`) and by the live capture
+          matching that shape exactly on every message received.
+        - **The target sends one unsolicited message immediately on
+          connect**, before any request is sent: type `0`, payload = the
+          two `PB_DEBUGGER_SourcePath`/`FileName` strings concatenated as
+          `<dir>\0<file>\0` (confirmed live: `.../src/debug/spike\0test.pb\0`).
+        - **The first request sent after that hello always gets back a
+          generic `type=2, len=0` reply, regardless of its opcode** — tried
+          this with both a raw opcode `16` request and a `Control` opcode
+          `1` sub-command `-1` (version-pair query) as the first message;
+          both got `type=2, len=0`. Only the *second* request onward gets
+          dispatched to its real handler (confirmed: the second message,
+          opcode `16` again, came back correctly tagged `type=22`). Not yet
+          explained — plausibly a priming/handshake message the target
+          expects before real dispatch starts, or an artifact of how
+          `ExternalDebugger_CommunicationsThread`'s read loop drains its
+          first buffered read. Workaround for now: always send one
+          throwaway request immediately after the hello and discard its
+          reply.
+        - **Opcode `16`'s live reply was well-formed but empty** (`type=22,
+          len=0`) even while the target was genuinely blocked inside two
+          nested procedure calls. This means the "`Thread+0x48` active-call
+          count" read in the static decode above was *not* counting
+          `Outer`/`Inner` at the moment of the request — the multi-frame
+          call-stack conclusion from the static decode is **not yet
+          confirmed live and should be treated as unverified** until this
+          is explained. Leading hypothesis, not yet tested: `Thread` comes
+          from `PB_Object_GetThreadMemory()`, which is almost certainly
+          per-*OS*-thread (TLS-style) data — and `ExternalDebugger_Misc`
+          runs on the debugger's own `ExternalDebugger_CommunicationsThread`
+          pthread, not the target program's main thread. If
+          `PB_Object_GetThreadMemory` returns the *calling* thread's record
+          (the comms thread's, which never enters `Inner`/`Outer`) rather
+          than the target's main thread's, opcode `16` would always read
+          back empty for a single-threaded target queried this way,
+          regardless of real call depth. Needs one more experiment: check
+          whether one of the header's three spare `int32` fields is a
+          target-thread-ID selector (plausible given the `Libraries`
+          category's `SuspendingThread`/`SuspensionFlag` — thread-scoped
+          operations exist elsewhere in this protocol), or find where
+          `PB_Object_GetThreadMemory` actually resolves "current thread".
+        - The target printed `[Fatal Debugger Error] Broken communication
+          pipe` when the script closed its FIFO file descriptors and
+          exited — expected, not a bug: the script tore down the pipes
+          without sending a clean disconnect message. The real DAP adapter
+          will need a real disconnect opcode (likely in the `Control`
+          category, unconfirmed which) sent before closing FIFOs.
     - `ExternalDebugger_Variables` (`9,10,11,17`) calls
       `ExamineVariables`/`NextVariable`/`ExamineStructure`/
       `NextStructureField`/`GetProcedureIndex` — DAP's `variables`
@@ -819,43 +911,65 @@ Pure_Xtension/
     `"wb"` (→ `OutStream`, the target-to-debugger direction) and the second
     `"rb"` (→ `InStream`, debugger-to-target), sets both non-blocking via
     `fcntl64`, then spawns `ExternalDebugger_CommunicationsThread` on a
-    pthread. So the rendezvous file's contents are simply
+    pthread. So *`FifoConnect`'s own input string* is simply
     `<fifo-target-writes-to>;<fifo-target-reads-from>` — two named-pipe
-    paths, semicolon-separated, no length prefix or binary header. The
-    `"[PureBasic Debugger] Warning: ... is too old and will be ignored"`
-    string (found via `strings`) confirms there's an mtime freshness check
-    before this parse even runs. The TCP path (`ServerConnect`/handshake
-    strings documented above) is the *other* transport, selected by
-    `~/.pbdebugger.prefs`, not yet decoded — same file confirmed to exist
-    by name only.
-- **Net effect on risk 1 (§8):** downgraded further than the previous pass
-  concluded — **opcode `16` is a real, walkable multi-frame call-stack wire
-  message** (see "third correction" above), reversing the earlier "no
-  multi-frame stack opcode" finding. `ExternalDebugger_Procedures` and
-  `PrintStack` are still correctly ruled out as call-stack sources; opcode
-  `16` was just filed under the wrong bucket (`Misc`) by the category-name
-  heuristic. The DAP adapter's `stackTrace` can now be a real per-frame
-  reply (`(int32, name)` pairs from opcode `16`) instead of a synthetic
-  single-frame one. Remaining unknowns: (a) what `record+0x10`'s int32
-  actually encodes — line number is the leading guess, unconfirmed; (b)
-  `Variables`' exact request/response byte layout (only its call graph is
-  confirmed so far); (c) `~/.pbdebugger.prefs`' format for the TCP path.
-  All three are narrow, well-scoped decodes now, not open unknowns.
-- **Next spike steps:** (1) empirically confirm `record+0x10` (opcode `16`'s
-  per-frame integer) is a source line by capturing real FIFO traffic from a
-  `-d` build with 2-3 levels of nested procedure calls and diffing the
-  captured ints against known call-site line numbers; decode
-  `ExternalDebugger_Variables`' request/response byte layout next —
-  together these cover a workable `stackTrace` + `variables` pair for a
-  "launch + breakpoint + continue + locals" adapter, now with real
-  multi-frame stepping through caller frames (revised from the earlier
-  single-frame conclusion); (2) write a throwaway Node/TS prototype that
-  creates the two FIFOs, writes the rendezvous file to
-  `/tmp/.pbdebugger.out`, launches a real `-d` build, and confirms a
-  captured message round-trips on the decoded opcodes; (3) only then start
-  the real `pbDebugAdapter.ts` DAP scaffolding. (TCP path via
-  `~/.pbdebugger.prefs` remains a fallback/alternative to spike later —
-  FIFO is simpler to prototype from a CLI-launched debug session.)
+    paths, semicolon-separated, no length prefix or binary header. **Correction
+    (see the live-wire-test bullet below): this is not the full contents of
+    `/tmp/.pbdebugger.out`.** Decoding `PB_DEBUGGER_InitExternal` (the actual
+    caller that reads that file) shows it's a multi-line format — a magic
+    first line, a `%d` timestamp line, then a descriptor line with this
+    `plugin;path;path` shape — not this raw two-path content directly. The
+    freshness check is real (confirmed: a `PB_DEBUGGER_Timestamp() -
+    line2value > 0x13` (19-second) staleness check gates the parse, matching
+    the `"...is too old and will be ignored"` string found via `strings`),
+    but a *far simpler and fully-verified* alternative for a tool that
+    controls its own launch (like a DAP adapter) is the
+    `PB_DEBUGGER_Communication` environment variable — see below. The TCP
+    path (`ServerConnect`/handshake strings documented above) is the *other*
+    transport, selected by `~/.pbdebugger.prefs`, not yet decoded — same
+    file confirmed to exist by name only.
+- **Net effect on risk 1 (§8):** the wire transport itself is now fully
+  de-risked — connection setup, framing, and the hello message are
+  confirmed *live*, not just from static decode (see the "live wire test"
+  bullet above), and the simplest connection method
+  (`PB_DEBUGGER_Communication=FifoFiles;<out>;<in>` env var) is known and
+  working. What's *not* yet de-risked, contrary to the previous pass's
+  optimism: **opcode `16`'s call-stack claim is unconfirmed live** — the
+  real reply came back empty while the target was genuinely mid-call, so
+  the "real, walkable multi-frame call-stack" conclusion from the static
+  decode is a hypothesis pending the thread-scoping question below, not a
+  settled fact. `ExternalDebugger_Procedures` and `PrintStack` are still
+  correctly ruled out as call-stack sources regardless of how opcode `16`
+  shakes out. Remaining unknowns, reordered by what the live test surfaced:
+  (a) why opcode `16` read back zero frames — leading hypothesis is
+  `PB_Object_GetThreadMemory` scoping to the wrong (comms) thread, needs a
+  thread-ID-selector check; (b) what the generic `type=2` first-reply
+  artifact means; (c) what `record+0x10`'s int32 encodes, once (a) is fixed
+  and opcode `16` actually returns frames to inspect; (d) `Variables`'
+  exact request/response byte layout; (e) `~/.pbdebugger.prefs`' format for
+  the TCP path.
+- **Next spike steps:** (1) resolve why opcode `16` reads back zero active
+  calls — check whether one of the header's 3 spare `int32` fields
+  (offsets `0x8`/`0xc`/`0x10`) is a target-thread-ID selector by trying
+  non-zero values there, and/or find where `PB_Object_GetThreadMemory`
+  picks "current thread" (decode it directly — it's called from both the
+  comms thread and, presumably, `PB_DEBUGGER_EnterProcedure`/
+  `LeaveProcedure` in `Debugger.o`, which are almost certainly the
+  compiler-inserted per-call instrumentation and the far more promising
+  place to find how call records actually get pushed); (2) once opcode
+  `16` returns real frames, empirically confirm what `record+0x10`'s
+  per-frame integer is (line number is still the leading guess) by
+  diffing captured ints against known call-site line numbers; (3) decode
+  `ExternalDebugger_Variables`' request/response byte layout — together
+  with a working `stackTrace` this covers "launch + breakpoint + continue
+  + locals" for a first adapter pass; (4) only then start the real
+  `pbDebugAdapter.ts` DAP scaffolding. The throwaway FIFO round-trip
+  prototype this list used to call for for next steps is **done**:
+  `src/debug/spike/fifo-client.mjs` + `test.pb` in this repo, confirmed
+  working end to end (connects via the env var, decodes the hello message,
+  sends/receives framed requests). (TCP path via `~/.pbdebugger.prefs`
+  remains a fallback/alternative to spike later — FIFO is simpler to
+  prototype from a CLI-launched debug session.)
 - Probe pbdebugger protocol → minimal DAP (launch, breakpoint, continue, stack,
   variables) → full stepping/watch/eval.
 
@@ -920,12 +1034,15 @@ Pure_Xtension/
 
 ## 9. Immediate next steps
 1. M0–M4 done. **M5 — debugger** protocol spike is well underway (risk 1 in
-   §8): opcode table mapped, FIFO rendezvous format decoded, and a real
-   multi-frame call-stack opcode (`16`) instruction-level decoded — continue
-   per the "Next spike steps" list in the M5 section: confirm what opcode
-   `16`'s per-frame integer encodes, decode `Variables`' byte layout, then
-   move to the throwaway FIFO round-trip prototype before starting the real
-   `pbDebugAdapter.ts` DAP scaffolding.
+   §8): opcode table mapped, and the FIFO transport verified live end to
+   end via the throwaway `src/debug/spike/fifo-client.mjs` prototype
+   (connects, decodes the hello message, round-trips framed requests).
+   Continue per the "Next spike steps" list in the M5 section: the live
+   test found opcode `16` (call stack) reads back empty against a real
+   nested-call target, so the next session should resolve that (likely a
+   thread-scoping issue in `PB_Object_GetThreadMemory`) before decoding
+   `record+0x10`'s meaning or `Variables`' byte layout, and before starting
+   the real `pbDebugAdapter.ts` DAP scaffolding.
 2. Full in-editor GUI smoke test (M1–M4 features) is still pending a working
    X display in this sandbox — flag to the user to manually verify in a real
    VS Code session before any marketplace publish.
