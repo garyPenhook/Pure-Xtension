@@ -46,16 +46,18 @@ and a debugger.
 ### Debugging
 Standard VS Code debugging for PureBasic programs, via a `purebasic` launch
 configuration:
-- Launch, line breakpoints, continue, and a real multi-frame call stack.
+- Launch, line breakpoints, continue, step-over/into/out, and a real
+  multi-frame call stack. (The underlying wire protocol has no native step
+  opcode, so stepping is emulated via temporary breakpoints — functionally
+  equivalent, but each step briefly sets a breakpoint on every line of the
+  file.)
 - Locals for the current frame, including expandable arrays, lists, maps,
   and structures.
 - Evaluate expressions in the Debug Console/hover/watch, including writing
   back to a variable.
-- One known limitation: PureBasic's debugger has no step command, so
-  step-over/into/out aren't available — only run/continue. A `List<String>`
-  also can't show every element's text individually (a limitation of
-  PureBasic's own debugger, not this extension) — its current element is
-  shown instead.
+- One known limitation: a `List<String>` can't show every element's text
+  individually (a limitation of PureBasic's own debugger, not this
+  extension) — its current element is shown instead.
 
 ## Requirements
 
