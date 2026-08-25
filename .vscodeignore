@@ -1,0 +1,12 @@
+.vscode/**
+.gitignore
+.vscodeignore
+esbuild.mjs
+tsconfig.json
+PLAN.md
+*.png
+*.vsix
+src/**
+server/**
+node_modules/**
+dist/**/*.map
