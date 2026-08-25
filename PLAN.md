@@ -3,7 +3,10 @@
 **A full-featured VS Code language extension for PureBasic with deeply integrated
 help, IntelliSense, build/run tasks, and a native debugger bridge.**
 
-- Status: M2, M3, M4 (deep help integration) complete. M5 (debugger) not started.
+- Status: M2, M3, M4 (deep help integration) complete. M5 (debugger) protocol
+  spike well underway — wire opcodes mapped, FIFO transport decoded, and a
+  real multi-frame call-stack opcode found (opcode 16); DAP scaffolding
+  (`pbDebugAdapter.ts`) not started yet.
 - Target VS Code engine: `^1.85.0` (matches the existing help-viewer prototype)
 - Reference PureBasic install: `/home/gary/Apps/purebasic-v6.41` (v6.41, Linux x64)
 - Language: TypeScript (extension host) + a small Language Server (Node)
@@ -685,21 +688,87 @@ Pure_Xtension/
       is the raw "CPU Stack" memory-inspector view** (the kind shown in
       `debugger_*.png`-style screenshots), not a symbolic call-frame list —
       opcode `6` is off the table as a `stackTrace` source.
-      **Net implication for the DAP adapter's design:** no wire opcode
-      found so far returns a multi-frame call stack with per-frame
-      name/line, because PureBasic's own debugger UI doesn't have one —
-      it tracks a single "current execution point" (`Control` opcode `1`
-      sub `-3`'s `GetExecutableLine`, §above) plus this raw stack-memory
-      view for manual pointer-chasing, and separately the
-      `Misc` category's `PB_DEBUGGER_GetProcedureCall` (singular — not yet
-      decoded, but the name matches "get the one currently-executing
-      call" rather than a stack). **This means the DAP adapter's
-      `stackTrace` response will likely have to be a synthetic
-      single-frame reply** (current line/procedure from `GetExecutableLine`
-      + `GetProcedureCall`) rather than a walkable multi-frame stack — a
-      real scope-narrowing finding, not a blocker, but it changes what
-      "done" looks like for M5's stepping/stack UI compared to a
-      GDB-style adapter.
+      **Net implication, at this point in the investigation:** no wire
+      opcode found so far returns a multi-frame call stack with per-frame
+      name/line — but see the **third correction** immediately below, which
+      overturns this once opcode `16` (filed under `Misc`) got the same
+      instruction-level treatment. Left in place so the record shows the
+      reasoning wasn't skipped, only revised.
+      **Third correction — opcode `16` (dispatched to `ExternalDebugger_Misc`,
+      previously read as "grab-bag: profiler + module/file metadata, not
+      relevant to a first pass") *is* a genuine multi-frame call stack.**
+      The category-name heuristic used for the other opcodes (read off which
+      exported `PB_DEBUGGER_*` helpers a handler calls) undersold this one —
+      `Misc` is one function handling nine unrelated opcodes, and opcode
+      `16`'s case block doesn't call anything with "stack" in the name, so
+      the first pass filed it as irrelevant. Instruction-level decoding says
+      otherwise:
+      - **Method note:** `ExternalDebugger_Misc`'s internal opcode dispatch
+        (a *second*, smaller jump table nested inside the `Misc` handler,
+        separate from the top-level 40-entry `IncomingCommand` table) lives
+        in `.rodata+0x1b8` as `R_X86_64_PC32` relocations against `.text`
+        labels — these read as all-zero in a plain `objdump -d -r` on the
+        relocatable `.o` (relocations are unresolved until link time), so
+        the earlier per-category pass could only infer this block's
+        boundaries from surrounding control flow, not confirm each case's
+        target address. Forcing resolution — `ld -shared -o ext.so
+        ExternalDebugger.o --unresolved-symbols=ignore-all -z notext`, then
+        `objdump -d` on the resulting `.so` — turns those relocations into
+        concrete addresses, so all 25 case targets (opcodes `16`–`40`) could
+        be read directly out of the table instead of inferred. Confirms the
+        table shape matches the outer opcode-category map exactly: opcodes
+        `17`–`27` and `33`–`37` land on the shared default/no-op return
+        (dispatched to the *other* eight handlers instead, so `Misc` never
+        actually acts on them), and `16`, `28`–`32`, `38`–`40` land on 8
+        distinct case blocks.
+      - **Opcode `16`'s case block, fully decoded:** reads the per-thread
+        struct (`PB_Object_GetThreadMemory` result, dereferenced — call it
+        `Thread`; no DWARF survives in this `.o`, so field names below are
+        inferred from behavior, not read off a symbol). `Thread+0x48` is a
+        **count** used as a loop bound; `Thread+0x40` is a **32-byte-stride
+        record array**. For `index` in `0..count-1`: `record =
+        Thread+0x40 + index*32`; a 4-byte field at `record+0x10` is
+        byte-swapped per the `PB_DEBUGGER_ByteSwap` global (same idiom seen
+        in `Control`, §above) and copied straight into the outgoing buffer;
+        then the *exported*, separately-decoded `PB_DEBUGGER_GetProcedureCall`
+        is called with `(index, outBuf)` and appends a formatted string
+        right after that 4-byte field. This repeats per index, so the reply
+        is a **flat concatenation of `(int32, cstring)` pairs, one pair per
+        active call**, sent as one `SendCommandWithData` reply tagged type
+        `0x16`. `(int32, cstring)` per frame is exactly the minimum a
+        `stackTrace` frame needs (line/id + display name).
+      - **`PB_DEBUGGER_GetProcedureCall` itself** (exported, defined in
+        `Procedures.o`, decoded separately from the `Misc` handler that
+        calls it): given `index`, it re-derives the *same* 32-byte-stride
+        record array via `Thread+0x40`, reads the record's first 4-byte
+        field, and uses it as an index into a second global pointer table to
+        fetch a call-signature descriptor string (procedure name plus a
+        compact byte-code for its parameter types/count). It then formats a
+        human-readable `ProcName(arg1, arg2, ...)` string by walking that
+        byte-code through a large per-parameter-type switch (not decoded
+        further — out of scope until `variables`/`evaluate` needs
+        per-argument typed values rather than a display string).
+      - **What `record+0x10` (the raw int32) actually represents is still
+        unconfirmed** — plausibly a source line number or a return-address-
+        derived value, but nothing in this stripped-of-DWARF object
+        confirms which. Cheapest next check: run a real `-d` build with
+        nested procedure calls, capture the FIFO traffic for opcode `16`'s
+        reply, and diff the int32 against known source line numbers for
+        each call site.
+      - **Net implication for the DAP adapter's design (supersedes the
+        single-frame conclusion above):** a real, walkable multi-frame
+        `stackTrace` is possible after all — `Thread+0x48` active calls,
+        each with a resolvable display name (`GetProcedureCall`) and an
+        integer field of unconfirmed meaning (`record+0x10`, likely the
+        line). `ExternalDebugger_Procedures` (opcodes `18`-`20`, a
+        name/profiler table) and `PrintStack` (opcode `6`, a raw
+        stack-memory dump) are still correctly ruled out, exactly as
+        decoded above — the miss was scoping "call stack" search to opcodes
+        whose *handler function name* suggested it, when the real one was
+        filed under the generic `Misc` bucket. This removes M5's
+        "synthetic single-frame `stackTrace`" fallback as the default plan;
+        pending only the `record+0x10` field check above, a GDB-style
+        multi-frame adapter is back on the table.
     - `ExternalDebugger_Variables` (`9,10,11,17`) calls
       `ExamineVariables`/`NextVariable`/`ExamineStructure`/
       `NextStructureField`/`GetProcedureIndex` — DAP's `variables`
@@ -759,32 +828,29 @@ Pure_Xtension/
     strings documented above) is the *other* transport, selected by
     `~/.pbdebugger.prefs`, not yet decoded — same file confirmed to exist
     by name only.
-- **Net effect on risk 1 (§8):** downgraded overall, but with a real design
-  finding, not just a protocol map — **there is no multi-frame call-stack
-  wire opcode in this protocol**, checked two candidates
-  (`ExternalDebugger_Procedures` and `PrintStack`) and instruction-level
-  decoded both to rule them out (name/count table + profiler counts, and a
-  raw stack-memory dump, respectively — see corrections above). The DAP
-  adapter's `stackTrace` will need to be a synthetic single-frame reply
-  built from `Control` opcode `1` sub `-3` (`GetExecutableLine`) and
-  `Misc`'s `PB_DEBUGGER_GetProcedureCall`, not a walked frame list. This is
-  a scope-narrowing fact worth having *before* building the adapter, not
-  after. Remaining unknowns: (a) `GetProcedureCall`'s exact
-  request/response shape (not yet decoded — the current best synthetic-
-  `stackTrace` candidate); (b) `Variables`' exact request/response byte
-  layout (only its call graph is confirmed so far); (c)
-  `~/.pbdebugger.prefs`' format for the TCP path. All three are narrow,
-  well-scoped decodes now, not open unknowns.
-- **Next spike steps:** (1) decode `PB_DEBUGGER_GetProcedureCall` (in
-  `ExternalDebugger_Misc`, opcode `16`) and confirm it returns a
-  name/line/module for the *current* call — the basis for a synthetic
-  single-frame `stackTrace`; decode `ExternalDebugger_Variables`'
-  request/response byte layout next — together these cover a workable
-  `stackTrace` + `variables` pair for a "launch + breakpoint + continue +
-  locals" adapter (a single-frame one, per the finding above — no
-  multi-frame stepping through caller frames is possible over this wire
-  protocol as currently understood); (2) write a throwaway Node/TS
-  prototype that creates the two FIFOs, writes the rendezvous file to
+- **Net effect on risk 1 (§8):** downgraded further than the previous pass
+  concluded — **opcode `16` is a real, walkable multi-frame call-stack wire
+  message** (see "third correction" above), reversing the earlier "no
+  multi-frame stack opcode" finding. `ExternalDebugger_Procedures` and
+  `PrintStack` are still correctly ruled out as call-stack sources; opcode
+  `16` was just filed under the wrong bucket (`Misc`) by the category-name
+  heuristic. The DAP adapter's `stackTrace` can now be a real per-frame
+  reply (`(int32, name)` pairs from opcode `16`) instead of a synthetic
+  single-frame one. Remaining unknowns: (a) what `record+0x10`'s int32
+  actually encodes — line number is the leading guess, unconfirmed; (b)
+  `Variables`' exact request/response byte layout (only its call graph is
+  confirmed so far); (c) `~/.pbdebugger.prefs`' format for the TCP path.
+  All three are narrow, well-scoped decodes now, not open unknowns.
+- **Next spike steps:** (1) empirically confirm `record+0x10` (opcode `16`'s
+  per-frame integer) is a source line by capturing real FIFO traffic from a
+  `-d` build with 2-3 levels of nested procedure calls and diffing the
+  captured ints against known call-site line numbers; decode
+  `ExternalDebugger_Variables`' request/response byte layout next —
+  together these cover a workable `stackTrace` + `variables` pair for a
+  "launch + breakpoint + continue + locals" adapter, now with real
+  multi-frame stepping through caller frames (revised from the earlier
+  single-frame conclusion); (2) write a throwaway Node/TS prototype that
+  creates the two FIFOs, writes the rendezvous file to
   `/tmp/.pbdebugger.out`, launches a real `-d` build, and confirms a
   captured message round-trips on the decoded opcodes; (3) only then start
   the real `pbDebugAdapter.ts` DAP scaffolding. (TCP path via
@@ -814,15 +880,20 @@ Pure_Xtension/
 ---
 
 ## 8. Risks & open questions
-1. **pbdebugger control protocol is undocumented** — spike done (see M5
-   notes): `pbdebugger.exe` itself is a GTK GUI, not the protocol endpoint;
-   the real protocol is a TCP handshake (`CONNECT %i DEBUGGER` → `ACCEPT`,
-   optional password/encryption) built into every `-d` executable via
-   `debugger.a`'s `ServerConnect`, with a rich `PB_DEBUGGER_*` command
-   surface (variables, arrays, breakpoints, call stack). Remaining unknown:
-   exact binary opcode values for `IncomingCommand`. The `Debug`/`OnError`
-   stdout fallback (verified working, zero plumbing) still de-risks shipping
-   *something* even if opcode mapping stalls.
+1. **pbdebugger control protocol is undocumented** — spike well underway
+   (see M5 notes): `pbdebugger.exe` itself is a GTK GUI, not the protocol
+   endpoint; the real protocol is a FIFO (default) or TCP (`CONNECT %i
+   DEBUGGER` → `ACCEPT`, optional password/encryption) transport built into
+   every `-d` executable via `debugger.a`, with a rich `PB_DEBUGGER_*`
+   command surface (variables, arrays, breakpoints, call stack). All 40
+   `IncomingCommand` opcodes are mapped to their 9 handler categories, and
+   opcode `16` is confirmed to be a real multi-frame call-stack reply (not
+   the synthetic single-frame fallback an earlier pass concluded). Remaining
+   unknowns: exact byte layout of `Variables`' request/response, and what
+   opcode `16`'s per-frame integer field encodes (line number, unconfirmed).
+   The `Debug`/`OnError` stdout fallback (verified working, zero plumbing)
+   still de-risks shipping *something* even if further opcode decoding
+   stalls.
 2. **`.help` binary format** — resolved by sidestepping it: neither offline
    pipeline in the original plan actually worked (`pbdocmaker` is GUI-only;
    no `.help` parser exists to reuse — see M4 notes). Help integration now
@@ -848,10 +919,13 @@ Pure_Xtension/
 ---
 
 ## 9. Immediate next steps
-1. M0–M4 done. Start **M5 — debugger**: spike `pbdebugger`'s control
-   protocol (risk 1 in §8 — biggest unknown in the whole project) before
-   building any DAP scaffolding, since a negative result changes the shape
-   of M5 (fall back to the `Debug`/`OnError` trace approach in §4.5).
+1. M0–M4 done. **M5 — debugger** protocol spike is well underway (risk 1 in
+   §8): opcode table mapped, FIFO rendezvous format decoded, and a real
+   multi-frame call-stack opcode (`16`) instruction-level decoded — continue
+   per the "Next spike steps" list in the M5 section: confirm what opcode
+   `16`'s per-frame integer encodes, decode `Variables`' byte layout, then
+   move to the throwaway FIFO round-trip prototype before starting the real
+   `pbDebugAdapter.ts` DAP scaffolding.
 2. Full in-editor GUI smoke test (M1–M4 features) is still pending a working
    X display in this sandbox — flag to the user to manually verify in a real
    VS Code session before any marketplace publish.
