@@ -114,9 +114,12 @@ is not yet manually verified (same X-display limitation noted above for the
 language-support features). Not yet implemented: stepping (the one known
 lead — the continue opcode's nonzero sub-command — was live-tested and
 ruled out; no dedicated step opcode is known to exist), watch/`evaluate`
-expressions, and array/list/map/structure value expansion. Throwaway
-protocol-spike clients remain in `src/debug/spike/` for anyone following
-along or picking up that remaining work.
+expressions (the read side is now decoded and live-tested — full
+expression parsing with a confirmed wire format, not yet wired into the
+adapter; the write side, for `setVariable`, is decoded but blocked on an
+unexplained target-side failure), and array/list/map/structure value
+expansion. Throwaway protocol-spike clients remain in `src/debug/spike/`
+for anyone following along or picking up that remaining work.
 
 ## Development
 

@@ -3,42 +3,53 @@
 **A full-featured VS Code language extension for PureBasic with deeply integrated
 help, IntelliSense, build/run tasks, and a native debugger bridge.**
 
-- Status: M2, M3, M4 (deep help integration) complete. M5 (debugger) protocol
-  spike well underway — wire opcodes mapped, FIFO transport confirmed
-  working end to end with real throwaway clients
-  (`src/debug/spike/fifo-client.mjs`, `fifo-go.mjs`,
-  `fifo-continue-client.mjs`), and the full command-dispatch model is
-  decoded (`Check`, running on the target's own main thread between
-  statements, is the sole caller of `IncomingCommand` — the comms thread
-  only enqueues). **The continue/go opcode is found and gdb-confirmed**
-  (`Control` opcode `2` — sending it visibly releases
-  `PB_DEBUGGER_EnterProcedure`, caught live in gdb), and **the multi-frame
-  call-stack opcode (16) is now confirmed to return real, correctly-shaped
-  frames** once the target is actually running: polling it after sending
-  opcode `2` returned `Outer(5)`/`Inner(5, 10)` with matching, confirmed
-  0-based call-site line numbers for the full duration those calls were
-  genuinely on the stack. This closes out the "empty reply" investigation
-  from last session for good — it was the stop-on-entry wait, and now a
-  real continue command is known. **Breakpoint-setting (opcode `3`,
-  `PB_DEBUGGER_ExternalBreakpoints`) is decoded and live-tested** — a 7-way
-  sub-dispatch covering line-breakpoint add/remove/bulk-clear and
-  data/watch-breakpoint add/remove/clear; add, remove-by-key, and
-  bulk-clear-all are all gdb-free-but-wire-confirmed (the target genuinely
-  stops on the breakpointed line and genuinely runs to completion once
-  cleared). Only the data/watch-breakpoint sub-command remains
-  static-decode-only. **`ExternalDebugger_Variables` (opcodes `9,10,11,17`)
-  is now decoded and live-tested against a running, stopped target** — the
-  per-variable wire record (7-byte header: PB type byte, flag byte, kind
-  byte, 4-byte reserved/proc-id field; null-terminated name; 8-byte
-  little-endian value for numeric types) was read directly off real
-  replies containing `test.pb`'s actual `a=5`, `b=10`, `c=15`, and a live
-  `ElapsedMilliseconds()` value for `t`, plus the top-level `result`
-  variable via the global-scope opcode. Next: start the real
-  `pbDebugAdapter.ts` DAP scaffolding using the now-decoded
-  continue/stack/breakpoints/variables opcodes; decode array/list/map and
-  structure-field expansion (opcodes `12`-`15`, `ExamineStructure`/
-  `NextStructureField`) only when a DAP `variables` request actually needs
-  to expand a compound value.
+- Status: M2, M3, M4 (deep help integration) complete. M5 (debugger)
+  protocol is now fully decoded for everything the DAP scaffolding needs,
+  and a first working adapter is implemented on top of it. Wire opcodes
+  mapped, FIFO transport confirmed working end to end with real throwaway
+  clients (`src/debug/spike/fifo-client.mjs`, `fifo-go.mjs`,
+  `fifo-continue-client.mjs`, `fifo-step-probe.mjs`), and the full
+  command-dispatch model is decoded (`Check`, running on the target's own
+  main thread between statements, is the sole caller of `IncomingCommand`
+  — the comms thread only enqueues). **Continue/go (`Control` opcode `2`),
+  the multi-frame call stack (opcode `16`), breakpoint-setting (opcode `3`,
+  add/remove-by-key/bulk-clear-all), and variable inspection (opcodes
+  `9,10,11,17`, global/frame-local scopes) are all decoded and live-tested
+  against real, running targets** — see the dated entries in the M5
+  section below for the full verification detail on each. **`Control`
+  opcode `2`'s nonzero sub-command has also been live-tested and ruled out
+  as a step mode**: `f8` values `0`/`1`/`2`/`-1` all produced an identical
+  free-run-to-completion against a dedicated non-looping fixture
+  (`test-step.pb`), so no step-vs-run distinction exists under `Control`'s
+  sub-command field, and no other lead on a dedicated step opcode is known.
+  **A first `pbDebugAdapter.ts` pass is now implemented** on this decoded
+  protocol: `src/debug/pbSession.ts` (a reusable async wire-protocol
+  client with a connect timeout) and `src/debug/pbDebugAdapter.ts` (a
+  `@vscode/debugadapter` `DebugSession`) cover launch, line breakpoints,
+  continue, stack trace, and locals, wired in via
+  `src/debug/debugConfigProvider.ts` and a new package.json `debuggers`
+  contribution. Smoke-tested standalone against a real compiled debug
+  build; not yet verified through a real VS Code Run-and-Debug-view
+  session (no X display in this sandbox). Not yet done: stepping (ruled
+  out as above — out of scope for M5 unless a fresh static-decode pass
+  finds a different opcode), `evaluate`/watch expressions (`Expression`
+  category, opcodes `8`/`33`-`35`, not yet decoded), compound-value
+  expansion (arrays/lists/maps/structures, opcodes `12`-`15` plus
+  `ExamineStructure`/`NextStructureField`, not yet decoded), and a clean
+  disconnect opcode (currently FIFO-close-and-kill). **`Expression`'s
+  read side (opcodes `33`/`34`) is now decoded and live-tested** — full
+  expression parsing (not just bare variable names, e.g. `a+b` correctly
+  evaluates to `15`) with a fully-confirmed reply wire format, everything
+  a DAP `evaluate` request needs. Its write side (opcode `35`, for
+  `setVariable`/`setExpression`) is decoded to the instruction level and
+  live-tested, but blocked on an unexplained `ModifyVariable` failure that
+  needs a gdb trace to resolve, not more static reading. Opcode `8` was
+  ruled out as an evaluator — it's the memory-inspector's address/length
+  field, live-confirmed by its own error message. Next: wire `pbDebugAdapter.ts`'s
+  `evaluateRequest` up to opcodes `33`/`34` now that they're confirmed;
+  gdb-trace `ModifyVariable`'s failure to unblock `setVariable`; then
+  compound-value expansion once a DAP `variables` request actually needs
+  to expand one.
 - Target VS Code engine: `^1.85.0` (matches the existing help-viewer prototype)
 - Reference PureBasic install: `/home/gary/Apps/purebasic-v6.41` (v6.41, Linux x64)
 - Language: TypeScript (extension host) + a small Language Server (Node)
@@ -1436,9 +1447,11 @@ Pure_Xtension/
     `stopOnEntry`/`backend`/`compilerArgs` launch schema) wire it into VS
     Code's Run and Debug view.
   - **Deliberately not implemented yet, because the protocol doesn't
-    support it or it hasn't been decoded:** stepping (`evaluate`/watch
-    expressions (`Expression` category, opcodes `8`/`33`-`35`, not yet
-    decoded), compound-value expansion (arrays/lists/maps/structures,
+    support it or it hasn't been decoded:** stepping, `evaluate`/watch
+    expressions (`Expression` category — the read side, opcodes `33`/`34`,
+    is now decoded and live-tested, see the dated entry below; the write
+    side, opcode `35`, is decoded to the instruction level but blocked on
+    an unexplained target-side failure, also below), compound-value expansion (arrays/lists/maps/structures,
     opcodes `12`-`15` plus `ExamineStructure`/`NextStructureField`, not yet
     live-tested), and data/watch breakpoints (opcode `3` sub-command `4`,
     static-decode-only). A clean `disconnect` opcode is also still
@@ -1472,6 +1485,84 @@ Pure_Xtension/
   reachable through `Control`'s sub-command field. No further leads are
   known — stepping is off the table for this milestone unless a fresh
   static-decode pass turns up an opcode outside the `Control` category.
+- **`ExternalDebugger_Expression` (opcodes `8`/`33`/`34`/`35`) decoded to
+  the instruction level from `debugger.a`'s `ExternalDebugger.o`
+  (`ar x .../compilers/debugger.a ExternalDebugger.o`, since this object
+  isn't shipped standalone the way `ExternalDebugger.o` was found before —
+  it lives inside the static archive, extracted the same way) and
+  live-tested against a running, stopped target**
+  (`src/debug/spike/fifo-expression.mjs`):
+  - **Opcode `8` is *not* a general expression evaluator** — live-testing
+    `expr="a"` got back a `PB_Language_GetKey`-sourced error, *"An integer
+    expression is expected as end address/length."* The static decode
+    confirms this: opcode `8`'s success path (`ParseExpressionExternal`
+    called with a context of `0`, no frame/line targeting) leads straight
+    into `PB_DEBUGGER_SendCommand` with no value-formatting logic at all
+    once parsed — this opcode is the **memory-inspector's "go to
+    address/length" field** (the CPU-stack/memory view opcode `6`
+    decoded earlier feeds from), not a watch/hover evaluator. Off the
+    table for a DAP `evaluate` request.
+  - **Opcodes `33` and `34` are the real read-side evaluator, and are
+    byte-for-byte identical in this handler** — both fall into the same
+    `eax > 0x20` dispatch branch (`ExternalDebugger_Expression+0x118`),
+    so there is no functional difference between them here; live-testing
+    confirmed this directly (`expr="a"` through both opcodes produced
+    identical replies). Request: `f12` is a line/frame context for
+    `PB_DEBUGGER_GetLineContext` (`-1` reads `ThreadData+0x18`, the
+    currently-stopped line, which is what a DAP `evaluate` in the current
+    frame wants), payload is the expression text, null-terminated
+    (`ParseExpressionExternal` uses `estrlen` on it directly, not the
+    header length field). **Reply wire format, live-confirmed**: `type`
+    is computed from the *request* opcode as `(opcode - 0x21 > 1 ? 1 : 0)
+    + 0x24` — `36` for opcodes `33`/`34`, `37` for opcode `35` (matches
+    exactly in every test) — `f8` echoes the request's `f8`, and `f12`
+    carries a "value-kind" tag: `0` means the payload is an error string
+    (`PB_Language_GetKey`-sourced, e.g. *"Variable not found:
+    'nosuchvar'."*) followed immediately by the echoed expression text
+    (no length prefix); `1`/`2`/`3` mean the payload is an **8-byte
+    little-endian raw value** (integer or double, by the internal
+    expression-result type tag, not a `#PB_*` constant) **followed by the
+    echoed expression text** (exactly `header[0x4]` bytes, no null
+    terminator — confirmed with `expr="a"` → `05 00 00 00 00 00 00 00
+    61` (`5`, then `"a"`) and `expr="a+b"` → `0f 00 00 00 00 00 00 00 61
+    2b 62` (`15`, then `"a+b"` — **full expression parsing, not just bare
+    variable lookup**, confirmed); `4` means a string result (built via
+    `PB_DEBUGGER_econvertn`, not live-tested with a string variable yet);
+    `5` means a structure descriptor (via `ExamineStructure`/
+    `NextStructureField`, the same machinery flagged for opcodes `12`-`15`
+    — not live-tested). **This opcode pair is exactly what a DAP
+    `evaluate` request (watch expressions, hover, and the Debug Console's
+    REPL) needs**, and the wire format is now fully known for the
+    scalar case.
+  - **Opcode `35` (modify/write) is decoded to the instruction level but
+    *not yet working live* — a real target-side failure, not (yet) a
+    framing bug on our side.** Statically: it expects the payload to hold
+    two back-to-back null-terminated strings — a target lvalue expression
+    (parsed with `ParseExpressionExternal`'s mode flag `1`, i.e.
+    address/lvalue mode — confirmed by reading the actual `mov $0x1,%edx`
+    immediately before that call, correcting an initial misreading of the
+    instruction stream that had both parses sharing mode `0`) followed by
+    a value expression (parsed with mode `0`, the same "give me a value"
+    mode opcodes `33`/`34` use) — then calls `PB_DEBUGGER_ModifyVariable`
+    with both parsed results. Live-testing: sending `target="a"` alone
+    with a value string `"99"` at the byte offset the disassembly implies
+    (`rbx + *CharSizeExternal + strlen(target)`) gets **both individual
+    `ParseExpressionExternal` calls to succeed** (no "cannot locate
+    variable"/"parse error" reply — ruling out a framing mistake in how
+    the two strings are laid out) but `ModifyVariable` itself then fails
+    with *"Missing a value to assign."* — a message that reads as
+    describing an assignment-parser-level problem, not a
+    variable-not-writable problem, which doesn't obviously match "two
+    already-successfully-parsed operands, one lvalue one integer literal".
+    Concatenating both halves into a single string (`"a=99"`) was also
+    tried and fails differently and earlier (*"Cannot locate target
+    variable."*, from the *target* parse trying to resolve the literal
+    text `"a=99"` as a variable name) — ruling out the "single combined
+    expression" framing entirely. **Root cause not yet found**; next step
+    is a gdb breakpoint on `PB_DEBUGGER_ModifyVariable` itself (the method
+    already used successfully to gdb-confirm the continue opcode) rather
+    than further blind byte-layout guessing. DAP `setVariable`/
+    `setExpression` support is blocked on this.
 
 **M6 — Polish & ship (1.0)**
 - Walkthrough, tree views, formatter, semantic tokens, README/docs, marketplace
@@ -1589,7 +1680,16 @@ Pure_Xtension/
    entry at the end of the M5 section above
    (`src/debug/spike/fifo-step-probe.mjs`). No further leads on a
    dedicated step opcode are known; stepping stays out of scope for M5
-   barring a fresh static-decode pass.
+   barring a fresh static-decode pass. **`Expression`'s read side (opcodes
+   `33`/`34`) has since been decoded and live-tested too** (see the dated
+   entry at the end of the M5 section above,
+   `src/debug/spike/fifo-expression.mjs`) — full expression parsing with a
+   confirmed reply wire format, ready to wire into `evaluateRequest`. Its
+   write side (opcode `35`) is decoded but not yet working live —
+   `ModifyVariable` fails with an unexplained message even with correctly
+   laid-out operands; needs a gdb trace, not more guessing. Opcode `8`
+   turned out to be the memory-inspector's address/length field, not an
+   evaluator — ruled out for this purpose.
 2. Full in-editor GUI smoke test (M1–M4 features) is still pending a working
    X display in this sandbox — flag to the user to manually verify in a real
    VS Code session before any marketplace publish. **The new debug adapter
@@ -1598,11 +1698,14 @@ Pure_Xtension/
    Run-and-Debug-view session through VS Code's UI is unverified.
 3. Confirm scope/priorities (esp. whether the debugger or a Form Designer is
    in the 1.0 cut) before M5/M6.
-4. Next debugger work, roughly in cost order: (a) decode `Expression`
-   (opcodes `8`/`33`-`35`) for `evaluate`/watch support; (b) live-test
-   array/list/map/structure expansion so `variablesRequest` can return
-   non-zero `variablesReference`s for compound values; (c) find/confirm a
-   clean disconnect opcode instead of the FIFO-close-and-kill fallback.
-   (The former item (a), finding a real step opcode via `Control` opcode
-   `2`'s nonzero sub-command, is done — live-tested and ruled out; no
-   further lead is known, see item 1 above.)
+4. Next debugger work, roughly in cost order: (a) wire `pbDebugAdapter.ts`'s
+   `evaluateRequest` up to opcodes `33`/`34`, now confirmed and ready; (b)
+   gdb-trace `PB_DEBUGGER_ModifyVariable` to find why opcode `35` fails
+   with correctly-parsed operands, to unblock `setVariable`/
+   `setExpression`; (c) live-test array/list/map/structure expansion so
+   `variablesRequest` can return non-zero `variablesReference`s for
+   compound values; (d) find/confirm a clean disconnect opcode instead of
+   the FIFO-close-and-kill fallback.
+   (Finding a real step opcode via `Control` opcode `2`'s nonzero
+   sub-command is done — live-tested and ruled out; no further lead is
+   known, see item 1 above.)
