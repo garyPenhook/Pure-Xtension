@@ -658,25 +658,45 @@ Pure_Xtension/
       (type tag), `0xc`/`0x10`/`0x14` (payload), `0x24` (status/size) —
       this response struct's shape recurs across handlers and is the
       next thing worth nailing down precisely.
-    - `ExternalDebugger_Procedures` (`18,19,20`, call stack) calls
-      `PB_DEBUGGER_GetProcedureID`/`GetProcedureName`/`GetProcedureModule`
-      and `ProcedureCounts`/`ProcedureBank` — confirms this category is
-      exactly DAP's `stackTrace`/`scopes` (enumerate call-stack frames,
-      resolve each to a name/module).
+    - **Correction to first-pass guess, both now instruction-level decoded:**
+      `ExternalDebugger_Procedures` (`18,19,20`) is **not** the call stack —
+      it's the procedure name/module lookup table plus profiler call
+      counts: opcode `18` loops `PB_DEBUGGER_ProcedureBank`'s count calling
+      `GetProcedureID`/`GetProcedureName`/`GetProcedureModule` per index and
+      concatenates the strings into one reply (a name table built once, not
+      per-frame); opcode `19` reads a signed index from buffer offset `0x8`
+      and zeroes one `ProcedureCounts[index]` entry, or all of them if the
+      index is negative (a profiler-counter reset); opcode `20` sends the
+      whole `ProcedureCounts` array, byte-swapped if `PB_DEBUGGER_ByteSwap`
+      is set. This is the IDE's "procedure call statistics" panel, not
+      `stackTrace`.
+      **The real call stack is opcode `6`, inside `ExternalDebugger_Assembly`**
+      (`4,5,6,7` — decoded instruction-level): opcode `6` calls
+      `PB_DEBUGGER_PrintStack(0, buffer_offset_0x8, &count, &framePointer)`
+      and sends back a `count`-length array of 8-byte entries (byte-swapped
+      per-entry if needed) — this is DAP's `stackTrace` in one call, no
+      client-side frame-pointer walking needed as I'd speculated before
+      finding this. Opcode `4` in the same handler sends the CPU register
+      *names* (a fixed 17-entry, `0x22`/2-byte-stride table built from
+      `.data.rel.ro.local`); opcode `5` sends the register *values* (an
+      `0x88`-byte context blob plus `PB_DEBUGGER_FlagsRegister`); opcode `7`
+      writes a single register value back (index bound-checked against
+      `0x11`=17, byte-swap-aware). So `ExternalDebugger_Assembly` — despite
+      the name suggesting a disassembly view — is actually where
+      `stackTrace` **and** the registers view for a DAP adapter both live;
+      it's higher priority than the earlier pass rated it, not lower.
     - `ExternalDebugger_Variables` (`9,10,11,17`) calls
       `ExamineVariables`/`NextVariable`/`ExamineStructure`/
       `NextStructureField`/`GetProcedureIndex` — DAP's `variables`
-      request (locals for the selected stack frame).
+      request (locals for the selected stack frame). Not yet
+      instruction-level decoded (next target, alongside `PrintStack`'s
+      exact frame-entry layout, since `variables` needs to be scoped to
+      the frame `stackTrace` returns).
     - `ExternalDebugger_ArraysLists` (`12,13,14,15`) calls
       `ExamineArrays`/`ExamineLinkedLists`/`ExamineMaps` +
       `NextArray`/`NextLinkedList`/`NextMap` + `ParseExpressionExternal` —
       structured-container variable expansion (array/list/map children in
       the variables view).
-    - `ExternalDebugger_Assembly` (`4,5,6,7`) calls `PrintStack`,
-      `FlagsRegister`, `HexDisplay` — the disassembly/register/memory-dump
-      view, not stack unwinding (name is misleading vs. its actual DAP
-      mapping — this is closer to a "disassembly view" feature, lower
-      priority than `stackTrace`).
     - `ExternalDebugger_Expression` (`8,33,34,35`) calls
       `ParseExpressionExternal`, `ModifyVariable`, `GetLineContext`,
       `IsValidMemory` — DAP's `evaluate` (watch expressions) and
@@ -725,29 +745,29 @@ Pure_Xtension/
     strings documented above) is the *other* transport, selected by
     `~/.pbdebugger.prefs`, not yet decoded — same file confirmed to exist
     by name only.
-- **Net effect on risk 1 (§8):** downgraded further — the FIFO rendezvous
-  format is fully decoded, the opcode-to-handler-category table is extracted
-  from the real binary, and every category's DAP-relevant purpose is
-  confirmed by its internal call graph (`Procedures`→stack frames,
-  `Variables`/`ArraysLists`→locals, `Expression`→evaluate/setVariable,
-  `Watchlist`→persistent watches). Remaining unknowns before a DAP adapter
-  can be built: (a) the exact request/response *byte layout* within each
-  category (only `Control` is decoded to that depth so far — its response
-  struct shape at offsets `0x8`/`0xc-0x14`/`0x24` is the template to verify
-  against `Procedures`/`Variables` next), (b) `~/.pbdebugger.prefs`' format,
-  needed to pick the TCP path instead of FIFO. Both are narrower than
-  before — decoding a couple more payload structs and one prefs file, not
-  an unknown binary protocol.
-- **Next spike steps:** (1) instruction-level decode `ExternalDebugger_Procedures`
-  and `ExternalDebugger_Variables` (opcodes `18-20` and `9-11,17`) the same
-  way `Control` was done, to nail down exact request/response byte offsets
-  for a `stackTrace`/`variables` DAP pair — the minimum needed for a
-  "launch + breakpoint + continue + stack" adapter; (2) write a
-  throwaway Node/TS prototype that creates the two FIFOs, writes the
-  rendezvous file to `/tmp/.pbdebugger.out`, launches a real `-d` build, and
-  confirms a captured message round-trips on the decoded opcodes; (3) only
-  then start the real `pbDebugAdapter.ts` DAP scaffolding. (TCP path via
-  `~/.pbdebugger.prefs` remains a fallback/alternative to spike later —
+- **Net effect on risk 1 (§8):** downgraded further, and one prior guess
+  corrected before it could cause wasted adapter-building work — opcode `6`
+  (`ExternalDebugger_Assembly`, *not* `ExternalDebugger_Procedures` as
+  first guessed from call-graph alone) is the real `stackTrace` source via
+  `PB_DEBUGGER_PrintStack`, and its request/response shape is now decoded
+  down to the field level (see above), same depth as `Control`. Remaining
+  unknowns before a DAP adapter can be built: (a) `PrintStack`'s per-frame
+  8-byte entry layout (address? line? both packed?) — known to exist and
+  be byte-swap-aware, not yet decoded to the bit level; (b) `Variables`'
+  exact request/response byte layout (only its call graph is confirmed so
+  far); (c) `~/.pbdebugger.prefs`' format for the TCP path. All three are
+  narrow, well-scoped decodes now, not open unknowns.
+- **Next spike steps:** (1) decode `PrintStack`'s per-frame entry layout
+  (it's an external/exported symbol so its own object file, not just the
+  caller, can be disassembled) and `ExternalDebugger_Variables`'
+  request/response byte layout — together these cover `stackTrace` +
+  `variables`, the minimum for a "launch + breakpoint + continue + stack"
+  adapter; (2) write a throwaway Node/TS prototype that creates the two
+  FIFOs, writes the rendezvous file to `/tmp/.pbdebugger.out`, launches a
+  real `-d` build, and confirms a captured message round-trips on the
+  decoded opcodes; (3) only then start the real `pbDebugAdapter.ts` DAP
+  scaffolding. (TCP path via `~/.pbdebugger.prefs` remains a
+  fallback/alternative to spike later —
   FIFO is simpler to prototype from a CLI-launched debug session.)
 - Probe pbdebugger protocol → minimal DAP (launch, breakpoint, continue, stack,
   variables) → full stepping/watch/eval.
