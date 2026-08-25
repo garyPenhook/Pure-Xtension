@@ -3,7 +3,7 @@
 **A full-featured VS Code language extension for PureBasic with deeply integrated
 help, IntelliSense, build/run tasks, and a native debugger bridge.**
 
-- Status: M1 complete (static language support); M2 (build & diagnostics) next
+- Status: M2 complete (build & diagnostics); M3 (language server IntelliSense) next
 - Target VS Code engine: `^1.85.0` (matches the existing help-viewer prototype)
 - Reference PureBasic install: `/home/gary/Apps/purebasic-v6.41` (v6.41, Linux x64)
 - Language: TypeScript (extension host) + a small Language Server (Node)
@@ -298,9 +298,37 @@ Pure_Xtension/
   errors. (Screenshot-based visual QA was not possible — this sandbox's X
   display has no working pointer/window grab.)
 
-**M2 — Build & diagnostics (0.3)**
-- Task provider + problem matcher + `-k` syntax check on save → Problems panel.
-- Compiler/home auto-discovery + settings + status bar Build/Run.
+**M2 — Build & diagnostics (0.3)** ✅ done
+- `src/config.ts`: `purebasicHome`/compiler discovery (setting → `PUREBASIC_HOME`
+  env → scan `~/Apps`, `/opt`, `/usr/local`, `/usr/share` for a `purebasic*` dir
+  containing `compilers/pbcompiler`); `resolveBackend()` implements the
+  auto-detect-and-ask-once-then-persist-to-workspace-settings flow from §2.1;
+  `resolveBackendSilent()` (no prompt) is used by background diagnostics so
+  save-triggered checks never pop a QuickPick.
+- `src/build/problemMatcher.ts`: parses real `pbcompiler -k -q` output —
+  single-line `Error:`/`Warning: Line N - message` and the two-line
+  `Error: in included file '<path>'` / `Line N - message` form used for
+  `XIncludeFile`d files (verified against the actual compiler, not guessed).
+- `src/build/diagnostics.ts`: debounced (400ms) `-k -q` check on document
+  open/save, published to a `DiagnosticCollection`; correctly attaches
+  diagnostics to the *included* file's own document when the error is
+  reported there.
+- `src/build/taskProvider.ts`: `TaskProvider` for type `purebasic` — Build,
+  Build and Run, Syntax Check, Build (debug) (`-d -ds -l`), Build (console)
+  (`-cl`); tasks are backend-aware and resolve the active editor's file when
+  none is specified in the task definition.
+- `src/build/statusBar.ts`: Build/Run/backend-toggle status bar items, shown
+  only for `purebasic` documents.
+- `package.json`: `taskDefinitions` for type `purebasic`, a `$purebasic`
+  problem matcher (uses an echoed `PUREBASIC_SOURCE_FILE:` sentinel line since
+  the compiler's own output never names the file being checked), 4 new
+  commands, `onLanguage:purebasic` activation.
+- Verified: `tsc --noEmit` + esbuild clean; `parseCompilerOutput` unit-verified
+  against real `pbcompiler -k -q` stdout for clean/error/included-file cases
+  (bundled standalone with a stub `vscode` module, since this sandbox's
+  Extension Development Host can't reliably launch — same X/pointer
+  limitation noted under M1). Full in-editor GUI smoke test still pending a
+  working display.
 
 **M3 — Language Server IntelliSense (0.4)**
 - Symbol DB from `-lf/-ls/-li`; completion, signature help, hover, document

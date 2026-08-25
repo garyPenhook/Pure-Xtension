@@ -15,7 +15,13 @@
     "Snippets"
   ],
   "main": "./dist/extension.js",
-  "activationEvents": [],
+  "activationEvents": [
+    "onLanguage:purebasic",
+    "onCommand:pureXtension.build",
+    "onCommand:pureXtension.buildAndRun",
+    "onCommand:pureXtension.checkSyntax",
+    "onCommand:pureXtension.selectBackend"
+  ],
   "contributes": {
     "languages": [
       {
@@ -79,6 +85,73 @@
       {
         "command": "pureXtension.helloWorld",
         "title": "Pure Xtension: Hello World"
+      },
+      {
+        "command": "pureXtension.build",
+        "title": "Pure Xtension: Build",
+        "icon": "$(tools)"
+      },
+      {
+        "command": "pureXtension.buildAndRun",
+        "title": "Pure Xtension: Build and Run",
+        "icon": "$(play)"
+      },
+      {
+        "command": "pureXtension.checkSyntax",
+        "title": "Pure Xtension: Check Syntax"
+      },
+      {
+        "command": "pureXtension.selectBackend",
+        "title": "Pure Xtension: Select Compiler Backend"
+      }
+    ],
+    "menus": {
+      "commandPalette": [
+        { "command": "pureXtension.build", "when": "editorLangId == purebasic" },
+        { "command": "pureXtension.buildAndRun", "when": "editorLangId == purebasic" },
+        { "command": "pureXtension.checkSyntax", "when": "editorLangId == purebasic" }
+      ]
+    },
+    "taskDefinitions": [
+      {
+        "type": "purebasic",
+        "properties": {
+          "mode": {
+            "type": "string",
+            "enum": ["build", "buildRun", "check", "buildDebug", "buildConsole"],
+            "description": "Which compile action to run."
+          },
+          "backend": {
+            "type": "string",
+            "enum": ["asm", "c"],
+            "description": "Force a specific compiler backend for this task."
+          },
+          "file": {
+            "type": "string",
+            "description": "Source file to compile. Defaults to the active editor's file."
+          }
+        }
+      }
+    ],
+    "problemMatchers": [
+      {
+        "name": "purebasic",
+        "owner": "purebasic",
+        "applyTo": "allDocuments",
+        "fileLocation": "absolute",
+        "pattern": [
+          {
+            "regexp": "^PUREBASIC_SOURCE_FILE: (.*)$",
+            "file": 1
+          },
+          {
+            "regexp": "^(Error|Warning): Line (\\d+) - (.*)$",
+            "severity": 1,
+            "line": 2,
+            "message": 3,
+            "loop": true
+          }
+        ]
       }
     ]
   },
