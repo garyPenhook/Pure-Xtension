@@ -135,7 +135,7 @@ export interface PbEvaluateResult {
 // `"beta\0names()\0"`). Kind 5 (structure) is still only decoded from the
 // disassembly, not live-tested, so it's surfaced as unsupported rather than
 // guessed at.
-function parseEvaluateReply(msg: PbMessage): PbEvaluateResult {
+export function parseEvaluateReply(msg: PbMessage): PbEvaluateResult {
   if (msg.f12 === 0) {
     const nul = msg.payload.indexOf(0);
     const error = nul === -1 ? msg.payload.toString("latin1") : msg.payload.toString("latin1", 0, nul);
@@ -153,7 +153,7 @@ function parseEvaluateReply(msg: PbMessage): PbEvaluateResult {
   return { kind: msg.f12, error: `unsupported evaluate result kind ${msg.f12} (structure results are not decoded yet)` };
 }
 
-function parseFrames(payload: Buffer): PbFrame[] {
+export function parseFrames(payload: Buffer): PbFrame[] {
   const frames: PbFrame[] = [];
   let off = 0;
   while (off + 4 <= payload.length) {
@@ -181,7 +181,7 @@ function parseFrames(payload: Buffer): PbFrame[] {
 // `y` fields, src/debug/spike/fifo-arrayslists.mjs). Strings and
 // array/list/map-typed *scalar* variables (as opposed to the dedicated
 // ArraysLists opcodes) are still not live-tested.
-function parseVariables(payload: Buffer): PbVariable[] {
+export function parseVariables(payload: Buffer): PbVariable[] {
   interface FlatRecord {
     type: number;
     kind: number;
@@ -233,7 +233,7 @@ function parseVariables(payload: Buffer): PbVariable[] {
 // byte. Only the bare name (up to "(") is extracted -- the dimension-string
 // bytes between the parens weren't fully decoded (see PLAN.md), and aren't
 // needed to enumerate which arrays exist.
-function parseArrayDecls(payload: Buffer): PbArrayDecl[] {
+export function parseArrayDecls(payload: Buffer): PbArrayDecl[] {
   const decls: PbArrayDecl[] = [];
   let off = 0;
   while (off < payload.length) {
@@ -252,7 +252,7 @@ function parseArrayDecls(payload: Buffer): PbArrayDecl[] {
 
 // Linked-list declaration: `<name>\0` + flag byte + type byte + kind byte
 // + int64 LE ListCount + int64 LE ListIndex (0-based "current" position).
-function parseListDecls(payload: Buffer): PbListDecl[] {
+export function parseListDecls(payload: Buffer): PbListDecl[] {
   const decls: PbListDecl[] = [];
   let off = 0;
   while (off < payload.length) {
@@ -273,7 +273,7 @@ function parseListDecls(payload: Buffer): PbListDecl[] {
 
 // Map declaration: `<name>\0` + flag byte + type byte + kind byte + int64
 // LE MapSize + 1 byte hasCurrentKey + (if set) `<key>\0`.
-function parseMapDecls(payload: Buffer): PbMapDecl[] {
+export function parseMapDecls(payload: Buffer): PbMapDecl[] {
   const decls: PbMapDecl[] = [];
   let off = 0;
   while (off < payload.length) {
@@ -303,7 +303,7 @@ function parseMapDecls(payload: Buffer): PbMapDecl[] {
 // Opcode-15 Array-data reply (type 0x11): `<echoed expr>\0` + repeated
 // (`<decimal index string>\0` + int64 LE value). Confirmed only for a
 // numeric (.i) element type.
-function parseArrayElements(payload: Buffer): { name: string; elements: PbArrayElement[] } {
+export function parseArrayElements(payload: Buffer): { name: string; elements: PbArrayElement[] } {
   const nul = payload.indexOf(0);
   const name = nul === -1 ? payload.toString("latin1") : payload.toString("latin1", 0, nul);
   let off = nul === -1 ? payload.length : nul + 1;
@@ -324,7 +324,7 @@ function parseArrayElements(payload: Buffer): { name: string; elements: PbArrayE
 // Opcode-15 Map-data reply (type 0x15): `<echoed expr>\0` + repeated
 // (`<key string>\0` + int64 LE value). Confirmed for a string-keyed,
 // numeric-valued map.
-function parseMapElements(payload: Buffer): { name: string; elements: PbMapElement[] } {
+export function parseMapElements(payload: Buffer): { name: string; elements: PbMapElement[] } {
   const nul = payload.indexOf(0);
   const name = nul === -1 ? payload.toString("latin1") : payload.toString("latin1", 0, nul);
   let off = nul === -1 ? payload.length : nul + 1;
@@ -366,7 +366,7 @@ function parseMapElements(payload: Buffer): { name: string; elements: PbMapEleme
 // kind 4) DOES return the list's real *current* element text -- live
 // output `"beta\0names()\0"` for this exact fixture -- so a per-index dump
 // isn't recoverable this way, but the current element is.
-function parseListElements(payload: Buffer, elementCount: number): { name: string; elements: PbListElement[] } | undefined {
+export function parseListElements(payload: Buffer, elementCount: number): { name: string; elements: PbListElement[] } | undefined {
   const nul = payload.indexOf(0);
   if (nul === -1) return undefined;
   const name = payload.toString("latin1", 0, nul);

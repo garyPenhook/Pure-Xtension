@@ -4,6 +4,9 @@
 .vscodeignore
 esbuild.mjs
 tsconfig.json
+tsconfig.test.json
+test/**
+out-test/**
 PLAN.md
 *.png
 *.vsix

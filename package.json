@@ -322,6 +322,7 @@
   "scripts": {
     "compile": "tsc --noEmit -p ./ && tsc --noEmit -p ./server && node esbuild.mjs",
     "watch": "node esbuild.mjs --watch",
+    "test": "tsc -p tsconfig.test.json && node --test \"out-test/test/**/*.test.js\"",
     "package": "vsce package",
     "vscode:prepublish": "node esbuild.mjs --production"
   },
