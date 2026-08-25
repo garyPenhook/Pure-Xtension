@@ -2,6 +2,8 @@
 // document's text. Deliberately not a full parser — good enough for
 // completion/hover/documentSymbol/definition on the declaring keywords.
 
+import { StructureField } from "./dumpParsers";
+
 export type WorkspaceSymbolKind = "procedure" | "structure" | "interface" | "constant" | "macro";
 
 export interface WorkspaceSymbol {
@@ -11,10 +13,14 @@ export interface WorkspaceSymbol {
   line: number;
   /** Extra detail for hover/completion, e.g. the parameter list or field list. */
   detail: string;
+  /** Populated for `structure` symbols: fields declared between Structure/EndStructure. */
+  fields?: StructureField[];
 }
 
 const PROCEDURE_LINE = /^\s*Procedure(?:C|DLL|CDLL)?(?:\.\w+)?\s+(\w+)\s*\(([^)]*)\)/i;
 const STRUCTURE_LINE = /^\s*Structure\s+(\w+)/i;
+const END_STRUCTURE_LINE = /^\s*EndStructure\b/i;
+const STRUCTURE_FIELD_LINE = /^(\*?)([A-Za-z_]\w*)\.([A-Za-z_]\w*)(\[(\d+)\])?/;
 const INTERFACE_LINE = /^\s*Interface\s+(\w+)/i;
 const MACRO_LINE = /^\s*Macro\s+(\w+)/i;
 const CONSTANT_LINE = /^\s*#(\w+)(?:\.\w+)?\s*=\s*(.*)$/;
@@ -22,9 +28,28 @@ const CONSTANT_LINE = /^\s*#(\w+)(?:\.\w+)?\s*=\s*(.*)$/;
 export function extractWorkspaceSymbols(text: string): WorkspaceSymbol[] {
   const symbols: WorkspaceSymbol[] = [];
   const lines = text.split(/\r?\n/);
+  let currentStructure: WorkspaceSymbol | undefined;
 
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i];
+
+    if (currentStructure) {
+      if (END_STRUCTURE_LINE.test(line)) {
+        currentStructure = undefined;
+        continue;
+      }
+      const field = STRUCTURE_FIELD_LINE.exec(line.trim());
+      if (field) {
+        const [, pointer, name, type, , arraySize] = field;
+        (currentStructure.fields ??= []).push({
+          name,
+          type,
+          isPointer: pointer === "*",
+          arraySize: arraySize ? Number(arraySize) : undefined,
+        });
+      }
+      continue;
+    }
 
     const proc = PROCEDURE_LINE.exec(line);
     if (proc) {
@@ -34,7 +59,15 @@ export function extractWorkspaceSymbols(text: string): WorkspaceSymbol[] {
 
     const struct = STRUCTURE_LINE.exec(line);
     if (struct) {
-      symbols.push({ kind: "structure", name: struct[1], line: i, detail: "Structure" });
+      const symbol: WorkspaceSymbol = {
+        kind: "structure",
+        name: struct[1],
+        line: i,
+        detail: "Structure",
+        fields: [],
+      };
+      symbols.push(symbol);
+      currentStructure = symbol;
       continue;
     }
 

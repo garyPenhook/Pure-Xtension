@@ -3,7 +3,7 @@
 **A full-featured VS Code language extension for PureBasic with deeply integrated
 help, IntelliSense, build/run tasks, and a native debugger bridge.**
 
-- Status: M2 complete (build & diagnostics); M3 (language server IntelliSense) in progress
+- Status: M2 complete (build & diagnostics); M3 (language server IntelliSense) complete
 - Target VS Code engine: `^1.85.0` (matches the existing help-viewer prototype)
 - Reference PureBasic install: `/home/gary/Apps/purebasic-v6.41` (v6.41, Linux x64)
 - Language: TypeScript (extension host) + a small Language Server (Node)
@@ -330,7 +330,7 @@ Pure_Xtension/
   limitation noted under M1). Full in-editor GUI smoke test still pending a
   working display.
 
-**M3 — Language Server IntelliSense (0.4)** 🚧 in progress
+**M3 — Language Server IntelliSense (0.4)** ✅ done (GUI smoke test still pending a display)
 - `server/`: separate `vscode-languageserver` process, bundled by esbuild to
   `dist/server.js` and started over IPC via `vscode-languageclient` from
   `src/client.ts`. Wired into `extension.ts` activation and into
@@ -363,12 +363,68 @@ Pure_Xtension/
   and fixed an out-of-spec LSP `uinteger` (`Number.MAX_SAFE_INTEGER` used
   as a character offset) and an unguarded `client.start()` that could leave
   the client in a half-started state on failure.
-- Remaining for M3: `signatureHelp`, `rename`, `references`, cross-file
-  symbol resolution via the `IncludeFile`/`XIncludeFile` graph, structure
-  field completion (via the already-parsed but not-yet-wired `-qs` field
-  data), and `-sb` standby-mode investigation for faster incremental
-  rebuilds. Full in-editor GUI smoke test still pending a working display
-  (same X/pointer limitation as M1/M2).
+- `server/src/includeGraph.ts`: walks the `IncludeFile`/`XIncludeFile` graph
+  from the active document (paths resolved relative to the including file's
+  directory, cycle-safe via a visited-URI set, depth-capped at 8), reading
+  unopened files straight off disk and open ones through the LSP's own
+  `TextDocuments` cache. Every symbol it returns is tagged with the URI it
+  was declared in. `completion`, `hover`, and `definition` were switched from
+  single-document `extractWorkspaceSymbols` to this, so a symbol defined in
+  an included file now resolves, hovers, and jumps to the *included* file
+  (not just the entry file) — verified against a synthetic
+  `main.pb` → `XIncludeFile "lib.pbi"` fixture (`resolveIncludeGraphSymbols`
+  correctly tags `LibFunc` with `lib.pbi`'s URI).
+- `signatureHelp` (`server/src/server.ts`): depth-aware backward scan from
+  the cursor finds the enclosing, still-open `(` and counts top-level commas
+  for the active-parameter index; resolves against built-in functions (params
+  from the `-lf` dump) or user procedures (params from
+  `extractWorkspaceSymbols`, now include-graph-aware).
+- `references`/`rename` (`onReferences`/`onPrepareRename`/`onRenameRequest`):
+  word-boundary-aware occurrence search scoped to the **current document
+  only** — cross-file rename/references were deliberately deferred (renaming
+  across files without type-aware call-site verification risks silently
+  corrupting unrelated identically-named symbols in other files; single-file
+  scope is the safe default until real cross-file usage tracking exists).
+- Structure field completion: `workspaceSymbols.ts` now parses fields inside
+  `Structure`/`EndStructure` blocks (same field-line shape as the `-qs` dump,
+  reusing `StructureField`) so user-defined structures get field completion
+  for free; `builtinIndex.ts` adds an on-demand, per-name-cached `-qs <name>`
+  query (`queryStructureFields`) for built-in structures. A first-occurrence
+  `variable.TypeName` scan maps identifiers to their declared structure type,
+  so typing `variable\` completion-triggers on either source. Verified `-qs`
+  behavior directly against `pbcompiler 6.41`: it always exits 0, including
+  for an unknown structure name (empty output file) — confirmed, not
+  assumed, so `queryStructureFields`'s try/catch is a defensive backstop, not
+  the primary "not found" path (that's just an empty array). Field parsing
+  verified against real structures in
+  `purebasic-v6.41/examples/3d/TerrainPhysic.pb`.
+- `-sb` standby-mode investigation (spike, not shipped): traced `pbcompiler
+  -sb` under `strace -f` with a held-open FIFO on stdin (verified the FIFO
+  itself doesn't spuriously EOF — a control test with a plain `while read`
+  loop against the same FIFO setup stayed alive across multiple writes).
+  Confirmed facts: it's a single process (no fork/exec of a worker), it
+  writes `STARTING\t<ver>\t<name>\n` then `READY\n` to stdout, then
+  `read(0, ...)`s one line from stdin. Sending a source filename (with or
+  without leading `-k -q`) is read successfully, but the process then issues
+  a second `read(0)` that returns 0 and calls `exit_group(0)` immediately —
+  no compile output, no diagnostics, no second `READY`, even though stdin's
+  write end was verifiably still held open. Whatever turns that one line
+  into a "run a check and loop" action (a second line? a specific
+  terminator? a different transport than piped stdin?) is not established by
+  black-box testing, and PLAN.md's own fact-verification rule is to not ship
+  a guess. **Decision: keep the per-check `pbcompiler -k -q <file>` spawn
+  (`src/build/diagnostics.ts`, 400ms debounce) as the shipping diagnostics
+  path**; `-sb` stays a documented open question (§8, risk 3) rather than a
+  half-implemented feature.
+- Cross-file references/rename: still deliberately out of scope (see above).
+- M3 is otherwise feature-complete: completion, hover, documentSymbol,
+  definition, signatureHelp, references/rename (single-file), and structure
+  field completion all work across the include graph, backed by real
+  `pbcompiler` dumps. Full in-editor GUI smoke test still pending a working
+  display (same X/pointer limitation as M1/M2) — `tsc --noEmit` (both
+  tsconfigs) and the esbuild bundle are clean, and the new parsing/resolution
+  logic was smoke-tested against real PureBasic source and real `pbcompiler`
+  output, not just typechecked.
 
 **M4 — Deep help integration (0.5)** ← headline
 - `pbdocmaker`/`.help` pipeline → topic index; hover docs, `F1` context help, Help
@@ -403,8 +459,12 @@ Pure_Xtension/
    with a spike; the `Debug`/`OnError` fallback de-risks shipping *something*.
 2. **`.help` binary format** — mitigated by preferring `pbdocmaker`-generated HTML
    and reusing the existing help-viewer's `.help` reader as fallback.
-3. **`-sb` standby protocol** for fast incremental checks may need reverse
-   engineering; fallback is plain per-check `pbcompiler -k` with debounce.
+3. **`-sb` standby protocol** for fast incremental checks — spiked (see M3
+   notes): confirmed handshake (`STARTING`/`READY`) and that it reads one
+   stdin line, but it exits after that line instead of looping, and
+   black-box testing couldn't establish what makes it stay resident.
+   Shipping with the fallback (plain per-check `pbcompiler -k -q` with
+   400ms debounce, already implemented in `src/build/diagnostics.ts`).
 4. **Cross-platform** — pipeline assumes Linux paths/tools; Windows `.chm` + IDE
    paths differ. Ship Linux first; abstract tool discovery behind `config.ts`.
 5. **Relationship to existing help-viewer extension** — decide: absorb it as the
@@ -417,9 +477,10 @@ Pure_Xtension/
 ---
 
 ## 9. Immediate next steps
-1. Confirm scope/priorities (esp. whether the debugger or a Form Designer is in
-   the 1.0 cut).
-2. M0 scaffold + M1 grammar so there's a testable extension against the real
-   `examples/sources` files within the first iteration.
-3. Spike `pbdebugger` invocation early (in parallel with M1–M4) to retire the
+1. M0–M3 done. Start **M4 — deep help integration**: stand up the
+   `pbdocmaker`/`.help` topic index, then wire hover docs, `F1` context help,
+   the Help browser webview, and completion documentation on top of it.
+2. Spike `pbdebugger` invocation early (in parallel with M4) to retire the
    biggest risk before M5.
+3. Confirm scope/priorities (esp. whether the debugger or a Form Designer is
+   in the 1.0 cut) before M5/M6.

@@ -2,7 +2,13 @@ import { execFile } from "node:child_process";
 import { mkdtemp, readFile, rm, mkdir, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { parseFunctionsDump, parseNameListDump, BuiltinFunction } from "./dumpParsers";
+import {
+  parseFunctionsDump,
+  parseNameListDump,
+  parseStructureFieldsDump,
+  BuiltinFunction,
+  StructureField,
+} from "./dumpParsers";
 
 export interface BuiltinIndex {
   compilerVersion: string;
@@ -64,6 +70,26 @@ export async function buildBuiltinIndex(compilerPath: string): Promise<BuiltinIn
       structures: parseNameListDump(structsText),
       interfaces: parseNameListDump(ifacesText),
     };
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+}
+
+/** On-demand `-qs <name>` lookup for a single built-in structure's fields. */
+export async function queryStructureFields(
+  compilerPath: string,
+  structureName: string,
+): Promise<StructureField[]> {
+  const dir = await mkdtemp(join(tmpdir(), "pure-xtension-qs-"));
+  try {
+    const stubSource = join(dir, "stub.pb");
+    const outFile = join(dir, "fields.txt");
+    await writeFile(stubSource, "; symbol-dump stub\n", "utf8");
+    await runCompiler(compilerPath, [stubSource, "-qs", structureName, "-o", outFile, "-k", "-q"]);
+    const text = await readFile(outFile, "utf8");
+    return parseStructureFieldsDump(text);
+  } catch {
+    return [];
   } finally {
     await rm(dir, { recursive: true, force: true });
   }

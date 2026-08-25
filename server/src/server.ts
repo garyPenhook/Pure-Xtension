@@ -14,10 +14,20 @@ import {
   Position,
   InitializeParams,
   InitializeResult,
+  SignatureHelp,
+  SignatureInformation,
+  ParameterInformation,
+  ReferenceParams,
+  RenameParams,
+  PrepareRenameParams,
+  WorkspaceEdit,
+  TextEdit,
 } from "vscode-languageserver/node";
 import { TextDocument } from "vscode-languageserver-textdocument";
-import { BuiltinIndex, loadOrBuildBuiltinIndex } from "./builtinIndex";
-import { extractWorkspaceSymbols, WorkspaceSymbol } from "./workspaceSymbols";
+import { BuiltinIndex, loadOrBuildBuiltinIndex, queryStructureFields } from "./builtinIndex";
+import { WorkspaceSymbol } from "./workspaceSymbols";
+import { resolveIncludeGraphSymbols, ResolvedSymbol } from "./includeGraph";
+import { StructureField } from "./dumpParsers";
 
 interface InitializationOptions {
   compilerPath?: string;
@@ -30,6 +40,7 @@ const documents = new TextDocuments(TextDocument);
 let builtinIndex: BuiltinIndex | undefined;
 let compilerPath = "";
 let cacheDir = "";
+const structureFieldsCache = new Map<string, StructureField[]>();
 
 async function ensureBuiltinIndex(): Promise<BuiltinIndex | undefined> {
   if (builtinIndex) return builtinIndex;
@@ -42,14 +53,56 @@ async function ensureBuiltinIndex(): Promise<BuiltinIndex | undefined> {
   return builtinIndex;
 }
 
+async function getBuiltinStructureFields(name: string): Promise<StructureField[]> {
+  const key = name.toLowerCase();
+  const cached = structureFieldsCache.get(key);
+  if (cached) return cached;
+  if (!compilerPath) return [];
+  const fields = await queryStructureFields(compilerPath, name);
+  structureFieldsCache.set(key, fields);
+  return fields;
+}
+
+function isWordChar(ch: string): boolean {
+  return /[\w#]/.test(ch);
+}
+
 function wordAt(text: string, offset: number): string | undefined {
-  const isWordChar = (ch: string) => /[\w#]/.test(ch);
   let start = offset;
   let end = offset;
   while (start > 0 && isWordChar(text[start - 1])) start--;
   while (end < text.length && isWordChar(text[end])) end++;
   if (start === end) return undefined;
   return text.slice(start, end);
+}
+
+function wordRangeAt(text: string, offset: number): { start: number; end: number } | undefined {
+  let start = offset;
+  let end = offset;
+  while (start > 0 && isWordChar(text[start - 1])) start--;
+  while (end < text.length && isWordChar(text[end])) end++;
+  if (start === end) return undefined;
+  return { start, end };
+}
+
+function findWordRanges(doc: TextDocument, word: string): Range[] {
+  const text = doc.getText();
+  const lower = word.toLowerCase();
+  const ranges: Range[] = [];
+  let i = 0;
+  while (i < text.length) {
+    if (isWordChar(text[i]) && (i === 0 || !isWordChar(text[i - 1]))) {
+      let j = i;
+      while (j < text.length && isWordChar(text[j])) j++;
+      if (text.slice(i, j).toLowerCase() === lower) {
+        ranges.push(Range.create(doc.positionAt(i), doc.positionAt(j)));
+      }
+      i = j;
+    } else {
+      i++;
+    }
+  }
+  return ranges;
 }
 
 function workspaceSymbolKindToLsp(kind: WorkspaceSymbol["kind"]): SymbolKind {
@@ -67,6 +120,98 @@ function workspaceSymbolKindToLsp(kind: WorkspaceSymbol["kind"]): SymbolKind {
   }
 }
 
+/** Backward scan from `offset` for the enclosing, unclosed `(` and which comma-separated
+ *  argument slot `offset` falls in — used to resolve the active function call for signatureHelp. */
+function findEnclosingCall(text: string, offset: number): { name: string; activeParameter: number } | undefined {
+  let depth = 0;
+  let activeParameter = 0;
+  let i = offset - 1;
+  while (i >= 0) {
+    const ch = text[i];
+    if (ch === ")") {
+      depth++;
+    } else if (ch === "(") {
+      if (depth === 0) {
+        const name = wordAt(text, i);
+        return name ? { name, activeParameter } : undefined;
+      }
+      depth--;
+    } else if (ch === "," && depth === 0) {
+      activeParameter++;
+    }
+    i--;
+  }
+  return undefined;
+}
+
+function splitParams(params: string): string[] {
+  const parts: string[] = [];
+  let depth = 0;
+  let current = "";
+  for (const ch of params) {
+    if (ch === "(") depth++;
+    else if (ch === ")") depth--;
+    if (ch === "," && depth === 0) {
+      parts.push(current.trim());
+      current = "";
+    } else {
+      current += ch;
+    }
+  }
+  if (current.trim()) parts.push(current.trim());
+  return parts;
+}
+
+function knownStructureNames(symbols: ResolvedSymbol[], index: BuiltinIndex | undefined): Set<string> {
+  const names = new Set<string>();
+  for (const symbol of symbols) {
+    if (symbol.kind === "structure") names.add(symbol.name.toLowerCase());
+  }
+  for (const name of index?.structures ?? []) names.add(name.toLowerCase());
+  return names;
+}
+
+/** First-occurrence `variable.TypeName` declarations where TypeName is a known structure. */
+function buildVariableTypeMap(text: string, structureNames: Set<string>): Map<string, string> {
+  const map = new Map<string, string>();
+  const DECL = /\b(\w+)\.(\w+)\b/g;
+  let match: RegExpExecArray | null;
+  while ((match = DECL.exec(text))) {
+    const [, varName, typeName] = match;
+    const key = varName.toLowerCase();
+    if (!map.has(key) && structureNames.has(typeName.toLowerCase())) {
+      map.set(key, typeName);
+    }
+  }
+  return map;
+}
+
+async function structureFieldCompletions(
+  text: string,
+  backslashOffset: number,
+  uri: string,
+): Promise<CompletionItem[]> {
+  const varWord = wordAt(text, backslashOffset - 1);
+  if (!varWord) return [];
+
+  const symbols = resolveIncludeGraphSymbols(uri, documents);
+  const index = await ensureBuiltinIndex();
+  const structureNames = knownStructureNames(symbols, index);
+  const typeName = buildVariableTypeMap(text, structureNames).get(varWord.toLowerCase());
+  if (!typeName) return [];
+
+  const userStruct = symbols.find(
+    (s) => s.kind === "structure" && s.name.toLowerCase() === typeName.toLowerCase(),
+  );
+  const fields = userStruct?.fields ?? (await getBuiltinStructureFields(typeName));
+
+  return fields.map((field) => ({
+    label: field.name,
+    kind: CompletionItemKind.Field,
+    detail: `${field.isPointer ? "*" : ""}${field.name}.${field.type}${field.arraySize ? `[${field.arraySize}]` : ""}`,
+  }));
+}
+
 connection.onInitialize((params: InitializeParams): InitializeResult => {
   const options = (params.initializationOptions ?? {}) as InitializationOptions;
   compilerPath = options.compilerPath ?? "";
@@ -75,21 +220,34 @@ connection.onInitialize((params: InitializeParams): InitializeResult => {
   return {
     capabilities: {
       textDocumentSync: TextDocumentSyncKind.Incremental,
-      completionProvider: { resolveProvider: false, triggerCharacters: ["#"] },
+      completionProvider: { resolveProvider: false, triggerCharacters: ["#", "\\"] },
       hoverProvider: true,
       documentSymbolProvider: true,
       definitionProvider: true,
+      signatureHelpProvider: { triggerCharacters: ["(", ","] },
+      referencesProvider: true,
+      renameProvider: { prepareProvider: true },
     },
   };
 });
 
 connection.onRequest("pureXtension/rebuildSymbolCache", async () => {
   builtinIndex = undefined;
+  structureFieldsCache.clear();
   await ensureBuiltinIndex();
 });
 
 connection.onCompletion(async (params): Promise<CompletionItem[]> => {
   const doc = documents.get(params.textDocument.uri);
+  if (!doc) return [];
+
+  const text = doc.getText();
+  const offset = doc.offsetAt(params.position);
+
+  if (offset > 0 && text[offset - 1] === "\\") {
+    return structureFieldCompletions(text, offset, doc.uri);
+  }
+
   const items: CompletionItem[] = [];
 
   const index = await ensureBuiltinIndex();
@@ -107,21 +265,19 @@ connection.onCompletion(async (params): Promise<CompletionItem[]> => {
     }
   }
 
-  if (doc) {
-    for (const symbol of extractWorkspaceSymbols(doc.getText())) {
-      items.push({
-        label: symbol.name,
-        kind:
-          symbol.kind === "procedure"
-            ? CompletionItemKind.Function
-            : symbol.kind === "structure"
-              ? CompletionItemKind.Struct
-              : symbol.kind === "constant"
-                ? CompletionItemKind.Constant
-                : CompletionItemKind.Reference,
-        detail: symbol.detail,
-      });
-    }
+  for (const symbol of resolveIncludeGraphSymbols(doc.uri, documents)) {
+    items.push({
+      label: symbol.name,
+      kind:
+        symbol.kind === "procedure"
+          ? CompletionItemKind.Function
+          : symbol.kind === "structure"
+            ? CompletionItemKind.Struct
+            : symbol.kind === "constant"
+              ? CompletionItemKind.Constant
+              : CompletionItemKind.Reference,
+      detail: symbol.detail,
+    });
   }
 
   return items;
@@ -140,7 +296,7 @@ connection.onHover((params): Hover | undefined => {
     return { contents: { kind: "markdown", value: `**${fn.signature}**\n\n${fn.description}` } };
   }
 
-  const symbol = extractWorkspaceSymbols(doc.getText()).find(
+  const symbol = resolveIncludeGraphSymbols(doc.uri, documents).find(
     (s) => s.name.toLowerCase() === word.toLowerCase(),
   );
   if (symbol) {
@@ -157,21 +313,23 @@ connection.onDocumentSymbol((params): DocumentSymbol[] => {
   if (!doc) return [];
 
   const lines = doc.getText().split(/\r?\n/);
-  return extractWorkspaceSymbols(doc.getText()).map((symbol) => {
-    // LSP's `uinteger` caps at 2^32-1; Number.MAX_SAFE_INTEGER overflows that
-    // and can fail strict client-side validation, so clamp to the real line length.
-    const range = Range.create(
-      Position.create(symbol.line, 0),
-      Position.create(symbol.line, lines[symbol.line]?.length ?? 0),
-    );
-    return DocumentSymbol.create(
-      symbol.name,
-      symbol.detail,
-      workspaceSymbolKindToLsp(symbol.kind),
-      range,
-      range,
-    );
-  });
+  return resolveIncludeGraphSymbols(doc.uri, documents)
+    .filter((symbol) => symbol.uri === doc.uri)
+    .map((symbol) => {
+      // LSP's `uinteger` caps at 2^32-1; Number.MAX_SAFE_INTEGER overflows that
+      // and can fail strict client-side validation, so clamp to the real line length.
+      const range = Range.create(
+        Position.create(symbol.line, 0),
+        Position.create(symbol.line, lines[symbol.line]?.length ?? 0),
+      );
+      return DocumentSymbol.create(
+        symbol.name,
+        symbol.detail,
+        workspaceSymbolKindToLsp(symbol.kind),
+        range,
+        range,
+      );
+    });
 });
 
 connection.onDefinition((params): Definition | undefined => {
@@ -182,13 +340,94 @@ connection.onDefinition((params): Definition | undefined => {
   const word = wordAt(doc.getText(), offset);
   if (!word) return undefined;
 
-  const symbol = extractWorkspaceSymbols(doc.getText()).find(
+  const symbol = resolveIncludeGraphSymbols(doc.uri, documents).find(
     (s) => s.name.toLowerCase() === word.toLowerCase(),
   );
   if (!symbol) return undefined;
 
   const range = Range.create(Position.create(symbol.line, 0), Position.create(symbol.line, 0));
-  return Location.create(params.textDocument.uri, range);
+  return Location.create(symbol.uri, range);
+});
+
+connection.onSignatureHelp(async (params): Promise<SignatureHelp | undefined> => {
+  const doc = documents.get(params.textDocument.uri);
+  if (!doc) return undefined;
+
+  const offset = doc.offsetAt(params.position);
+  const call = findEnclosingCall(doc.getText(), offset);
+  if (!call) return undefined;
+
+  const index = await ensureBuiltinIndex();
+  const fn = index?.functions.find((f) => f.name.toLowerCase() === call.name.toLowerCase());
+  if (fn) {
+    const params_ = splitParams(fn.params);
+    return {
+      signatures: [
+        SignatureInformation.create(
+          fn.signature,
+          fn.description,
+          ...params_.map((p) => ParameterInformation.create(p)),
+        ),
+      ],
+      activeSignature: 0,
+      activeParameter: Math.min(call.activeParameter, Math.max(params_.length - 1, 0)),
+    };
+  }
+
+  const procedure = resolveIncludeGraphSymbols(doc.uri, documents).find(
+    (s) => s.kind === "procedure" && s.name.toLowerCase() === call.name.toLowerCase(),
+  );
+  if (procedure) {
+    const rawParams = procedure.detail.replace(/^\(|\)$/g, "");
+    const params_ = splitParams(rawParams);
+    return {
+      signatures: [
+        SignatureInformation.create(
+          `${procedure.name} ${procedure.detail}`,
+          undefined,
+          ...params_.map((p) => ParameterInformation.create(p)),
+        ),
+      ],
+      activeSignature: 0,
+      activeParameter: Math.min(call.activeParameter, Math.max(params_.length - 1, 0)),
+    };
+  }
+
+  return undefined;
+});
+
+connection.onReferences((params: ReferenceParams): Location[] => {
+  const doc = documents.get(params.textDocument.uri);
+  if (!doc) return [];
+
+  const offset = doc.offsetAt(params.position);
+  const word = wordAt(doc.getText(), offset);
+  if (!word) return [];
+
+  return findWordRanges(doc, word).map((range) => Location.create(doc.uri, range));
+});
+
+connection.onPrepareRename((params: PrepareRenameParams): Range | undefined => {
+  const doc = documents.get(params.textDocument.uri);
+  if (!doc) return undefined;
+
+  const offset = doc.offsetAt(params.position);
+  const range = wordRangeAt(doc.getText(), offset);
+  if (!range) return undefined;
+
+  return Range.create(doc.positionAt(range.start), doc.positionAt(range.end));
+});
+
+connection.onRenameRequest((params: RenameParams): WorkspaceEdit | undefined => {
+  const doc = documents.get(params.textDocument.uri);
+  if (!doc) return undefined;
+
+  const offset = doc.offsetAt(params.position);
+  const word = wordAt(doc.getText(), offset);
+  if (!word) return undefined;
+
+  const edits: TextEdit[] = findWordRanges(doc, word).map((range) => TextEdit.replace(range, params.newName));
+  return { changes: { [doc.uri]: edits } };
 });
 
 documents.listen(connection);
