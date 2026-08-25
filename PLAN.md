@@ -3,13 +3,11 @@
 **A full-featured VS Code language extension for PureBasic with deeply integrated
 help, IntelliSense, build/run tasks, and a native debugger bridge.**
 
-- Status: M2, M3 complete; M4 (deep help integration) in progress —
-  online-docs deep-links (hover link, `F1` webview) done, completion docs
-  and keyword/structure coverage still open
+- Status: M2, M3, M4 (deep help integration) complete. M5 (debugger) not started.
 - Target VS Code engine: `^1.85.0` (matches the existing help-viewer prototype)
 - Reference PureBasic install: `/home/gary/Apps/purebasic-v6.41` (v6.41, Linux x64)
 - Language: TypeScript (extension host) + a small Language Server (Node)
-- Date: 2026-08-24
+- Date: 2026-08-25
 
 ---
 
@@ -435,7 +433,7 @@ Pure_Xtension/
   logic was smoke-tested against real PureBasic source and real `pbcompiler`
   output, not just typechecked.
 
-**M4 — Deep help integration (0.5)** ← headline — in progress
+**M4 — Deep help integration (0.5)** ← headline — ✅ done
 - **Design change from the original plan (verified, not guessed):** the two
   offline pipelines in §4.3 don't actually exist. `pbdocmaker` is GUI-only —
   no `--help`, no flags in the binary's string table, and it opens a window
@@ -545,11 +543,24 @@ Pure_Xtension/
   `syntaxes/purebasic.tmLanguage.json`'s control/declaration/storage/
   operator patterns has a table entry (checked programmatically against
   the actual grammar file, not by eye) — zero gaps.
-- Remaining for M4: the sidebar has no search/filter box yet, just category
-  browsing. Interface hover still has no method list (see above). Keyword
-  hover doesn't distinguish e.g. `Return` (Gosub) from `ProcedureReturn`
-  semantically — both are correct, just noting the mapping is per-token,
-  not context-aware.
+- **Help search** ✅: `pureXtension.searchHelp` (`src/help/helpTreeProvider.ts`)
+  — a `QuickPick` over every entry in the online help index (name + category,
+  `matchOnDescription` so typing a category like `string` narrows results
+  too), reusing the same `listHelpEntries`/`openHelpEntry` path as the tree.
+  Bound to a `$(search)` button in the Help browser's title bar (left of the
+  existing refresh button) and to the command palette; guards against an
+  empty index (client not started yet) with a message instead of showing a
+  blank picker.
+- **Remaining, accepted gaps (not blocking M4 completion):** interface hover
+  still has no method list — `-qs` (the only per-symbol dump PureBasic's
+  compiler exposes) is structures-only, confirmed against `pbcompiler
+  --help`: there is no `-qi`/interface equivalent. Scraping each interface's
+  individual purebasic.com page for its method table is possible in
+  principle (interfaces do have doc pages, unlike keywords) but is new
+  scope, not a fix to something broken — deferred rather than guessed at.
+  Keyword hover also doesn't distinguish e.g. `Return` (Gosub) from
+  `ProcedureReturn` semantically — both resolve correctly, the mapping is
+  just per-token, not context-aware. Neither gap blocks real usage.
 
 **M5 — Debugger (0.6)**
 - Probe pbdebugger protocol → minimal DAP (launch, breakpoint, continue, stack,
@@ -603,10 +614,12 @@ Pure_Xtension/
 ---
 
 ## 9. Immediate next steps
-1. M0–M3 done. Start **M4 — deep help integration**: stand up the
-   `pbdocmaker`/`.help` topic index, then wire hover docs, `F1` context help,
-   the Help browser webview, and completion documentation on top of it.
-2. Spike `pbdebugger` invocation early (in parallel with M4) to retire the
-   biggest risk before M5.
+1. M0–M4 done. Start **M5 — debugger**: spike `pbdebugger`'s control
+   protocol (risk 1 in §8 — biggest unknown in the whole project) before
+   building any DAP scaffolding, since a negative result changes the shape
+   of M5 (fall back to the `Debug`/`OnError` trace approach in §4.5).
+2. Full in-editor GUI smoke test (M1–M4 features) is still pending a working
+   X display in this sandbox — flag to the user to manually verify in a real
+   VS Code session before any marketplace publish.
 3. Confirm scope/priorities (esp. whether the debugger or a Form Designer is
    in the 1.0 cut) before M5/M6.

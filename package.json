@@ -120,6 +120,11 @@
       {
         "command": "pureXtension.openHelpEntry",
         "title": "Pure Xtension: Open Help Entry"
+      },
+      {
+        "command": "pureXtension.searchHelp",
+        "title": "Pure Xtension: Search Help",
+        "icon": "$(search)"
       }
     ],
     "menus": {
@@ -143,13 +148,21 @@
         {
           "command": "pureXtension.openHelpEntry",
           "when": "false"
+        },
+        {
+          "command": "pureXtension.searchHelp"
         }
       ],
       "view/title": [
         {
+          "command": "pureXtension.searchHelp",
+          "when": "view == pureXtension.helpBrowser",
+          "group": "navigation@1"
+        },
+        {
           "command": "pureXtension.rebuildHelpIndex",
           "when": "view == pureXtension.helpBrowser",
-          "group": "navigation"
+          "group": "navigation@2"
         }
       ]
     },

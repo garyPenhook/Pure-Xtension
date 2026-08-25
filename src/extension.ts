@@ -12,7 +12,7 @@ import {
   stopLanguageClient,
 } from "./client";
 import { showHelpPage } from "./help/helpViewer";
-import { HelpTreeProvider, openHelpEntry } from "./help/helpTreeProvider";
+import { HelpTreeProvider, openHelpEntry, searchHelp } from "./help/helpTreeProvider";
 
 function wordAt(text: string, offset: number): string | undefined {
   const isWordChar = (ch: string) => /[\w#]/.test(ch);
@@ -91,6 +91,7 @@ export function activate(context: vscode.ExtensionContext): void {
     vscode.commands.registerCommand("pureXtension.openHelpEntry", (entry: HelpEntry) =>
       openHelpEntry(entry),
     ),
+    vscode.commands.registerCommand("pureXtension.searchHelp", () => searchHelp()),
     vscode.workspace.onDidSaveTextDocument((doc) => diagnostics.scheduleCheck(doc)),
     vscode.workspace.onDidOpenTextDocument((doc) => diagnostics.scheduleCheck(doc)),
     vscode.workspace.onDidCloseTextDocument((doc) => diagnostics.clear(doc)),

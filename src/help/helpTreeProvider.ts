@@ -83,3 +83,25 @@ export class HelpTreeProvider implements vscode.TreeDataProvider<HelpTreeNode> {
 export function openHelpEntry(entry: HelpEntry): void {
   showHelpPage(entry.name, entry.url);
 }
+
+/** Fuzzy-searchable QuickPick over every entry in the online help index — the
+ *  sidebar's category tree has no filter box, so this is the "type to find a
+ *  command" path (bound to the view's title bar and the command palette). */
+export async function searchHelp(): Promise<void> {
+  const entries = await listHelpEntries();
+  if (entries.length === 0) {
+    vscode.window.showInformationMessage(
+      "Pure Xtension: help index isn't loaded yet — try again once the language server has started.",
+    );
+    return;
+  }
+
+  const picked = await vscode.window.showQuickPick(
+    entries
+      .slice()
+      .sort((a, b) => a.name.localeCompare(b.name))
+      .map((entry) => ({ label: entry.name, description: categoryOf(entry), entry })),
+    { placeHolder: "Search PureBasic help...", matchOnDescription: true },
+  );
+  if (picked) openHelpEntry(picked.entry);
+}
