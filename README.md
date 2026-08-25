@@ -1,5 +1,7 @@
 # Pure Xtension
 
+[![CI](https://github.com/garyPenhook/Pure-Xtension/actions/workflows/ci.yml/badge.svg)](https://github.com/garyPenhook/Pure-Xtension/actions/workflows/ci.yml)
+
 A VS Code extension that turns VS Code into a PureBasic IDE on Linux: syntax
 highlighting, IntelliSense backed by the real compiler, build/run tasks with
 inline diagnostics, deep links into PureBasic's live online documentation,
