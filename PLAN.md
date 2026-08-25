@@ -528,14 +528,28 @@ Pure_Xtension/
   - Verified: category-extraction regex tested against a real fetch of all
     1888 `commandindex.html` entries (88 categories, 0 uncategorized).
     `tsc --noEmit` (both tsconfigs) and esbuild clean.
-- Remaining for M4: language-keyword hover/help (`If`, `For`, `Procedure`,
-  ...) is still uncovered — those aren't in `builtinIndex` at all (that index
-  only holds `-lf`/`-ls`/`-li` dump contents, which are functions/
-  structures/interfaces, not language keywords), and `commandindex.html`
-  doesn't list them either (verified: it's function/structure/interface
-  commands only, not the `reference/*.html` keyword pages) — would need a
-  separate, hand-maintained keyword → `reference/*.html` URL table. The
-  sidebar has no search/filter box yet, just category browsing.
+- **Language-keyword hover/help** ✅: `server/src/keywordHelp.ts` is a
+  hand-built `keyword → reference/*.html` table — there's no machine-
+  readable index for this (`commandindex.html` only covers functions/
+  structures/interfaces, confirmed empty for `Goto`/`End`/`Swap`/`And`/etc.),
+  and several keywords share one prose topic page with no per-keyword
+  anchor (`If`/`ElseIf`/`Else`/`EndIf` all → `if_endif.html`; `Goto`/`End`/
+  `Swap` all → the catch-all `others.html`, confirmed by fetching that page
+  and finding all three literally on it). Built by walking
+  `documentation/index.html`'s "Language fundamentals" section and
+  confirming every one of the 26 distinct target pages returns HTTP 200.
+  Wired into `onHover` as the last fallback (after builtin functions,
+  workspace symbols, builtin structures/interfaces) and into
+  `pureXtension/helpUrl` (so `F1` resolves keywords too, not just
+  functions). Verified: every one of the 70 keywords in
+  `syntaxes/purebasic.tmLanguage.json`'s control/declaration/storage/
+  operator patterns has a table entry (checked programmatically against
+  the actual grammar file, not by eye) — zero gaps.
+- Remaining for M4: the sidebar has no search/filter box yet, just category
+  browsing. Interface hover still has no method list (see above). Keyword
+  hover doesn't distinguish e.g. `Return` (Gosub) from `ProcedureReturn`
+  semantically — both are correct, just noting the mapping is per-token,
+  not context-aware.
 
 **M5 — Debugger (0.6)**
 - Probe pbdebugger protocol → minimal DAP (launch, breakpoint, continue, stack,

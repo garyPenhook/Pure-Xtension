@@ -29,6 +29,7 @@ import { WorkspaceSymbol } from "./workspaceSymbols";
 import { resolveIncludeGraphSymbols, ResolvedSymbol } from "./includeGraph";
 import { StructureField } from "./dumpParsers";
 import { HelpIndex, getHelpUrl, loadOrFetchHelpIndex } from "./onlineHelpIndex";
+import { getKeywordHelpUrl } from "./keywordHelp";
 
 interface InitializationOptions {
   compilerPath?: string;
@@ -265,7 +266,7 @@ connection.onRequest(
   "pureXtension/helpUrl",
   async (params: { symbol: string }): Promise<{ url?: string }> => {
     await ensureHelpIndex();
-    return { url: getHelpUrl(helpIndex, params.symbol) };
+    return { url: getHelpUrl(helpIndex, params.symbol) ?? getKeywordHelpUrl(params.symbol) };
   },
 );
 
@@ -369,6 +370,13 @@ connection.onHover(async (params): Promise<Hover | undefined> => {
         kind: "markdown",
         value: `**${builtinStructureOrInterface}**${fieldList}${link}`,
       },
+    };
+  }
+
+  const keywordUrl = getKeywordHelpUrl(word);
+  if (keywordUrl) {
+    return {
+      contents: { kind: "markdown", value: `**${word}**\n\n[Open documentation](${keywordUrl})` },
     };
   }
 
