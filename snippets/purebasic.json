@@ -1,0 +1,137 @@
+{
+  "Procedure": {
+    "prefix": "proc",
+    "body": [
+      "Procedure${1:.i} ${2:Name}(${3:})",
+      "  $0",
+      "EndProcedure"
+    ],
+    "description": "Procedure returning a typed value"
+  },
+  "ProcedureNoReturn": {
+    "prefix": "procs",
+    "body": [
+      "Procedure ${1:Name}(${2:})",
+      "  $0",
+      "EndProcedure"
+    ],
+    "description": "Procedure with no return value"
+  },
+  "If": {
+    "prefix": "if",
+    "body": [
+      "If ${1:condition}",
+      "  $0",
+      "EndIf"
+    ],
+    "description": "If / EndIf"
+  },
+  "IfElse": {
+    "prefix": "ifelse",
+    "body": [
+      "If ${1:condition}",
+      "  $2",
+      "Else",
+      "  $0",
+      "EndIf"
+    ],
+    "description": "If / Else / EndIf"
+  },
+  "For": {
+    "prefix": "for",
+    "body": [
+      "For ${1:i} = ${2:0} To ${3:10}",
+      "  $0",
+      "Next"
+    ],
+    "description": "For / Next loop"
+  },
+  "ForEach": {
+    "prefix": "foreach",
+    "body": [
+      "ForEach ${1:Collection}()",
+      "  $0",
+      "Next"
+    ],
+    "description": "ForEach / Next loop"
+  },
+  "While": {
+    "prefix": "while",
+    "body": [
+      "While ${1:condition}",
+      "  $0",
+      "Wend"
+    ],
+    "description": "While / Wend loop"
+  },
+  "Repeat": {
+    "prefix": "repeat",
+    "body": [
+      "Repeat",
+      "  $0",
+      "Until ${1:condition}"
+    ],
+    "description": "Repeat / Until loop"
+  },
+  "Select": {
+    "prefix": "select",
+    "body": [
+      "Select ${1:value}",
+      "  Case ${2:0}",
+      "    $0",
+      "  Default",
+      "    ",
+      "EndSelect"
+    ],
+    "description": "Select / Case / EndSelect"
+  },
+  "Structure": {
+    "prefix": "struct",
+    "body": [
+      "Structure ${1:Name}",
+      "  $0",
+      "EndStructure"
+    ],
+    "description": "Structure / EndStructure"
+  },
+  "Enumeration": {
+    "prefix": "enum",
+    "body": [
+      "Enumeration",
+      "  #${1:Constant}",
+      "  $0",
+      "EndEnumeration"
+    ],
+    "description": "Enumeration / EndEnumeration"
+  },
+  "Macro": {
+    "prefix": "macro",
+    "body": [
+      "Macro ${1:Name}",
+      "  $0",
+      "EndMacro"
+    ],
+    "description": "Macro / EndMacro"
+  },
+  "OpenWindowEventLoop": {
+    "prefix": "openwindow",
+    "body": [
+      "If OpenWindow(${1:0}, ${2:0}, ${3:0}, ${4:640}, ${5:480}, \"${6:Window}\")",
+      "  Repeat",
+      "    Event = WaitWindowEvent()",
+      "    $0",
+      "  Until Event = #PB_Event_CloseWindow",
+      "EndIf"
+    ],
+    "description": "OpenWindow with a standard event loop"
+  },
+  "FoldSection": {
+    "prefix": "fold",
+    "body": [
+      ";-${1:Section}",
+      ";",
+      "$0"
+    ],
+    "description": "PureBasic IDE fold marker section"
+  }
+}

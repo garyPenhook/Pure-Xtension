@@ -39,6 +39,12 @@
         "path": "./syntaxes/purebasic.tmLanguage.json"
       }
     ],
+    "snippets": [
+      {
+        "language": "purebasic",
+        "path": "./snippets/purebasic.json"
+      }
+    ],
     "configuration": {
       "title": "Pure Xtension",
       "properties": {

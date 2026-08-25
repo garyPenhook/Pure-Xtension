@@ -3,7 +3,7 @@
 **A full-featured VS Code language extension for PureBasic with deeply integrated
 help, IntelliSense, build/run tasks, and a native debugger bridge.**
 
-- Status: Planning
+- Status: M1 complete (static language support); M2 (build & diagnostics) next
 - Target VS Code engine: `^1.85.0` (matches the existing help-viewer prototype)
 - Reference PureBasic install: `/home/gary/Apps/purebasic-v6.41` (v6.41, Linux x64)
 - Language: TypeScript (extension host) + a small Language Server (Node)
@@ -280,9 +280,23 @@ Pure_Xtension/
 - Yeoman/manual scaffold, `package.json` manifest, esbuild build, CI, publish
   dry-run (`vsce package`). Language id + basic activation.
 
-**M1 — Static language support (0.2)**
+**M1 — Static language support (0.2)** ✅ done
 - TextMate grammar, language-configuration, snippets, folding. Manual test against
   `examples/sources/*.pb`. No server yet.
+- Grammar covers comments, strings, numbers (hex/binary/float/decimal), compiler
+  directives, `#Constants`, control/declaration/storage keywords, operators,
+  `@`/`*` pointer-address, function-call names (`entity.name.function`), and
+  `.type` suffixes (`storage.type.suffix`) split from variable names.
+- Folding fixed to match PureBasic's real IDE convention (`;-Section` markers,
+  verified against `examples/**/*.pb`) — the original `;{{{`/`;}}}` markers were
+  never a PureBasic convention and have been removed.
+- Snippet library added (`snippets/purebasic.json`): `proc`, `procs`, `if`,
+  `ifelse`, `for`, `foreach`, `while`, `repeat`, `select`, `struct`, `enum`,
+  `macro`, `openwindow`, `fold`.
+- Verified: `tsc --noEmit` + esbuild clean; launched the real Extension
+  Development Host against `examples/3d/MouseRayCast.pb` with no activation
+  errors. (Screenshot-based visual QA was not possible — this sandbox's X
+  display has no working pointer/window grab.)
 
 **M2 — Build & diagnostics (0.3)**
 - Task provider + problem matcher + `-k` syntax check on save → Problems panel.

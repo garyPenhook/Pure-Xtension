@@ -13,6 +13,7 @@
     { "include": "#storage-keywords" },
     { "include": "#operators" },
     { "include": "#pointer-address" },
+    { "include": "#function-calls" },
     { "include": "#variables" }
   ],
   "repository": {
@@ -132,11 +133,27 @@
         }
       ]
     },
+    "function-calls": {
+      "patterns": [
+        {
+          "match": "\\b([A-Za-z_][A-Za-z0-9_]*)(\\.[a-zA-Z_][A-Za-z0-9_]*)?(\\s*)(\\()",
+          "captures": {
+            "1": { "name": "entity.name.function.purebasic" },
+            "2": { "name": "storage.type.suffix.purebasic" },
+            "4": { "name": "punctuation.section.parens.begin.purebasic" }
+          }
+        }
+      ]
+    },
     "variables": {
       "patterns": [
         {
-          "name": "variable.other.typed.purebasic",
-          "match": "\\b[A-Za-z_][A-Za-z0-9_]*(\\.[a-zA-Z_][A-Za-z0-9_]*)?\\$?"
+          "match": "\\b([A-Za-z_][A-Za-z0-9_]*)(\\.[a-zA-Z_][A-Za-z0-9_]*)?(\\$)?",
+          "captures": {
+            "1": { "name": "variable.other.purebasic" },
+            "2": { "name": "storage.type.suffix.purebasic" },
+            "3": { "name": "punctuation.definition.variable.string.purebasic" }
+          }
         }
       ]
     }
