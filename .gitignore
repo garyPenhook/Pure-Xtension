@@ -5,3 +5,4 @@ dist/
 .DS_Store
 src/debug/spike/test.bin
 src/debug/spike/test-step.bin
+src/debug/spike/test-arrays.bin

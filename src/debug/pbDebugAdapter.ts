@@ -17,9 +17,18 @@ import {
 } from "@vscode/debugadapter";
 import { DebugProtocol } from "@vscode/debugprotocol";
 import { Backend, resolveBackendSilent, resolveCompilerPath } from "../config";
-import { PbDebugSession, PbFrame } from "./pbSession";
+import { PbDebugSession, PbFrame, PbVariable } from "./pbSession";
 
 const MAIN_THREAD_ID = 1;
+// variablesReference values for compound (structure/array/list/map)
+// children live in a disjoint range above the small 1..N frame-scope refs
+// scopesRequest hands out (N = frame count, always small), so the two
+// numbering schemes can share one field without collision.
+const COMPOUND_REF_BASE = 100000;
+
+type CompoundHandle =
+  | { kind: "struct"; children: PbVariable[] }
+  | { kind: "array" | "list" | "map"; expression: string };
 
 interface LaunchArgs extends DebugProtocol.LaunchRequestArguments {
   program: string;
@@ -46,6 +55,9 @@ export class PureBasicDebugSession extends DebugSession {
   private lastFrames: PbFrame[] = [];
   /** Guards against sending TerminatedEvent twice — the wire session's `close` and the child's `exit` both fire on every teardown. */
   private terminated = false;
+  /** Structure/array/list/map handles for the current stop, keyed by a variablesReference >= COMPOUND_REF_BASE. Rebuilt on every stop. */
+  private compoundHandles = new Map<number, CompoundHandle>();
+  private nextCompoundRef = COMPOUND_REF_BASE;
 
   constructor() {
     super();
@@ -53,6 +65,8 @@ export class PureBasicDebugSession extends DebugSession {
     this.setDebuggerColumnsStartAt1(true);
     this.pb.on("stopped", ({ reason }: { line: number; reason: number }) => {
       this.lastFrames = [];
+      this.compoundHandles.clear();
+      this.nextCompoundRef = COMPOUND_REF_BASE;
       this.sendEvent(new StoppedEvent(reason === 7 ? "breakpoint" : "pause", MAIN_THREAD_ID));
     });
     this.pb.on("close", () => this.notifyTerminated());
@@ -211,15 +225,98 @@ export class PureBasicDebugSession extends DebugSession {
     this.sendResponse(response);
   }
 
+  /** Registers a compound-value handle and returns the variablesReference for it. */
+  private registerCompound(handle: CompoundHandle): number {
+    const ref = this.nextCompoundRef++;
+    this.compoundHandles.set(ref, handle);
+    return ref;
+  }
+
+  /** Converts a scalar-stream record into a DAP Variable, giving structure children their own expandable reference. */
+  private toDapVariable(v: PbVariable): Variable {
+    if (v.children) {
+      return new Variable(v.name, "{...}", this.registerCompound({ kind: "struct", children: v.children }));
+    }
+    return new Variable(v.name, v.value ?? "");
+  }
+
   protected async variablesRequest(
     response: DebugProtocol.VariablesResponse,
     args: DebugProtocol.VariablesArguments,
   ): Promise<void> {
-    const frameIndex = args.variablesReference - 1;
+    const ref = args.variablesReference;
+
+    if (ref >= COMPOUND_REF_BASE) {
+      const handle = this.compoundHandles.get(ref);
+      if (!handle) {
+        response.body = { variables: [] };
+        this.sendResponse(response);
+        return;
+      }
+      if (handle.kind === "struct") {
+        response.body = { variables: handle.children.map((v) => this.toDapVariable(v)) };
+        this.sendResponse(response);
+        return;
+      }
+      // Array/list/map: opcode 15 fetches element data lazily, only once
+      // this specific container is actually expanded.
+      const result = await this.pb.examineExpression(handle.expression);
+      let variables: Variable[];
+      if (result.kind === "array" || result.kind === "list") {
+        variables = result.elements.map((e) => new Variable(`[${e.index}]`, e.value));
+      } else if (result.kind === "map") {
+        variables = result.elements.map((e) => new Variable(e.key, e.value));
+      } else if (result.kind === "unsupported") {
+        // Confirmed live only for List<String> so far (PLAN.md M5) — the
+        // element wire format wasn't decoded, so this surfaces the gap
+        // instead of guessing at a layout.
+        variables = [new Variable("<unsupported>", `element format not decoded (${result.raw.length} raw bytes)`)];
+      } else {
+        variables = [new Variable("<error>", result.message)];
+      }
+      response.body = { variables };
+      this.sendResponse(response);
+      return;
+    }
+
+    const frameIndex = ref - 1;
     const vars = await this.pb.examineFrame(frameIndex);
-    response.body = {
-      variables: vars.map((v) => new Variable(v.name, v.value)),
-    };
+    const variables: Variable[] = vars.map((v) => this.toDapVariable(v));
+
+    // Arrays/lists/maps (opcodes 12-14) only have a confirmed way to target
+    // the current/topmost frame (PLAN.md M5) — there's no opcode-17-style
+    // explicit frame index for them, so they're only attached when this
+    // scope's frame actually is the topmost one, rather than silently
+    // showing the wrong frame's containers under an outer frame.
+    const isTopmostFrame = this.lastFrames.length === 0 || frameIndex === this.lastFrames.length - 1;
+    if (isTopmostFrame) {
+      try {
+        const [arrays, lists, maps] = await Promise.all([
+          this.pb.examineArrays(),
+          this.pb.examineLists(),
+          this.pb.examineMaps(),
+        ]);
+        for (const a of arrays) {
+          variables.push(new Variable(a.name, "Array", this.registerCompound({ kind: "array", expression: `${a.name}()` })));
+        }
+        for (const l of lists) {
+          variables.push(
+            new Variable(l.name, `LinkedList[${l.count}]`, this.registerCompound({ kind: "list", expression: `${l.name}()` })),
+          );
+        }
+        for (const m of maps) {
+          variables.push(
+            new Variable(m.name, `Map[${m.size}]`, this.registerCompound({ kind: "map", expression: `${m.name}()` })),
+          );
+        }
+      } catch (err) {
+        // Best-effort: a scalars-only view is still useful if the
+        // container enumeration itself fails for some reason.
+        this.logError(err);
+      }
+    }
+
+    response.body = { variables };
     this.sendResponse(response);
   }
 

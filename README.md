@@ -6,12 +6,12 @@ inline diagnostics, and deep links into PureBasic's live online documentation.
 
 > Status: language support, IntelliSense, build/diagnostics, and help
 > integration are implemented and usable. A first debugger integration
-> (launch, breakpoints, continue, call stack, locals, evaluate/watch
-> expressions including writes via `setVariable`, and disconnect via VS
-> Code's Debug Adapter Protocol) is implemented but not yet verified in a
-> real VS Code session; stepping and compound-value (array/list/map/
-> structure) inspection are not yet implemented — see
-> [Debugger support](#debugger-support-in-progress) below.
+> (launch, breakpoints, continue, call stack, locals and compound-value
+> expansion — arrays, lists, maps, structures — evaluate/watch expressions
+> including writes via `setVariable`, and disconnect via VS Code's Debug
+> Adapter Protocol) is implemented but not yet verified in a real VS Code
+> session; stepping is not implemented (no dedicated step opcode exists —
+> see [Debugger support](#debugger-support-in-progress) below).
 
 ## Features
 
@@ -112,10 +112,19 @@ registered via `src/debug/debugConfigProvider.ts` and package.json's new
 `debuggers` contribution. The wire-protocol client is smoke-tested standalone
 against a real compiled target; an actual VS Code Run-and-Debug-view session
 is not yet manually verified (same X-display limitation noted above for the
-language-support features). Not yet implemented: stepping (the one known
-lead — the continue opcode's nonzero sub-command — was live-tested and
-ruled out; no dedicated step opcode is known to exist) and array/list/map/
-structure value expansion.
+language-support features). Not yet implemented: stepping — the one known
+lead, the continue opcode's nonzero sub-command, was live-tested and ruled
+out; no dedicated step opcode is known to exist.
+
+Compound-value expansion (arrays, lists, maps, structures) is decoded and
+live-tested too: `variablesRequest` now enumerates a frame's arrays/lists/
+maps alongside its scalars and lazily fetches element data (via a parsed
+expression, e.g. `nums()`) only once a container is actually expanded in
+the UI; structure locals expand inline via a nesting flag on the existing
+scalar-variable wire records. One confirmed gap: a `List<String>`'s element
+wire format wasn't decoded (the reply is too short to hold real text), so
+that case is surfaced as an explicit "unsupported" node rather than guessed
+at — see `PLAN.md`'s M5 section for the full evidence.
 
 `evaluate` (hover, watch, and Debug Console expressions) works both ways:
 reads are live-tested (full arithmetic like `a+b`, not just bare variable

@@ -21,11 +21,32 @@ export const OP_EXAMINE_FRAME = 17; // f8 = frame index, 0 = outermost
 export const OP_EVALUATE = 33; // ExternalDebugger_Expression read side; 34 is byte-identical
 export const OP_MODIFY = 35; // ExternalDebugger_Expression write side (ModifyVariable)
 
+// ExternalDebugger_ArraysLists opcodes (PLAN.md M5, live-tested against
+// src/debug/spike/test-arrays.pb via fifo-arrayslists.mjs). f8=0 selects
+// the current/topmost frame's declarations; only that value is
+// live-tested (the f8!=0 "global scope" branch is static-decode-only).
+export const OP_EXAMINE_ARRAYS = 12; // ExamineArrays/NextArray, reply type 0x10
+export const OP_EXAMINE_LISTS = 13; // ExamineLinkedLists/NextLinkedList, reply type 0x12
+export const OP_EXAMINE_MAPS = 14; // ExamineMaps/NextMap, reply type 0x14
+export const OP_EXAMINE_EXPRESSION = 15; // parse expr, dispatch to SendArrayData/SendListData/SendMapData
+
+// Structure header type tag from the opcode-11/17 scalar variable stream
+// (PLAN.md M5, live-confirmed against a `p.Point` local): a record with
+// this type byte carries no trailing 8-byte value, and any immediately
+// following records whose 4-byte "reserved" field is nonzero are that
+// structure's fields, not new top-level variables.
+const STRUCT_TYPE_TAG = 0x07;
+
 // Breakpoint sub-commands (opcode 3's f8 field).
 export const BP_ADD_LINE = 1;
 export const BP_REMOVE_LINE = 2;
 export const BP_BULK = 3;
-export const BP_BULK_CLEAR_ALL = 0xffffffff;
+// -1, not 0xffffffff: same 4-byte wire pattern (0xffffffff), but
+// Buffer.writeInt32LE only accepts the signed int32 range and throws
+// (ERR_OUT_OF_RANGE) on the unsigned literal -- a real crash discovered
+// live while smoke-testing clearAllLineBreakpoints() during the M5
+// ArraysLists work (PLAN.md), not a hypothetical.
+export const BP_BULK_CLEAR_ALL = -1;
 
 // Message types seen on the wire (unsolicited unless noted).
 export const MSG_HELLO = 0;
@@ -48,9 +69,45 @@ export interface PbFrame {
 }
 
 export interface PbVariable {
+  type: number; // e.g. 0x15 for `.i`; 0x07 marks a structure header (see STRUCT_TYPE_TAG)
   kind: number; // 0 = global/module scope, 3 = local
+  name: string; // structure headers carry the target's own "Name.TypeName" formatting
+  /** Decimal string if the trailing 8 bytes parsed as a plausible number, else a hex dump. Absent for structure headers (type === 0x07), which have no scalar value of their own. */
+  value?: string;
+  /** Populated for structure headers from the nesting-flagged records that immediately follow them (PLAN.md M5, live-confirmed). */
+  children?: PbVariable[];
+}
+
+export interface PbArrayDecl {
+  /** Bare array name, truncated at "(" -- the dimension-string bytes between the parens are not decoded. */
   name: string;
-  /** Decimal string if the trailing 8 bytes parsed as a plausible number, else a hex dump. */
+}
+
+export interface PbListDecl {
+  name: string;
+  count: number;
+  /** 0-based "current element" position (PB_DEBUGGER_ListIndex). */
+  currentIndex: number;
+}
+
+export interface PbMapDecl {
+  name: string;
+  size: number;
+  currentKey?: string;
+}
+
+export interface PbArrayElement {
+  index: string;
+  value: string;
+}
+
+export interface PbListElement {
+  index: string;
+  value: string;
+}
+
+export interface PbMapElement {
+  key: string;
   value: string;
 }
 
@@ -97,33 +154,205 @@ function parseFrames(payload: Buffer): PbFrame[] {
   return frames;
 }
 
-// Per-variable record: 7-byte header (type, flag, kind bytes + 4-byte
-// reserved/proc-id field), a NUL-terminated name, then an 8-byte
-// little-endian numeric value. Only confirmed for `.i`-typed scalars — see
-// PLAN.md's "Per-variable wire record" note for what's still unconfirmed
-// (strings, arrays/lists/maps, structures, and the exact terminator shape).
+// Per-variable record: 7-byte header (type byte, flag byte, kind byte,
+// 4-byte "reserved" field), a NUL-terminated name, then an 8-byte
+// little-endian value for scalar types. Confirmed for `.i`-typed scalars
+// (PLAN.md's original "Per-variable wire record" note) and, as of this
+// session, for structure locals too: a record whose type byte is
+// STRUCT_TYPE_TAG (0x07) has NO trailing value at all (the name alone,
+// e.g. "p.Point", is the whole record), and the 4-byte "reserved" field —
+// previously seen as always 0 and assumed to be padding — turns out to be
+// a nesting flag: any record immediately after a structure header whose
+// reserved field is nonzero is that structure's field, not a new
+// top-level variable (live-confirmed against a `p.Point` local with `x`/
+// `y` fields, src/debug/spike/fifo-arrayslists.mjs). Strings and
+// array/list/map-typed *scalar* variables (as opposed to the dedicated
+// ArraysLists opcodes) are still not live-tested.
 function parseVariables(payload: Buffer): PbVariable[] {
-  const vars: PbVariable[] = [];
+  interface FlatRecord {
+    type: number;
+    kind: number;
+    nested: boolean;
+    name: string;
+    value?: string;
+  }
+  const flat: FlatRecord[] = [];
   let off = 0;
   while (off + 7 < payload.length) {
+    const type = payload.readUInt8(off);
     const kind = payload.readUInt8(off + 2);
+    const nested = payload.readInt32LE(off + 3) !== 0;
     off += 7;
     const nul = payload.indexOf(0, off);
     if (nul === -1) break;
     const name = payload.toString("latin1", off, nul);
     off = nul + 1;
     if (!name) break;
-    let value: string;
-    if (off + 8 <= payload.length) {
-      value = payload.readBigInt64LE(off).toString();
-      off += 8;
-    } else {
-      value = `0x${payload.subarray(off).toString("hex")}`;
-      off = payload.length;
+    let value: string | undefined;
+    if (type !== STRUCT_TYPE_TAG) {
+      if (off + 8 <= payload.length) {
+        value = payload.readBigInt64LE(off).toString();
+        off += 8;
+      } else {
+        value = `0x${payload.subarray(off).toString("hex")}`;
+        off = payload.length;
+      }
     }
-    vars.push({ kind, name, value });
+    flat.push({ type, kind, nested, name, value });
   }
-  return vars;
+  const result: PbVariable[] = [];
+  for (const rec of flat) {
+    const parent = result[result.length - 1];
+    if (rec.nested && parent && parent.type === STRUCT_TYPE_TAG) {
+      (parent.children ??= []).push({ type: rec.type, kind: rec.kind, name: rec.name, value: rec.value });
+    } else {
+      result.push({ type: rec.type, kind: rec.kind, name: rec.name, value: rec.value });
+    }
+  }
+  return result;
+}
+
+// Declaration records from opcodes 12/13/14 (PLAN.md M5, live-confirmed
+// against src/debug/spike/test-arrays.pb's `nums`/`names`+`counts`/`scores`
+// via fifo-arrayslists.mjs).
+
+// Array declaration: `<name>(<dims, not decoded>)\0` + 1 type byte + 1 kind
+// byte. Only the bare name (up to "(") is extracted -- the dimension-string
+// bytes between the parens weren't fully decoded (see PLAN.md), and aren't
+// needed to enumerate which arrays exist.
+function parseArrayDecls(payload: Buffer): PbArrayDecl[] {
+  const decls: PbArrayDecl[] = [];
+  let off = 0;
+  while (off < payload.length) {
+    const paren = payload.indexOf(0x28, off); // "("
+    if (paren === -1) break;
+    const name = payload.toString("latin1", off, paren);
+    const close = payload.indexOf(0x29, paren); // ")"
+    if (close === -1) break;
+    off = close + 1; // NUL terminator
+    off += 1; // that NUL
+    off += 2; // 1 type byte + 1 kind byte
+    decls.push({ name });
+  }
+  return decls;
+}
+
+// Linked-list declaration: `<name>\0` + flag byte + type byte + kind byte
+// + int64 LE ListCount + int64 LE ListIndex (0-based "current" position).
+function parseListDecls(payload: Buffer): PbListDecl[] {
+  const decls: PbListDecl[] = [];
+  let off = 0;
+  while (off < payload.length) {
+    const nul = payload.indexOf(0, off);
+    if (nul === -1) break;
+    const name = payload.toString("latin1", off, nul);
+    off = nul + 1;
+    if (off + 3 + 16 > payload.length) break;
+    off += 3; // flag, type, kind bytes
+    const count = Number(payload.readBigInt64LE(off));
+    off += 8;
+    const currentIndex = Number(payload.readBigInt64LE(off));
+    off += 8;
+    decls.push({ name, count, currentIndex });
+  }
+  return decls;
+}
+
+// Map declaration: `<name>\0` + flag byte + type byte + kind byte + int64
+// LE MapSize + 1 byte hasCurrentKey + (if set) `<key>\0`.
+function parseMapDecls(payload: Buffer): PbMapDecl[] {
+  const decls: PbMapDecl[] = [];
+  let off = 0;
+  while (off < payload.length) {
+    const nul = payload.indexOf(0, off);
+    if (nul === -1) break;
+    const name = payload.toString("latin1", off, nul);
+    off = nul + 1;
+    if (off + 3 + 8 + 1 > payload.length) break;
+    off += 3; // flag, type, kind bytes
+    const size = Number(payload.readBigInt64LE(off));
+    off += 8;
+    const hasCurrentKey = payload.readUInt8(off) !== 0;
+    off += 1;
+    let currentKey: string | undefined;
+    if (hasCurrentKey) {
+      const knul = payload.indexOf(0, off);
+      if (knul !== -1) {
+        currentKey = payload.toString("latin1", off, knul);
+        off = knul + 1;
+      }
+    }
+    decls.push({ name, size, currentKey });
+  }
+  return decls;
+}
+
+// Opcode-15 Array-data reply (type 0x11): `<echoed expr>\0` + repeated
+// (`<decimal index string>\0` + int64 LE value). Confirmed only for a
+// numeric (.i) element type.
+function parseArrayElements(payload: Buffer): { name: string; elements: PbArrayElement[] } {
+  const nul = payload.indexOf(0);
+  const name = nul === -1 ? payload.toString("latin1") : payload.toString("latin1", 0, nul);
+  let off = nul === -1 ? payload.length : nul + 1;
+  const elements: PbArrayElement[] = [];
+  while (off < payload.length) {
+    const inul = payload.indexOf(0, off);
+    if (inul === -1) break;
+    const index = payload.toString("latin1", off, inul);
+    off = inul + 1;
+    if (off + 8 > payload.length) break;
+    const value = payload.readBigInt64LE(off).toString();
+    off += 8;
+    elements.push({ index, value });
+  }
+  return { name, elements };
+}
+
+// Opcode-15 Map-data reply (type 0x15): `<echoed expr>\0` + repeated
+// (`<key string>\0` + int64 LE value). Confirmed for a string-keyed,
+// numeric-valued map.
+function parseMapElements(payload: Buffer): { name: string; elements: PbMapElement[] } {
+  const nul = payload.indexOf(0);
+  const name = nul === -1 ? payload.toString("latin1") : payload.toString("latin1", 0, nul);
+  let off = nul === -1 ? payload.length : nul + 1;
+  const elements: PbMapElement[] = [];
+  while (off < payload.length) {
+    const knul = payload.indexOf(0, off);
+    if (knul === -1) break;
+    const key = payload.toString("latin1", off, knul);
+    off = knul + 1;
+    if (off + 8 > payload.length) break;
+    const value = payload.readBigInt64LE(off).toString();
+    off += 8;
+    elements.push({ key, value });
+  }
+  return { name, elements };
+}
+
+// Opcode-15 List-data reply (type 0x13, the SAME tag SendListData uses for
+// its own generic error replies -- see the caller for the disambiguation
+// this requires): `<echoed expr>\0` + repeated (int64 LE index + int64 LE
+// value), 16 bytes/element. Confirmed ONLY for a numeric (.i) element type
+// -- a string-element list's reply is too short to hold real text (18
+// bytes total for a 2-element list, not a multiple of 16), so that case
+// isn't parsed as elements at all; the caller falls back to reporting it
+// as unsupported rather than guessing at a layout.
+function parseListElements(payload: Buffer, elementCount: number): { name: string; elements: PbListElement[] } | undefined {
+  const nul = payload.indexOf(0);
+  if (nul === -1) return undefined;
+  const name = payload.toString("latin1", 0, nul);
+  const off0 = nul + 1;
+  if (payload.length - off0 !== elementCount * 16) return undefined; // not the confirmed numeric layout
+  const elements: PbListElement[] = [];
+  let off = off0;
+  for (let i = 0; i < elementCount; i++) {
+    const index = payload.readBigInt64LE(off).toString();
+    off += 8;
+    const value = payload.readBigInt64LE(off).toString();
+    off += 8;
+    elements.push({ index, value });
+  }
+  return { name, elements };
 }
 
 /**
@@ -267,6 +496,82 @@ export class PbDebugSession extends EventEmitter {
     this.write(OP_EXAMINE_FRAME, frameIndex);
     const msg = await this.nextMessage();
     return parseVariables(msg.payload);
+  }
+
+  /**
+   * Opcode 12: enumerate arrays. `global` selects ExamineArrays(-1) (f8!=0,
+   * static-decode-only); the default (f8=0) is the current/topmost frame's
+   * arrays, the only case live-tested (PLAN.md M5,
+   * src/debug/spike/fifo-arrayslists.mjs). There is no confirmed way to
+   * target an arbitrary non-topmost frame the way opcode 17 does for
+   * scalars.
+   */
+  async examineArrays(global = false): Promise<PbArrayDecl[]> {
+    this.write(OP_EXAMINE_ARRAYS, global ? 1 : 0);
+    const msg = await this.nextMessage();
+    return parseArrayDecls(msg.payload);
+  }
+
+  /** Opcode 13: enumerate linked lists. Same f8/scope caveat as {@link examineArrays}. */
+  async examineLists(global = false): Promise<PbListDecl[]> {
+    this.write(OP_EXAMINE_LISTS, global ? 1 : 0);
+    const msg = await this.nextMessage();
+    return parseListDecls(msg.payload);
+  }
+
+  /** Opcode 14: enumerate maps. Same f8/scope caveat as {@link examineArrays}. */
+  async examineMaps(global = false): Promise<PbMapDecl[]> {
+    this.write(OP_EXAMINE_MAPS, global ? 1 : 0);
+    const msg = await this.nextMessage();
+    return parseMapDecls(msg.payload);
+  }
+
+  /**
+   * Opcode 15: parse `expression` (e.g. `"nums()"`, `"scores()"`) and fetch
+   * that array/list/map's element data. Returns `undefined` if the target
+   * rejected the expression (not an Array/LinkedList/Map, or a parse
+   * error) or if the reply's shape didn't match a confirmed layout (the
+   * List<String> case — see {@link parseListElements}).
+   *
+   * Reply type 0x11 = Array data, 0x15 = Map data, 0x13 = List data OR a
+   * generic error (SendListData hardcodes the same type tag ArraysLists'
+   * own "not a container"/parse-error path uses — PLAN.md M5). The two are
+   * disambiguated here by checking whether the payload's echoed name
+   * matches the expression actually sent; a real reply always echoes it
+   * verbatim, an error message never does.
+   */
+  async examineExpression(
+    expression: string,
+    frameContext = -1,
+  ): Promise<
+    | { kind: "array"; name: string; elements: PbArrayElement[] }
+    | { kind: "map"; name: string; elements: PbMapElement[] }
+    | { kind: "list"; name: string; elements: PbListElement[] }
+    | { kind: "unsupported"; raw: Buffer }
+    | { kind: "error"; message: string }
+  > {
+    const payload = Buffer.concat([Buffer.from(expression, "latin1"), Buffer.from([0])]);
+    this.write(OP_EXAMINE_EXPRESSION, 0, frameContext, 0, payload, payload.length);
+    const msg = await this.nextMessage();
+    const echoesExpression = msg.payload.length >= expression.length && msg.payload.toString("latin1", 0, expression.length) === expression;
+    if (msg.type === 0x11 && echoesExpression) {
+      const { name, elements } = parseArrayElements(msg.payload);
+      return { kind: "array", name, elements };
+    }
+    if (msg.type === 0x15 && echoesExpression) {
+      const { name, elements } = parseMapElements(msg.payload);
+      return { kind: "map", name, elements };
+    }
+    if (msg.type === 0x13 && echoesExpression) {
+      const listResult = parseListElements(msg.payload, msg.f12);
+      if (listResult) return { kind: "list", name: listResult.name, elements: listResult.elements };
+      return { kind: "unsupported", raw: msg.payload };
+    }
+    // Not a recognized data reply, or the echoed-name check failed: treat
+    // the whole payload as the target's own error string.
+    const nul = msg.payload.indexOf(0);
+    const message = nul === -1 ? msg.payload.toString("latin1") : msg.payload.toString("latin1", 0, nul);
+    return { kind: "error", message };
   }
 
   /**

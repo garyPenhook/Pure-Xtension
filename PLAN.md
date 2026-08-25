@@ -122,11 +122,31 @@ help, IntelliSense, build/run tasks, and a native debugger bridge.**
   "Next" list item for a clean disconnect opcode is now closed out — not
   by finding one, but by confirming none exists and making the adapter's
   actual termination path (FIFO-close, `SIGKILL`-fallback) provably
-  reliable instead of merely working by accident. Remaining M5 gap: only
-  compound-value expansion (arrays/lists/maps/structures, opcodes
-  `12`-`15`), once a DAP `variables` request actually needs to expand one.
-  Remaining, and now the only open M5 item: compound-value expansion
-  (arrays/lists/maps/structures, opcodes `12`-`15`).
+  reliable instead of merely working by accident. **2026-08-25:
+  compound-value expansion (`ExternalDebugger_ArraysLists`, opcodes
+  `12`-`15`) is now decoded and live-tested, closing out M5's last open
+  item.** Arrays/lists/maps are enumerated (opcodes `12`/`13`/`14`) and
+  their elements fetched on demand (opcode `15`), confirmed live for
+  numeric element/value types (an Array<Integer>, a LinkedList<Integer>, a
+  string-keyed Map<Integer>); a LinkedList<String>'s element wire format
+  is not decoded (the reply is provably too short to hold real text) and
+  is surfaced to the user as "unsupported" rather than guessed at.
+  Structures turned out **not** to need opcodes `12`-`15` at all — a
+  correction to this task's original framing, not a gap: they're already
+  present in the existing opcode-`11`/`17` scalar-variable stream, via a
+  previously-unexplained "reserved" field that turns out to be a
+  structure-nesting flag. Wired into `pbDebugAdapter.ts`'s
+  `variablesRequest` (a new `variablesReference` range for compound
+  handles, resolved lazily on expansion) — DAP `variables` requests can
+  now genuinely expand arrays, lists, maps, and structures, not just
+  scalars. See the dated entry at the end of the M5 section for the full
+  decode/verification detail, including a real pre-existing crash bug
+  (`BP_BULK_CLEAR_ALL`) this session's live testing incidentally found and
+  fixed. **M5 is now functionally complete** for everything the original
+  scope called for (launch, breakpoints, continue, stack trace, locals,
+  evaluate, setVariable, compound-value expansion); the only remaining
+  gaps are stepping (confirmed absent from the protocol, not fixable) and
+  the still-pending real-VS-Code-UI verification noted below.
 - Target VS Code engine: `^1.85.0` (matches the existing help-viewer prototype)
 - Reference PureBasic install: `/home/gary/Apps/purebasic-v6.41` (v6.41, Linux x64)
 - Language: TypeScript (extension host) + a small Language Server (Node)
@@ -1680,6 +1700,207 @@ Pure_Xtension/
     `parseEvaluateReply` since the success/error reply layout is shared
     with opcodes `33`/`34`. DAP `setVariable`/`setExpression` support is
     no longer blocked.
+- **2026-08-25: `ExternalDebugger_ArraysLists` (opcodes `12`/`13`/`14`/`15`)
+  decoded to the instruction level and live-tested against a real, stopped
+  FIFO session — this closes M5's last open item.** Extracted
+  `ExternalDebugger.o` fresh (`ar x .../compilers/debugger.a
+  ExternalDebugger.o` into a scratch dir) and disassembled the function's
+  full address range (`objdump -d -r -M intel`, `0x6220`-`0x6ca0`, found
+  via `nm`'s sorted symbol table bracketing it between
+  `ExternalDebugger_SendArrayData.isra.0` and `PB_DEBUGGER_IncomingCommand`),
+  plus its three send-helpers it tail-calls into:
+  `ExternalDebugger_SendArrayData.isra.0` (`0x5e80`),
+  `ExternalDebugger_SendListData` (`0x4f10`), `ExternalDebugger_SendMapData`
+  (`0x5290`). Wrote a new fixture, `src/debug/spike/test-arrays.pb`
+  (a `Dim` array, two `NewList`s — one `.i`, one `.s`, to specifically
+  probe the string-element case — a `NewMap`, and a `Structure`-typed
+  local, all populated with known values before a spin-wait so there's
+  something real to inspect), and a new spike script,
+  `src/debug/spike/fifo-arrayslists.mjs`, following the existing
+  `fifo-variables.mjs` connect/breakpoint/continue pattern.
+  - **Dispatch, confirmed both statically and live:** like `Variables`,
+    `ArraysLists` switches on the *raw incoming opcode* (not a payload
+    sub-command): `12`→arrays, `13`→linked lists, `14`→maps, `15`→
+    "parse an expression and fetch that specific container's data".
+    All four read the request header's `f8` field as a scope selector —
+    `0` = the current/topmost frame, nonzero = `Examine*(-1)` (global
+    scope) — mirroring opcodes `9` vs `11`'s split for scalars but folded
+    into one opcode per container kind instead of two. **Only `f8=0` was
+    live-tested**; the global-scope branch is static-decode-only, same
+    caveat PLAN.md already carries for other opcodes' less-common paths.
+  - **Opcode `12` (arrays) — declaration record decoded and live-matched
+    against a real `Dim nums.i(2)`:** reply type `0x10`, record shape
+    `<name>(<dims, not decoded>)\0` + 1 type byte + 1 kind byte. The
+    dimension-string bytes between the parens weren't hand-decoded (they
+    contain what looks like an embedded NUL before the digits, e.g. raw
+    bytes `28 00 00 32 29` for `nums(2)` — a real quirk of
+    `PB_DEBUGGER_ArrayDimensionString`'s output, not a parsing mistake on
+    this session's part) since the bare name (truncate at `"("`) is all
+    enumeration needs.
+  - **Opcode `13` (linked lists) — declaration record decoded and
+    live-matched against two real `NewList`s (`names.s()`, `counts.i()`,
+    both populated with 2 elements via `AddElement`+assignment):** reply
+    type `0x12`, record shape `<name>\0` + flag byte + type byte + kind
+    byte + int64 LE `ListCount` + int64 LE `ListIndex`. Both lists came
+    back with `count=2, currentIndex=1` — exactly the 0-based "last
+    `AddElement`'d position" after two adds, confirming the field
+    identities from the static decode (`PB_DEBUGGER_ListCount`/
+    `ListIndex` calls at `ExternalDebugger.o+0x6338`/`+0x635f`).
+  - **Opcode `14` (maps) — declaration record decoded and live-matched
+    against a real `NewMap scores.i()` with two keys:** reply type `0x14`,
+    record shape `<name>\0` + flag + type + kind + int64 LE `MapSize` + 1
+    byte `hasCurrentKey` + (if set) `<key>\0`. Live reply: `size=2,
+    currentKey="sam"` — `"sam"` was the last key assigned in the fixture,
+    confirming `PB_DEBUGGER_MapCurrentKey` (`+0x6874`) is exactly what it
+    sounds like.
+  - **Opcode `15` (parse expression → fetch container data) — the real
+    "expand this compound value" opcode, decoded and live-tested against
+    all three container kinds with real element data, not just
+    declarations:** request payload is a NUL-terminated expression string
+    (e.g. `"nums()"`, `"scores()"`), parsed via
+    `PB_DEBUGGER_ParseExpressionExternal`; `f12=-1` is confirmed to work
+    (same "current frame/line" convention as opcodes `33`/`34`, though
+    opcode `15`'s own static decode combines it with
+    `PB_DEBUGGER_CurrentContext()` differently than `GetLineContext` does,
+    so this is an empirical match, not a re-use of the exact same code
+    path). If the parsed expression isn't an Array/LinkedList/Map, the
+    reply is the target's own `PB_Language_GetKey` error string (live-
+    confirmed: a bare structure-typed local, `p`, got back *"The input did
+    not specify an Array, LinkedList or Map."*). If it is one, the reply
+    dispatches to the matching send-helper:
+    - **Array data (reply type `0x11`), live-matched against
+      `nums(0)=10, nums(1)=20, nums(2)=30`:** `<echoed expr>\0` + repeated
+      (`<decimal index string>\0` + int64 LE value) — live reply for
+      `"nums()"` decoded exactly to indices `"0"/"1"/"2"` with values
+      `10/20/30`.
+    - **Map data (reply type `0x15`), live-matched against
+      `scores("gary")=42, scores("sam")=7`:** `<echoed expr>\0` +
+      repeated (`<key string>\0` + int64 LE value) — live reply for
+      `"scores()"` decoded exactly to `("sam", 7), ("gary", 42)`
+      (target's internal order, not insertion order).
+    - **List data (reply type `0x13`), live-matched against
+      `counts()` = `{111, 222}` (a `NewList counts.i()`):** `<echoed
+      expr>\0` + repeated (int64 LE index + int64 LE value), 16
+      bytes/element — live reply decoded exactly to `(0, 111), (1, 222)`.
+      **The `.s()` string-list case (`names()` = `{"alpha", "beta"}`) does
+      NOT decode this way** — the reply payload is only 18 bytes for 2
+      elements (not the 32 bytes two 16-byte records would need, and not
+      a multiple of any other fixed size that could plausibly hold
+      `"alpha"`/`"beta"` as text), so `CopyValue`'s String-element output
+      format is genuinely undecoded, not just unparsed. Rather than guess,
+      this is surfaced as an explicit "unsupported" result
+      (`PbDebugSession.examineExpression`'s `kind: "unsupported"` case,
+      carrying the raw bytes) so the DAP `variables` view shows an honest
+      placeholder instead of garbage.
+    - **Reply type `0x13` is genuinely ambiguous at the wire level, not
+      just inconvenient to parse:** `SendListData` hardcodes type `0x13`
+      for all of its own replies (`ExternalDebugger.o+0x4f4c`), and this
+      collides with `ArraysLists`' own "not a container"/parse-error reply
+      type, which is *also* `0x13` (`+0x68e8`) — confirmed by both being
+      observed live with the identical header type value. The only
+      reliable disambiguator is content: a genuine List reply's payload
+      always starts with the exact expression text that was sent
+      (`ParseExpressionExternal` echoes it back verbatim on success); an
+      error reply's payload is a human-readable sentence that never
+      matches. `PbDebugSession.examineExpression()` implements exactly
+      this check (`echoesExpression`) rather than trusting the type byte
+      alone for this one case.
+    - **`f12` in every opcode-`15` success reply equals the element
+      count**, confirmed across all three kinds (`3` for the 3-element
+      array, `2` for both 2-element list/map cases) — used directly by
+      `parseListElements` as the multiplier that validates the confirmed
+      16-bytes/element numeric layout before trusting it.
+  - **Structures turned out not to be part of this opcode family at
+    all — a correction to this task's original framing (which grouped
+    "arrays/lists/maps/structures" together as one opcode family), not a
+    protocol gap.** Opcode `15` flatly rejects a bare structure-typed
+    expression (confirmed above). Instead, structures are already present
+    in the *existing*, previously-decoded opcode-`11`/`17` scalar-variable
+    stream — this session found and live-confirmed the actual mechanism
+    while probing why `15` rejected `p`: a record whose **type byte is
+    `0x07`** is a structure header with **no trailing 8-byte value at
+    all** (just the name, formatted by the target as `"p.Point"` —
+    `Name.TypeName`), and the 7-byte record header's 4-byte "reserved"
+    field — previously seen as always `0` across every scalar sample this
+    project had tested and assumed to be padding — turns out to be a
+    **nesting flag**: any record immediately following a structure header
+    whose reserved field is nonzero is that structure's *field*, not a
+    new top-level variable. Live-confirmed exactly against a `Define
+    p.Point` local with `p\x=100, p\y=200`: the opcode-`11` reply for the
+    frame containing `p` decoded to a `type=7` record named `"p.Point"`
+    with no value, immediately followed by two `type=0x15` (int) records
+    named `"x"`/`"y"` with reserved-field `1` and values `100`/`200`, then
+    a `type=0x15` record named `"t"` with reserved-field back to `0` (a
+    genuine top-level local, correctly not absorbed into `p`'s children).
+    This is a strictly backward-compatible re-reading of
+    `parseVariables()` — every previously-tested scalar sample had
+    reserved-field `0` and type `!= 0x07`, so this correction only adds
+    behavior, it doesn't change how any prior live result would have
+    parsed. `PbDebugSession.parseVariables()` (`src/debug/pbSession.ts`)
+    now builds this into a real tree (`PbVariable.children`) instead of a
+    flat list. Nested structures-in-structures, and structure-typed
+    elements *inside* an array/list/map (`ExamineStructure`/
+    `NextStructureField` are called from `SendArrayData`/`SendListData`/
+    `SendMapData` per the disassembly, confirming the mechanism extends
+    there too), are not live-tested — plausible next probes if a real
+    `.pb` fixture ever needs them, not a known gap in what's already
+    shipped.
+  - **Wired into `pbDebugAdapter.ts`:** `variablesRequest` now has two
+    numbering ranges sharing one `variablesReference` field — the existing
+    small `1..N` frame-scope refs (`N` = frame count, from
+    `scopesRequest`) and a new range starting at `100000` for compound
+    handles (structure-field lists, or an array/list/map's not-yet-fetched
+    expression), registered lazily and cleared on every `stopped` event.
+    Structure children resolve instantly from the same opcode-`11`/`17`
+    reply that already fetched them; array/list/map children trigger a
+    fresh opcode-`15` request only when the user actually expands that
+    node, not eagerly. Compound values (arrays/lists/maps) are only
+    attached to the *topmost* stack frame's scope, matching the
+    live-confirmed `f8=0` scoping limit above — there is no confirmed way
+    to enumerate an outer frame's containers the way opcode `17` does for
+    scalars, so outer frames correctly show scalars only rather than
+    silently showing the wrong frame's arrays.
+  - **Real, previously-undiscovered crash bug found and fixed along the
+    way, unrelated to `ArraysLists` itself:**
+    `PbDebugSession.clearAllLineBreakpoints()` — existing code, called by
+    every `setBreakPointsRequest` — passed `BP_BULK_CLEAR_ALL = 0xffffffff`
+    straight into `Buffer.writeInt32LE`, which only accepts the signed
+    int32 range and throws `ERR_OUT_OF_RANGE` on the unsigned literal.
+    Every prior live breakpoint test (`fifo-breakpoint3.mjs`) had
+    sidestepped this by writing `0xffffffff | 0` (forcing the same bit
+    pattern through signed coercion) directly in the throwaway spike, so
+    the bug was never exercised through the real `pbSession.ts` code path
+    until this session's end-to-end smoke test (below) called
+    `clearAllLineBreakpoints()` for real and crashed. Fixed by changing
+    the constant to `-1` (identical 4-byte wire pattern, valid for
+    `writeInt32LE`); would have crashed any real debug session the moment
+    VS Code sent a second `setBreakPoints` request (it always clears
+    first).
+  - **Full verification path:** hand-decoded every reply byte-for-byte
+    against known ground-truth values first (Python one-liners over the
+    exact hex captured live), then re-verified end to end through the
+    actual production TypeScript — `npx esbuild src/debug/pbSession.ts
+    --bundle --format=cjs ...` into a scratch `.cjs`, driven by a
+    standalone Node script that opens real FIFOs against
+    `test-arrays.bin`, sets a real breakpoint, continues, and calls
+    `examineFrame`/`examineArrays`/`examineLists`/`examineMaps`/
+    `examineExpression` exactly the way `pbDebugAdapter.ts` does — not
+    just checked the hand-decoded byte math once and assumed the
+    TypeScript matched it. Every result matched ground truth exactly
+    (structure fields, array elements, list elements, map entries, the
+    string-list "unsupported" case, and the "not a container" error
+    case), and the breakpoint-clear fix let the target run to completion
+    and exit cleanly afterward. `tsc --noEmit` (both `./` and `./server`
+    tsconfigs) and `node esbuild.mjs` (the real project bundle) all pass
+    clean with these changes in place.
+  - **Net effect: M5 is now functionally complete for its original
+    scope.** The only items PLAN.md still lists as open for the debugger
+    are: no dedicated step opcode exists (confirmed absent, not a gap to
+    close); a real VS Code Run-and-Debug-view session is still unverified
+    (no X display in this sandbox — flagged for the user, same caveat as
+    M1-M4's GUI features); nested-structure/structure-in-container element
+    formats are plausible but untested extensions, not known gaps in
+    what's implemented.
 
 **M6 — Polish & ship (1.0)**
 - Walkthrough, tree views, formatter, semantic tokens, README/docs, marketplace
@@ -1719,10 +1940,18 @@ Pure_Xtension/
    static-decode-only. **Opcode `2`'s nonzero sub-command has been
    live-tested (`f8` = `0`/`1`/`2`/`-1`) and ruled out as a step mode** — all
    four values produce an identical free-run, so no dedicated stepping
-   opcode is known to exist. Remaining unknowns: exact byte layout of
-   `Variables`' request/response. The `Debug`/`OnError` stdout fallback
-   (verified working, zero plumbing) still de-risks shipping *something*
-   even if further opcode decoding stalls.
+   opcode is known to exist. **`Variables` (opcodes `9`/`10`/`11`/`17`) and
+   `ArraysLists` (opcodes `12`-`15`) are both decoded and live-tested** —
+   scalar locals/globals, structure fields (found inline in the
+   `Variables` reply stream, not a separate opcode), and array/list/map
+   enumeration + element fetch all work against a real target; the one
+   confirmed gap is a `LinkedList<String>`'s element wire format, not
+   decoded (surfaced as "unsupported", not guessed). This closes out M5's
+   protocol-decode work — remaining debugger risk is entirely the
+   never-verified-through-a-real-VS-Code-window gap (no X display in this
+   sandbox), not further reverse engineering. The `Debug`/`OnError` stdout
+   fallback (verified working, zero plumbing) still de-risks shipping
+   *something* even if that UI verification turns something up.
 2. **`.help` binary format** — resolved by sidestepping it: neither offline
    pipeline in the original plan actually worked (`pbdocmaker` is GUI-only;
    no `.help` parser exists to reuse — see M4 notes). Help integration now
@@ -1851,3 +2080,21 @@ Pure_Xtension/
    (Finding a real step opcode via `Control` opcode `2`'s nonzero
    sub-command is done — live-tested and ruled out; no further lead is
    known, see item 1 above.)
+   **(c) is now done too, 2026-08-25** — `ExternalDebugger_ArraysLists`
+   (opcodes `12`-`15`) is decoded and live-tested against a real fixture
+   with a populated array, two lists (one numeric, one string), a map, and
+   a structure (`src/debug/spike/test-arrays.pb`,
+   `src/debug/spike/fifo-arrayslists.mjs`); `variablesRequest` in
+   `pbDebugAdapter.ts` now returns real, expandable `variablesReference`s
+   for arrays/lists/maps (fetched lazily via opcode `15` on expansion) and
+   structures (which turned out to already be present in the existing
+   opcode-`11`/`17` scalar stream, not a separate opcode at all — see the
+   dated M5 entry for the full correction). The one confirmed gap: a
+   `LinkedList` of `String`s' element wire format isn't decoded (the reply
+   is provably too short to hold real text) and surfaces as an explicit
+   "unsupported" placeholder rather than a guess. **This was M5's last
+   open item — M5 is now functionally complete** for launch, breakpoints,
+   continue, stack trace, locals (scalars + compound values), evaluate,
+   and setVariable; only stepping (confirmed absent from the protocol) and
+   the real-VS-Code-UI verification (item 2 above) remain outstanding, and
+   neither is a decoding gap.
