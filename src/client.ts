@@ -69,3 +69,20 @@ export async function rebuildSymbolCacheCommand(): Promise<void> {
   await client.sendRequest("pureXtension/rebuildSymbolCache");
   vscode.window.showInformationMessage("Pure Xtension: symbol cache rebuilt.");
 }
+
+export async function rebuildHelpIndexCommand(): Promise<void> {
+  if (!client) {
+    vscode.window.showWarningMessage("Pure Xtension: language server is not running.");
+    return;
+  }
+  await client.sendRequest("pureXtension/rebuildHelpIndex");
+  vscode.window.showInformationMessage("Pure Xtension: help index refreshed from purebasic.com.");
+}
+
+/** Resolves the purebasic.com documentation URL for a command name, or undefined
+ *  if the language server isn't running or the symbol isn't a known built-in. */
+export async function resolveHelpUrl(symbol: string): Promise<string | undefined> {
+  if (!client) return undefined;
+  const result = await client.sendRequest<{ url?: string }>("pureXtension/helpUrl", { symbol });
+  return result.url;
+}

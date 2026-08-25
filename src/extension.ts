@@ -3,7 +3,41 @@ import { invalidateHomeCache, selectBackendCommand } from "./config";
 import { PureBasicDiagnostics } from "./build/diagnostics";
 import { createStatusBar } from "./build/statusBar";
 import { PureBasicTaskProvider, TASK_TYPE } from "./build/taskProvider";
-import { rebuildSymbolCacheCommand, startLanguageClient, stopLanguageClient } from "./client";
+import {
+  rebuildHelpIndexCommand,
+  rebuildSymbolCacheCommand,
+  resolveHelpUrl,
+  startLanguageClient,
+  stopLanguageClient,
+} from "./client";
+import { showHelpPage } from "./help/helpViewer";
+
+function wordAt(text: string, offset: number): string | undefined {
+  const isWordChar = (ch: string) => /[\w#]/.test(ch);
+  let start = offset;
+  let end = offset;
+  while (start > 0 && isWordChar(text[start - 1])) start--;
+  while (end < text.length && isWordChar(text[end])) end++;
+  if (start === end) return undefined;
+  return text.slice(start, end);
+}
+
+async function openHelpForSymbol(): Promise<void> {
+  const editor = vscode.window.activeTextEditor;
+  if (!editor || editor.document.languageId !== "purebasic") return;
+
+  const doc = editor.document;
+  const offset = doc.offsetAt(editor.selection.active);
+  const word = wordAt(doc.getText(), offset);
+  if (!word) return;
+
+  const url = await resolveHelpUrl(word);
+  if (!url) {
+    vscode.window.showInformationMessage(`Pure Xtension: no documentation found for "${word}".`);
+    return;
+  }
+  showHelpPage(word, url);
+}
 
 async function runTask(mode: "build" | "buildRun" | "check"): Promise<void> {
   const tasks = await vscode.tasks.fetchTasks({ type: TASK_TYPE });
@@ -37,6 +71,10 @@ export function activate(context: vscode.ExtensionContext): void {
     vscode.commands.registerCommand("pureXtension.rebuildSymbolCache", () =>
       rebuildSymbolCacheCommand(),
     ),
+    vscode.commands.registerCommand("pureXtension.rebuildHelpIndex", () =>
+      rebuildHelpIndexCommand(),
+    ),
+    vscode.commands.registerCommand("pureXtension.openHelpForSymbol", () => openHelpForSymbol()),
     vscode.workspace.onDidSaveTextDocument((doc) => diagnostics.scheduleCheck(doc)),
     vscode.workspace.onDidOpenTextDocument((doc) => diagnostics.scheduleCheck(doc)),
     vscode.workspace.onDidCloseTextDocument((doc) => diagnostics.clear(doc)),

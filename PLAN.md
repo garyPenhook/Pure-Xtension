@@ -3,7 +3,9 @@
 **A full-featured VS Code language extension for PureBasic with deeply integrated
 help, IntelliSense, build/run tasks, and a native debugger bridge.**
 
-- Status: M2 complete (build & diagnostics); M3 (language server IntelliSense) complete
+- Status: M2, M3 complete; M4 (deep help integration) in progress —
+  online-docs deep-links (hover link, `F1` webview) done, completion docs
+  and keyword/structure coverage still open
 - Target VS Code engine: `^1.85.0` (matches the existing help-viewer prototype)
 - Reference PureBasic install: `/home/gary/Apps/purebasic-v6.41` (v6.41, Linux x64)
 - Language: TypeScript (extension host) + a small Language Server (Node)
@@ -169,29 +171,36 @@ spawn and speak to over stdio/sockets.
   Use `-sb` standby mode to avoid per-check process startup cost.
 
 ### 4.3 Help integration (the differentiator)
-Data pipeline options (pick per platform at build time):
+**Data source: `purebasic.com`'s live online documentation, not the local
+`.help` file.** The two offline pipelines originally sketched here turned out
+not to be viable — see M4 notes (§6) for what was actually checked:
+`pbdocmaker` has no CLI/batch mode (GUI-only, hangs headlessly), and there is
+no existing `.help` parser to reuse (the local file is a proprietary
+`2zlpc>`-magic binary format, and the "existing help-viewer" extension never
+parsed it — it just iframed the online docs too). Fetching live docs is also
+simply better here: always current, no reverse-engineering, no display
+dependency.
 
-1. **Primary (Linux/all):** run `pbdocmaker` once to render `purebasic.help` into
-   an HTML topic tree in `globalStorage`; build a topic index (`command → topic`).
-2. **Fallback:** parse the `.help` archive directly (it is a zlib topic archive
-   with anchors like `reference/ide_start`; the existing help-viewer already reads
-   `.help`/`.chm` — reuse its reader in `node_modules/chmlib-ts`).
-
-Features on top of the topic index:
-- **Hover docs**: server hover returns a Markdown summary; the client enriches it
-  with a "Open full help" command link.
-- **Context help command** `pureXtension.openHelpForSymbol` (bind to `F1` within
-  `.pb` files via `keybindings` + `when: editorLangId == purebasic`): resolves the
-  word under cursor → topic → opens the Help webview at that anchor.
-- **Help browser webview** (`pureXtension.helpBrowser`): sidebar view + full panel;
-  contents tree, per-topic navigation, in-page + cross-topic search box,
-  back/forward, "Insert example into editor". Runs sandboxed with a strict CSP and
-  `asWebviewUri` for local assets.
-- **Completion documentation**: each built-in completion item's `documentation`
-  field is lazily filled from the topic index (`resolveCompletionItem`).
-- **Settings**: `pureXtension.help.language` (english/german/french → pick
-  `.help` variant), `pureXtension.help.source` (auto/docmaker/rawHelp), and
-  `pureXtension.compilerPath` / `pureXtension.purebasicHome`.
+- `server/src/onlineHelpIndex.ts` fetches
+  `purebasic.com/documentation/reference/commandindex.html` (one page, every
+  command → its doc URL) and caches the parsed map for 30 days.
+- **Hover docs** ✅: server hover already returns the `-lf`-dump signature +
+  description for built-ins; now appends `[Open documentation](url)` once the
+  online index resolves.
+- **Context help command** `pureXtension.openHelpForSymbol` ✅ (bound to `F1`
+  within `.pb` files, `when: editorLangId == purebasic`): resolves the word
+  under cursor via the language server, opens the matching purebasic.com page
+  in a sandboxed webview (`src/help/helpViewer.ts`, CSP restricted to
+  `frame-src https://www.purebasic.com`).
+- **Still open:** a dedicated Help browser sidebar/tree view (contents
+  navigation, in-page search) — deferred; the deep-link webview covers the
+  common case for now. Completion-item `documentation` fields aren't wired to
+  the online index yet. Hover/`F1` only cover built-in *functions* today —
+  structures, interfaces, and language keywords (`If`, `For`, ...) aren't
+  resolvable yet (no URL mapping source for keywords was investigated).
+- No `pureXtension.help.language`/`.source` settings — those only made sense
+  for the abandoned local `.help` pipeline; the online docs are English-only
+  and always the current version.
 
 ### 4.4 Build & run
 - **Task provider** (`tasks` type `purebasic`): tasks for *Build*, *Build+Run*,
@@ -426,9 +435,50 @@ Pure_Xtension/
   logic was smoke-tested against real PureBasic source and real `pbcompiler`
   output, not just typechecked.
 
-**M4 — Deep help integration (0.5)** ← headline
-- `pbdocmaker`/`.help` pipeline → topic index; hover docs, `F1` context help, Help
-  browser webview with search, completion docs.
+**M4 — Deep help integration (0.5)** ← headline — in progress
+- **Design change from the original plan (verified, not guessed):** the two
+  offline pipelines in §4.3 don't actually exist. `pbdocmaker` is GUI-only —
+  no `--help`, no flags in the binary's string table, and it opens a window
+  that hangs headlessly (this sandbox has no working display, same limitation
+  noted under M1). The "reuse the existing help-viewer's `.help` reader"
+  assumption was also wrong: that extension's source (recovered from its
+  bundled sourcemap) never parses `.help` at all — for `.help` files it just
+  opens an iframe to the online docs; its `chmlib-ts` reader only handles
+  real `.chm` files. `purebasic.help` itself is a proprietary binary format
+  (`2zlpc>` magic, `1zlb`-tagged chunks) with no existing parser anywhere.
+  **Decision: use `purebasic.com`'s live documentation instead** — always
+  current, no reverse-engineering, no display dependency. Scope trimmed to
+  deep-links (hover link + `F1` webview), not an offline full-text-search
+  browser.
+- `server/src/onlineHelpIndex.ts`: fetches
+  `purebasic.com/documentation/reference/commandindex.html` — a single page
+  listing every command as `<a href=../lib/name.html>Name</a>` (verified
+  against the live page: 1888 entries, all matching that exact unquoted-href
+  shape, no exceptions) — and parses it into a lowercase-name → full-URL map.
+  Cached to `globalStorage/help-index.json` with a 30-day TTL; falls back to
+  a stale cache if the fetch fails (offline-friendly). Verified end-to-end
+  (real fetch, real parse, cache write + cache-hit reload) and spot-checked
+  3 resolved URLs (`string/left.html`, `gadget/addgadgetitem.html`,
+  `spline/addsplinepoint.html`) all return HTTP 200.
+- `server/src/server.ts`: fetches the index in the background on
+  `initialize` (never blocks hover/completion). `onHover` appends an `[Open
+  documentation](url)` link to built-in function hovers once the index is
+  loaded. New requests: `pureXtension/helpUrl` (resolve a symbol → URL, used
+  by the `F1` command) and `pureXtension/rebuildHelpIndex` (force a re-fetch,
+  mirrors `rebuildSymbolCache`).
+- `src/help/helpViewer.ts`: single reused `WebviewPanel` (CSP restricted to
+  `frame-src https://www.purebasic.com`) that iframes the resolved doc page —
+  same pattern the old help-viewer extension used for its online fallback.
+- `pureXtension.openHelpForSymbol` command, bound to `F1` when
+  `editorLangId == purebasic`: resolves the word under the cursor via the
+  language client, opens it in the help webview. `pureXtension.rebuildHelpIndex`
+  command added alongside `rebuildSymbolCache` for parity.
+- Verified: `tsc --noEmit` (both tsconfigs) and esbuild clean.
+- Remaining for M4: hover/`F1` currently only cover built-in **functions**
+  (the ones in `builtinIndex.functions`, from the `-lf` dump) — structures,
+  interfaces, and language keywords (`If`, `For`, ...) aren't in that index
+  yet and so don't get help links. No completion-item documentation wiring
+  yet either (§4.3's last bullet).
 
 **M5 — Debugger (0.6)**
 - Probe pbdebugger protocol → minimal DAP (launch, breakpoint, continue, stack,
@@ -457,8 +507,13 @@ Pure_Xtension/
 ## 8. Risks & open questions
 1. **pbdebugger control protocol is undocumented** — biggest unknown. M5 starts
    with a spike; the `Debug`/`OnError` fallback de-risks shipping *something*.
-2. **`.help` binary format** — mitigated by preferring `pbdocmaker`-generated HTML
-   and reusing the existing help-viewer's `.help` reader as fallback.
+2. **`.help` binary format** — resolved by sidestepping it: neither offline
+   pipeline in the original plan actually worked (`pbdocmaker` is GUI-only;
+   no `.help` parser exists to reuse — see M4 notes). Help integration now
+   fetches purebasic.com's live docs instead. New, smaller risk this
+   introduces: hover/`F1` help requires network access and go dark offline
+   (the 30-day disk cache absorbs short outages, but a machine that's never
+   been online won't have help links at all).
 3. **`-sb` standby protocol** for fast incremental checks — spiked (see M3
    notes): confirmed handshake (`STARTING`/`READY`) and that it reads one
    stdin line, but it exits after that line instead of looping, and

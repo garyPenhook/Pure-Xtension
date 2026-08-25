@@ -107,6 +107,14 @@
       {
         "command": "pureXtension.rebuildSymbolCache",
         "title": "Pure Xtension: Rebuild Symbol Cache"
+      },
+      {
+        "command": "pureXtension.rebuildHelpIndex",
+        "title": "Pure Xtension: Refresh Help Index from purebasic.com"
+      },
+      {
+        "command": "pureXtension.openHelpForSymbol",
+        "title": "Pure Xtension: Open Help for Symbol Under Cursor"
       }
     ],
     "menus": {
@@ -122,9 +130,20 @@
         {
           "command": "pureXtension.checkSyntax",
           "when": "editorLangId == purebasic"
+        },
+        {
+          "command": "pureXtension.openHelpForSymbol",
+          "when": "editorLangId == purebasic"
         }
       ]
     },
+    "keybindings": [
+      {
+        "command": "pureXtension.openHelpForSymbol",
+        "key": "F1",
+        "when": "editorTextFocus && editorLangId == purebasic"
+      }
+    ],
     "taskDefinitions": [
       {
         "type": "purebasic",

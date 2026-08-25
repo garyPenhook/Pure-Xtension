@@ -28,6 +28,7 @@ import { BuiltinIndex, loadOrBuildBuiltinIndex, queryStructureFields } from "./b
 import { WorkspaceSymbol } from "./workspaceSymbols";
 import { resolveIncludeGraphSymbols, ResolvedSymbol } from "./includeGraph";
 import { StructureField } from "./dumpParsers";
+import { HelpIndex, getHelpUrl, loadOrFetchHelpIndex } from "./onlineHelpIndex";
 
 interface InitializationOptions {
   compilerPath?: string;
@@ -41,6 +42,22 @@ let builtinIndex: BuiltinIndex | undefined;
 let compilerPath = "";
 let cacheDir = "";
 const structureFieldsCache = new Map<string, StructureField[]>();
+let helpIndex: HelpIndex | undefined;
+let helpIndexPromise: Promise<HelpIndex | undefined> | undefined;
+
+/** Fetches (or loads the cached) purebasic.com command index in the background;
+ *  never blocks a caller — hover/help-url lookups just get no link until it resolves. */
+function ensureHelpIndex(): Promise<HelpIndex | undefined> {
+  if (!helpIndexPromise) {
+    helpIndexPromise = loadOrFetchHelpIndex(cacheDir)
+      .then((index) => (helpIndex = index))
+      .catch((error) => {
+        connection.console.warn(`Pure Xtension: help index fetch failed: ${String(error)}`);
+        return undefined;
+      });
+  }
+  return helpIndexPromise;
+}
 
 async function ensureBuiltinIndex(): Promise<BuiltinIndex | undefined> {
   if (builtinIndex) return builtinIndex;
@@ -216,6 +233,7 @@ connection.onInitialize((params: InitializeParams): InitializeResult => {
   const options = (params.initializationOptions ?? {}) as InitializationOptions;
   compilerPath = options.compilerPath ?? "";
   cacheDir = options.cacheDir ?? "";
+  if (cacheDir) void ensureHelpIndex();
 
   return {
     capabilities: {
@@ -236,6 +254,20 @@ connection.onRequest("pureXtension/rebuildSymbolCache", async () => {
   structureFieldsCache.clear();
   await ensureBuiltinIndex();
 });
+
+connection.onRequest("pureXtension/rebuildHelpIndex", async () => {
+  helpIndex = undefined;
+  helpIndexPromise = undefined;
+  await ensureHelpIndex();
+});
+
+connection.onRequest(
+  "pureXtension/helpUrl",
+  async (params: { symbol: string }): Promise<{ url?: string }> => {
+    await ensureHelpIndex();
+    return { url: getHelpUrl(helpIndex, params.symbol) };
+  },
+);
 
 connection.onCompletion(async (params): Promise<CompletionItem[]> => {
   const doc = documents.get(params.textDocument.uri);
@@ -293,7 +325,11 @@ connection.onHover((params): Hover | undefined => {
 
   const fn = builtinIndex?.functions.find((f) => f.name.toLowerCase() === word.toLowerCase());
   if (fn) {
-    return { contents: { kind: "markdown", value: `**${fn.signature}**\n\n${fn.description}` } };
+    const url = getHelpUrl(helpIndex, fn.name);
+    const link = url ? `\n\n[Open documentation](${url})` : "";
+    return {
+      contents: { kind: "markdown", value: `**${fn.signature}**\n\n${fn.description}${link}` },
+    };
   }
 
   const symbol = resolveIncludeGraphSymbols(doc.uri, documents).find(
