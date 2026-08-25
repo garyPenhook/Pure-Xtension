@@ -1,0 +1,33 @@
+{
+  "comments": {
+    "lineComment": ";"
+  },
+  "brackets": [
+    ["{", "}"],
+    ["[", "]"],
+    ["(", ")"]
+  ],
+  "autoClosingPairs": [
+    { "open": "{", "close": "}" },
+    { "open": "[", "close": "]" },
+    { "open": "(", "close": ")" },
+    { "open": "\"", "close": "\"", "notIn": ["string"] }
+  ],
+  "surroundingPairs": [
+    ["{", "}"],
+    ["[", "]"],
+    ["(", ")"],
+    ["\"", "\""]
+  ],
+  "indentationRules": {
+    "increaseIndentPattern": "^\\s*(If|ElseIf|Else|ForEach|For|While|Repeat|Select|Case|Procedure(C|DLL|CDLL)?|Structure|Interface|Enumeration|EnumerationBinary|With|DataSection|Macro|Import|ImportC)\\b",
+    "decreaseIndentPattern": "^\\s*(EndIf|Else|ElseIf|Next|Wend|Until|EndSelect|Case|EndProcedure|EndStructure|EndInterface|EndEnumeration|EndWith|EndDataSection|EndMacro|EndImport)\\b"
+  },
+  "folding": {
+    "markers": {
+      "start": "^\\s*;\\s*\\{\\{\\{",
+      "end": "^\\s*;\\s*\\}\\}\\}"
+    }
+  },
+  "wordPattern": "[#$]?[A-Za-z_][A-Za-z0-9_]*(\\.[abcdfilqsuw])?"
+}

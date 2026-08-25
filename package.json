@@ -1,0 +1,96 @@
+{
+  "name": "pure-xtension",
+  "displayName": "Pure Xtension",
+  "description": "PureBasic language support for VS Code: syntax highlighting, IntelliSense, build tasks, deep help integration, and debugging.",
+  "version": "0.1.0",
+  "publisher": "local",
+  "private": true,
+  "license": "MIT",
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "Programming Languages",
+    "Debuggers",
+    "Snippets"
+  ],
+  "main": "./dist/extension.js",
+  "activationEvents": [],
+  "contributes": {
+    "languages": [
+      {
+        "id": "purebasic",
+        "aliases": [
+          "PureBasic",
+          "purebasic"
+        ],
+        "extensions": [
+          ".pb",
+          ".pbi",
+          ".pbf"
+        ],
+        "configuration": "./language-configuration.json"
+      }
+    ],
+    "grammars": [
+      {
+        "language": "purebasic",
+        "scopeName": "source.purebasic",
+        "path": "./syntaxes/purebasic.tmLanguage.json"
+      }
+    ],
+    "configuration": {
+      "title": "Pure Xtension",
+      "properties": {
+        "pureXtension.purebasicHome": {
+          "type": "string",
+          "default": "",
+          "markdownDescription": "Path to the PureBasic install directory (contains `compilers/`, `purebasic.help`). Leave empty to auto-detect."
+        },
+        "pureXtension.backend": {
+          "type": "string",
+          "enum": [
+            "auto",
+            "asm",
+            "c"
+          ],
+          "default": "auto",
+          "markdownDescription": "Which compiler backend to use: `pbcompiler` (ASM/fasm) or `pbcompilerc` (system C toolchain). `auto` detects and asks on first use."
+        },
+        "pureXtension.compilerPath.asm": {
+          "type": "string",
+          "default": "",
+          "markdownDescription": "Explicit override path to the ASM-backend compiler (`pbcompiler`)."
+        },
+        "pureXtension.compilerPath.c": {
+          "type": "string",
+          "default": "",
+          "markdownDescription": "Explicit override path to the C-backend compiler (`pbcompilerc`)."
+        }
+      }
+    },
+    "commands": [
+      {
+        "command": "pureXtension.helloWorld",
+        "title": "Pure Xtension: Hello World"
+      }
+    ]
+  },
+  "scripts": {
+    "compile": "tsc --noEmit -p ./ && node esbuild.mjs",
+    "watch": "node esbuild.mjs --watch",
+    "package": "vsce package",
+    "vscode:prepublish": "node esbuild.mjs --production"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "@types/vscode": "^1.85.0",
+    "@vscode/vsce": "^3.9.2",
+    "esbuild": "^0.28.2",
+    "typescript": "^5.9.2"
+  },
+  "allowScripts": {
+    "@vscode/vsce-sign@2.1.0": true,
+    "esbuild@0.28.2": true
+  }
+}

@@ -1,0 +1,144 @@
+{
+  "$schema": "https://raw.githubusercontent.com/martinring/tmlanguage/master/tmlanguage.json",
+  "name": "PureBasic",
+  "scopeName": "source.purebasic",
+  "patterns": [
+    { "include": "#comments" },
+    { "include": "#strings" },
+    { "include": "#compiler-directives" },
+    { "include": "#numbers" },
+    { "include": "#constants" },
+    { "include": "#control-keywords" },
+    { "include": "#declaration-keywords" },
+    { "include": "#storage-keywords" },
+    { "include": "#operators" },
+    { "include": "#pointer-address" },
+    { "include": "#variables" }
+  ],
+  "repository": {
+    "comments": {
+      "patterns": [
+        {
+          "name": "comment.line.semicolon.purebasic",
+          "match": ";.*$"
+        }
+      ]
+    },
+    "strings": {
+      "patterns": [
+        {
+          "name": "string.quoted.double.purebasic",
+          "begin": "\"",
+          "end": "\"",
+          "patterns": [
+            { "name": "constant.character.escape.purebasic", "match": "\"\"" }
+          ]
+        }
+      ]
+    },
+    "numbers": {
+      "patterns": [
+        {
+          "name": "constant.numeric.hex.purebasic",
+          "match": "\\$[0-9A-Fa-f]+\\b"
+        },
+        {
+          "name": "constant.numeric.binary.purebasic",
+          "match": "%[01]+\\b"
+        },
+        {
+          "name": "constant.numeric.float.purebasic",
+          "match": "\\b[0-9]+\\.[0-9]+\\b"
+        },
+        {
+          "name": "constant.numeric.decimal.purebasic",
+          "match": "\\b[0-9]+\\b"
+        }
+      ]
+    },
+    "compiler-directives": {
+      "patterns": [
+        {
+          "name": "keyword.control.directive.purebasic",
+          "match": "(?i)\\b(Compiler(If|ElseIf|Else|EndIf|Error|Warning|Select|Case|Default|EndSelect)|EnableExplicit|DisableExplicit|EnableASM|DisableASM|EnableDebugger|DisableDebugger|XIncludeFile|IncludeFile|IncludeBinary|IncludePath|IncludeLibrary)\\b"
+        }
+      ]
+    },
+    "constants": {
+      "patterns": [
+        {
+          "name": "variable.other.constant.purebasic",
+          "match": "#[A-Za-z_][A-Za-z0-9_]*"
+        }
+      ]
+    },
+    "pointer-address": {
+      "patterns": [
+        {
+          "name": "keyword.operator.address.purebasic",
+          "match": "[@*]"
+        }
+      ]
+    },
+    "control-keywords": {
+      "patterns": [
+        {
+          "name": "keyword.control.purebasic",
+          "match": "(?i)\\b(If|ElseIf|Else|EndIf|For|ForEach|To|Step|Next|While|Wend|Repeat|Until|Select|Case|Default|EndSelect|Break|Continue|Return|Goto|Gosub|FakeReturn|End|Swap)\\b"
+        }
+      ]
+    },
+    "declaration-keywords": {
+      "patterns": [
+        {
+          "name": "storage.type.function.purebasic",
+          "match": "(?i)\\b(Procedure|ProcedureC|ProcedureDLL|ProcedureCDLL|EndProcedure|Declare|DeclareC|DeclareDLL|ProcedureReturn)\\b"
+        },
+        {
+          "name": "storage.type.struct.purebasic",
+          "match": "(?i)\\b(Structure|EndStructure|StructureUnion|EndStructureUnion|Interface|EndInterface|Import|ImportC|EndImport|Extends)\\b"
+        },
+        {
+          "name": "storage.type.enum.purebasic",
+          "match": "(?i)\\b(Enumeration|EnumerationBinary|EndEnumeration)\\b"
+        },
+        {
+          "name": "storage.type.macro.purebasic",
+          "match": "(?i)\\b(Macro|EndMacro|UndefMacro)\\b"
+        },
+        {
+          "name": "storage.type.datasection.purebasic",
+          "match": "(?i)\\b(DataSection|EndDataSection|Data|DataAddress|Restore)\\b"
+        }
+      ]
+    },
+    "storage-keywords": {
+      "patterns": [
+        {
+          "name": "storage.modifier.purebasic",
+          "match": "(?i)\\b(Global|Protected|Static|Define|Dim|NewList|Array|List|Map|Threaded|Shared)\\b"
+        }
+      ]
+    },
+    "operators": {
+      "patterns": [
+        {
+          "name": "keyword.operator.logical.purebasic",
+          "match": "(?i)\\b(And|Or|Not|Xor)\\b"
+        },
+        {
+          "name": "keyword.operator.purebasic",
+          "match": "(<=|>=|<>|=|<|>|\\+|-|\\*|/|%|&|!|~|<<|>>)"
+        }
+      ]
+    },
+    "variables": {
+      "patterns": [
+        {
+          "name": "variable.other.typed.purebasic",
+          "match": "\\b[A-Za-z_][A-Za-z0-9_]*(\\.[a-zA-Z_][A-Za-z0-9_]*)?\\$?"
+        }
+      ]
+    }
+  }
+}
