@@ -474,11 +474,31 @@ Pure_Xtension/
   language client, opens it in the help webview. `pureXtension.rebuildHelpIndex`
   command added alongside `rebuildSymbolCache` for parity.
 - Verified: `tsc --noEmit` (both tsconfigs) and esbuild clean.
-- Remaining for M4: hover/`F1` currently only cover built-in **functions**
-  (the ones in `builtinIndex.functions`, from the `-lf` dump) — structures,
-  interfaces, and language keywords (`If`, `For`, ...) aren't in that index
-  yet and so don't get help links. No completion-item documentation wiring
-  yet either (§4.3's last bullet).
+- **Completion documentation** (§4.3's last bullet) ✅: each built-in
+  function's completion item now gets a Markdown `documentation` field
+  (description + `[Open documentation](url)`) built eagerly from the
+  in-memory help index — no `resolveCompletionItem` round-trip needed since
+  the lookup is just an in-memory map read for all ~1823 functions.
+- **Built-in structure/interface hover** ✅: `onHover` is now async and, for
+  a built-in structure or interface name (from `builtinIndex.structures` /
+  `.interfaces`, the `-ls`/`-li` dumps — names only, no descriptions),
+  reuses the same on-demand `-qs <name>` field lookup
+  (`getBuiltinStructureFields`, already built for structure-field
+  completion) to show the field list, plus the doc link. Verified against
+  the real compiler: `buildBuiltinIndex` + `queryStructureFields` round-
+  tripped on a real built-in structure (`GdkEventAny`), fields matched the
+  `-qs` dump shape (name/type/pointer/array-size). Interfaces have no field
+  data (`-qs` is structures-only) so they only get name + link, not a
+  method list — that's a real gap, not a bug: interface methods aren't
+  captured by any dump parser yet.
+- Remaining for M4: language-keyword hover/help (`If`, `For`, `Procedure`,
+  ...) is still uncovered — those aren't in `builtinIndex` at all (that index
+  only holds `-lf`/`-ls`/`-li` dump contents, which are functions/
+  structures/interfaces, not language keywords), and `commandindex.html`
+  doesn't list them either (verified: it's function/structure/interface
+  commands only, not the `reference/*.html` keyword pages) — would need a
+  separate, hand-maintained keyword → `reference/*.html` URL table. No
+  dedicated Help browser sidebar/tree view yet (deep-link webview only).
 
 **M5 — Debugger (0.6)**
 - Probe pbdebugger protocol → minimal DAP (launch, breakpoint, continue, stack,

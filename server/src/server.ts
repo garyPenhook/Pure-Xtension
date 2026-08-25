@@ -285,11 +285,14 @@ connection.onCompletion(async (params): Promise<CompletionItem[]> => {
   const index = await ensureBuiltinIndex();
   if (index) {
     for (const fn of index.functions) {
+      const url = getHelpUrl(helpIndex, fn.name);
       items.push({
         label: fn.name,
         kind: CompletionItemKind.Function,
         detail: fn.signature,
-        documentation: fn.description,
+        documentation: url
+          ? { kind: "markdown", value: `${fn.description}\n\n[Open documentation](${url})` }
+          : fn.description,
       });
     }
     for (const name of index.structures) {
@@ -315,7 +318,7 @@ connection.onCompletion(async (params): Promise<CompletionItem[]> => {
   return items;
 });
 
-connection.onHover((params): Hover | undefined => {
+connection.onHover(async (params): Promise<Hover | undefined> => {
   const doc = documents.get(params.textDocument.uri);
   if (!doc) return undefined;
 
@@ -338,6 +341,26 @@ connection.onHover((params): Hover | undefined => {
   if (symbol) {
     return {
       contents: { kind: "markdown", value: `**${symbol.name}** _(${symbol.kind})_\n\n${symbol.detail}` },
+    };
+  }
+
+  const builtinStructureOrInterface = builtinIndex?.structures
+    .concat(builtinIndex.interfaces)
+    .find((name) => name.toLowerCase() === word.toLowerCase());
+  if (builtinStructureOrInterface) {
+    const url = getHelpUrl(helpIndex, builtinStructureOrInterface);
+    const link = url ? `\n\n[Open documentation](${url})` : "";
+    const fields = await getBuiltinStructureFields(builtinStructureOrInterface);
+    const fieldList = fields.length
+      ? `\n\n${fields
+          .map((f) => `- ${f.isPointer ? "*" : ""}${f.name}.${f.type}${f.arraySize ? `[${f.arraySize}]` : ""}`)
+          .join("\n")}`
+      : "";
+    return {
+      contents: {
+        kind: "markdown",
+        value: `**${builtinStructureOrInterface}**${fieldList}${link}`,
+      },
     };
   }
 
