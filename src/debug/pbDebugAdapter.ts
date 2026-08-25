@@ -54,6 +54,19 @@ export class PureBasicDebugSession extends DebugSession {
   private workDir?: string;
   private fifoDir?: string;
   private sourcePath = "";
+  /**
+   * True once `this.pb.connect()` has actually opened the FIFOs. VS Code
+   * sends `setBreakpoints` as soon as `initialized` fires — which happens
+   * well before `launchRequest` finishes compiling and connecting — so
+   * `setBreakPointsRequest` can run while `this.pb`'s write stream doesn't
+   * exist yet. Writing to it then throws synchronously inside an async
+   * handler, which becomes a silently-unhandled rejection (dispatchRequest's
+   * try/catch only covers synchronous throws), so the breakpoint response
+   * never gets sent and every breakpoint appears ignored. This flag lets
+   * setBreakPointsRequest track the desired state locally and defer the
+   * actual wire writes to `flushBreakpointsToWire()` once connected.
+   */
+  private pbConnected = false;
   /** opcode-16 order (0 = outermost); cached per stop so scopes/variables can address into it. */
   private lastFrames: PbFrame[] = [];
   /** Guards against sending TerminatedEvent twice — the wire session's `close` and the child's `exit` both fire on every teardown. */
@@ -232,6 +245,12 @@ export class PureBasicDebugSession extends DebugSession {
       return;
     }
 
+    // setBreakPointsRequest may already have run (and recorded into
+    // activeBreakpoints) while the compile/connect above was in flight —
+    // push that state to the wire now that it's actually safe to.
+    this.pbConnected = true;
+    this.flushBreakpointsToWire();
+
     this.sendResponse(response);
 
     if (args.stopOnEntry) {
@@ -266,12 +285,24 @@ export class PureBasicDebugSession extends DebugSession {
       return;
     }
 
-    this.pb.clearAllLineBreakpoints();
     this.activeBreakpoints.clear();
-    for (const line of lines) {
-      this.pb.addLineBreakpoint(line);
-      this.activeBreakpoints.add(line);
-    }
+    for (const line of lines) this.activeBreakpoints.add(line);
+    // Before the target is connected (still compiling, in launchRequest),
+    // there's no wire to write to yet — activeBreakpoints above is the
+    // record launchRequest replays via flushBreakpointsToWire() once
+    // connected. Writing here regardless would throw on the not-yet-open
+    // FIFO stream.
+    if (this.pbConnected) this.flushBreakpointsToWire();
+    response.body = {
+      breakpoints: lines.map((line) => new Breakpoint(true, line)),
+    };
+    this.sendResponse(response);
+  }
+
+  /** Replays `activeBreakpoints` (and, if a step is mid-flight, its temporary full-line coverage) onto the wire. Only safe to call once `pbConnected` is true. */
+  private flushBreakpointsToWire(): void {
+    this.pb.clearAllLineBreakpoints();
+    for (const line of this.activeBreakpoints) this.pb.addLineBreakpoint(line);
     if (this.stepInProgress) {
       // The clearAllLineBreakpoints() above just wiped step()'s full-line
       // temporary coverage too (it's target-wide, not scoped to "real"
@@ -286,10 +317,6 @@ export class PureBasicDebugSession extends DebugSession {
         }
       }
     }
-    response.body = {
-      breakpoints: lines.map((line) => new Breakpoint(true, line)),
-    };
-    this.sendResponse(response);
   }
 
   protected continueRequest(
