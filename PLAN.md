@@ -6,9 +6,13 @@ help, IntelliSense, build/run tasks, and a native debugger bridge.**
 - Status: M2, M3, M4 (deep help integration) complete. M5 (debugger) protocol
   spike well underway — wire opcodes mapped, FIFO transport confirmed
   working end to end with a real throwaway client
-  (`src/debug/spike/fifo-client.mjs`); the multi-frame call-stack opcode
-  (16) is decoded but its live behavior (why it reads back empty) is still
-  an open question. DAP scaffolding (`pbDebugAdapter.ts`) not started yet.
+  (`src/debug/spike/fifo-client.mjs`), and the full command-dispatch model
+  is decoded (`Check`, running on the target's own main thread between
+  statements, is the sole caller of `IncomingCommand` — the comms thread
+  only enqueues). The multi-frame call-stack opcode (16) is decoded and its
+  empty live reply is now attributed to a statement-boundary timing
+  artifact rather than a thread-scoping bug, pending a retest. DAP
+  scaffolding (`pbDebugAdapter.ts`) not started yet.
 - Target VS Code engine: `^1.85.0` (matches the existing help-viewer prototype)
 - Reference PureBasic install: `/home/gary/Apps/purebasic-v6.41` (v6.41, Linux x64)
 - Language: TypeScript (extension host) + a small Language Server (Node)
@@ -861,6 +865,71 @@ Pure_Xtension/
           without sending a clean disconnect message. The real DAP adapter
           will need a real disconnect opcode (likely in the `Control`
           category, unconfirmed which) sent before closing FIFOs.
+      - **Dispatch model decoded (verified by disassembling
+        `UnixPipeCommunication.o`'s `ExternalDebugger_CommunicationsThread`
+        and `Debugger.o`'s `PB_DEBUGGER_Check` at the instruction level,
+        not guessed) — this overturns the thread-scoping hypothesis the
+        previous session's live test left as the leading explanation for
+        opcode `16`'s empty reply.**
+        - `ExternalDebugger_CommunicationsThread` (the comms pthread
+          `FifoConnect` spawns) does **not** call `PB_DEBUGGER_IncomingCommand`
+          itself, and never touches `PB_Object_GetThreadMemory`. Its read
+          loop only special-cases opcode `3` (breakpoint list — calls
+          `PB_DEBUGGER_ExternalBreakpoints` directly, matching the earlier
+          "routed around the dispatch table" note). Every other opcode's
+          20-byte header + payload is just appended, under
+          `PB_DEBUGGER_ReceiveMutex`, onto a `PB_DEBUGGER_CommandStack`
+          array (capped at `0x63` = 99 pending entries, indexed by a
+          `PB_DEBUGGER_Thread` counter global) and the loop goes straight
+          back to reading the next message — no reply, no handler call,
+          from this thread, ever.
+        - `PB_DEBUGGER_Check` — the function the compiler injects between
+          every source-line statement of a `-d` build — is the only caller
+          of `PB_DEBUGGER_IncomingCommand` (confirmed: it's `Check`'s only
+          call site anywhere in `debugger.a`). Decoded in full: `Check`
+          tests the `PB_DEBUGGER_External` and `PB_DEBUGGER_CommandWaiting`
+          flags, and — **only when the calling thread equals
+          `PB_DEBUGGER_MainThread`** (an explicit pointer comparison against
+          the thread-memory record `PB_Object_GetThreadMemory` just
+          returned) — calls `PB_DEBUGGER_SuspendThreads`, then loops
+          `while (PB_DEBUGGER_IncomingCommand() != 0)` draining the *entire*
+          queued `CommandStack` in one go, then `PB_DEBUGGER_ResumeThreads`.
+          Non-main threads skip this block entirely (they fall through to
+          the breakpoint-address binary search instead) — **worker threads
+          never service the command queue**, only the main thread does, and
+          only between statements.
+        - **Net effect:** `IncomingCommand`, and therefore
+          `ExternalDebugger_Misc`'s opcode-`16` handler, always executes on
+          the target's own main OS thread — the same thread
+          `EnterProcedure`/`LeaveProcedure` instrument, and the same thread
+          `PB_Object_GetThreadMemory` resolves via `pthread_getspecific` (its
+          disassembly in `objectmanagerthread.a` was checked directly: no
+          thread-ID argument exists on that call at all, it always resolves
+          "whichever OS thread is calling right now" via a `pthread_key`).
+          **There is no cross-thread TLS mismatch** — the comms thread never
+          calls anything that touches thread-local call-stack data. The
+          previous session's leading hypothesis is dead.
+        - **Revised explanation for the live empty reply:** `Check`'s
+          command-draining block only runs *between* PureBasic statements.
+          The spike's request landed while the target was blocked *inside*
+          a single statement (`Delay(...)`, a synchronous library call) —
+          the request sat queued on `CommandStack` and could only be
+          serviced once that statement's `Delay` returned and the *next*
+          statement's `Check` ran, by which point the call that was
+          "genuinely mid-call" at request time may have already progressed
+          or returned (`LeaveProcedure` popping the frame) before dispatch
+          actually happened. A statement-boundary timing artifact, not a
+          structural bug in opcode `16` or in thread resolution.
+        - **Next check (supersedes the thread-ID-selector idea):** rerun
+          the FIFO spike with the target parked on a statement that is
+          *not* a blocking library call while genuinely nested inside
+          `Outer`→`Inner` (e.g. a tight `Repeat which polls an event` loop
+          with no library block, so `Check` keeps running every iteration
+          while both frames are still on the stack) and confirm opcode `16`
+          returns two `(int32, cstring)` pairs. If it does, the dispatch
+          model above is fully validated end-to-end and `record+0x10`'s
+          meaning (line number, still unconfirmed) becomes the next thing
+          to pin down by diffing against known source lines.
     - `ExternalDebugger_Variables` (`9,10,11,17`) calls
       `ExamineVariables`/`NextVariable`/`ExamineStructure`/
       `NextStructureField`/`GetProcedureIndex` — DAP's `variables`
@@ -933,38 +1002,43 @@ Pure_Xtension/
   confirmed *live*, not just from static decode (see the "live wire test"
   bullet above), and the simplest connection method
   (`PB_DEBUGGER_Communication=FifoFiles;<out>;<in>` env var) is known and
-  working. What's *not* yet de-risked, contrary to the previous pass's
-  optimism: **opcode `16`'s call-stack claim is unconfirmed live** — the
-  real reply came back empty while the target was genuinely mid-call, so
-  the "real, walkable multi-frame call-stack" conclusion from the static
-  decode is a hypothesis pending the thread-scoping question below, not a
-  settled fact. `ExternalDebugger_Procedures` and `PrintStack` are still
-  correctly ruled out as call-stack sources regardless of how opcode `16`
-  shakes out. Remaining unknowns, reordered by what the live test surfaced:
-  (a) why opcode `16` read back zero frames — leading hypothesis is
-  `PB_Object_GetThreadMemory` scoping to the wrong (comms) thread, needs a
-  thread-ID-selector check; (b) what the generic `type=2` first-reply
-  artifact means; (c) what `record+0x10`'s int32 encodes, once (a) is fixed
-  and opcode `16` actually returns frames to inspect; (d) `Variables`'
-  exact request/response byte layout; (e) `~/.pbdebugger.prefs`' format for
-  the TCP path.
-- **Next spike steps:** (1) resolve why opcode `16` reads back zero active
-  calls — check whether one of the header's 3 spare `int32` fields
-  (offsets `0x8`/`0xc`/`0x10`) is a target-thread-ID selector by trying
-  non-zero values there, and/or find where `PB_Object_GetThreadMemory`
-  picks "current thread" (decode it directly — it's called from both the
-  comms thread and, presumably, `PB_DEBUGGER_EnterProcedure`/
-  `LeaveProcedure` in `Debugger.o`, which are almost certainly the
-  compiler-inserted per-call instrumentation and the far more promising
-  place to find how call records actually get pushed); (2) once opcode
-  `16` returns real frames, empirically confirm what `record+0x10`'s
-  per-frame integer is (line number is still the leading guess) by
-  diffing captured ints against known call-site line numbers; (3) decode
-  `ExternalDebugger_Variables`' request/response byte layout — together
-  with a working `stackTrace` this covers "launch + breakpoint + continue
-  + locals" for a first adapter pass; (4) only then start the real
-  `pbDebugAdapter.ts` DAP scaffolding. The throwaway FIFO round-trip
-  prototype this list used to call for for next steps is **done**:
+  working. The **dispatch model is now also fully decoded** (see the
+  "Dispatch model decoded" bullet above): `IncomingCommand` only ever runs
+  on the target's own main thread, invoked from `PB_DEBUGGER_Check` between
+  statements — there is no cross-thread TLS mismatch, and the
+  thread-ID-selector theory from the previous session is ruled out. What's
+  *still not* de-risked: **opcode `16`'s call-stack claim is unconfirmed
+  live** — the empty reply is now attributed to a statement-boundary timing
+  artifact (the request landed while the target was inside a blocking
+  library call, between `Check` invocations), not a structural defect, but
+  this is a hypothesis pending the retest described below, not a settled
+  fact. `ExternalDebugger_Procedures` and `PrintStack` are still correctly
+  ruled out as call-stack sources regardless of how opcode `16` shakes out.
+  Remaining unknowns, reordered by what this session's static decode
+  surfaced: (a) confirm opcode `16` returns real frames when the target is
+  parked between statements with `Outer`/`Inner` genuinely still on the
+  stack (no blocking library call in the way) — see "Next check" above;
+  (b) what the generic `type=2` first-reply artifact means (still
+  unexplained — `Check`'s command-drain loop was decoded but the specific
+  case that would produce a generic `type=2` reply wasn't identified);
+  (c) what `record+0x10`'s int32 encodes, once (a) is confirmed and opcode
+  `16` actually returns frames to inspect; (d) `Variables`' exact
+  request/response byte layout; (e) `~/.pbdebugger.prefs`' format for the
+  TCP path.
+- **Next spike steps:** (1) rerun the live FIFO test with the target parked
+  on a non-blocking statement while `Outer`/`Inner` are both still on the
+  stack (see "Next check" above) and confirm opcode `16` returns two
+  `(int32, cstring)` frames — this is the direct empirical test of the
+  corrected dispatch-model understanding, replacing the old thread-ID-
+  selector experiment; (2) once opcode `16` returns real frames, empirically
+  confirm what `record+0x10`'s per-frame integer is (line number is still
+  the leading guess) by diffing captured ints against known call-site line
+  numbers; (3) decode `ExternalDebugger_Variables`' request/response byte
+  layout — together with a working `stackTrace` this covers "launch +
+  breakpoint + continue + locals" for a first adapter pass; (4) only then
+  start the real `pbDebugAdapter.ts` DAP scaffolding. The throwaway FIFO
+  round-trip prototype this list used to call for for next steps is
+  **done**:
   `src/debug/spike/fifo-client.mjs` + `test.pb` in this repo, confirmed
   working end to end (connects via the env var, decodes the hello message,
   sends/receives framed requests). (TCP path via `~/.pbdebugger.prefs`
@@ -1034,15 +1108,22 @@ Pure_Xtension/
 
 ## 9. Immediate next steps
 1. M0–M4 done. **M5 — debugger** protocol spike is well underway (risk 1 in
-   §8): opcode table mapped, and the FIFO transport verified live end to
-   end via the throwaway `src/debug/spike/fifo-client.mjs` prototype
-   (connects, decodes the hello message, round-trips framed requests).
-   Continue per the "Next spike steps" list in the M5 section: the live
-   test found opcode `16` (call stack) reads back empty against a real
-   nested-call target, so the next session should resolve that (likely a
-   thread-scoping issue in `PB_Object_GetThreadMemory`) before decoding
-   `record+0x10`'s meaning or `Variables`' byte layout, and before starting
-   the real `pbDebugAdapter.ts` DAP scaffolding.
+   §8): opcode table mapped, the FIFO transport verified live end to end via
+   the throwaway `src/debug/spike/fifo-client.mjs` prototype (connects,
+   decodes the hello message, round-trips framed requests), and the full
+   command-dispatch model is now decoded (`ExternalDebugger_CommunicationsThread`
+   only enqueues onto `PB_DEBUGGER_CommandStack`; `PB_DEBUGGER_Check` —
+   running on the target's own main thread between source-line statements —
+   is the only caller of `IncomingCommand`). That decode rules out the
+   previous session's thread-scoping-mismatch theory for why opcode `16`
+   (call stack) read back empty; the corrected leading explanation is a
+   statement-boundary timing artifact (the request landed while the target
+   was inside a blocking library call). Continue per the "Next spike steps"
+   list in the M5 section: rerun the live FIFO test with the target parked
+   on a non-blocking statement while genuinely nested in `Outer`/`Inner`,
+   confirm opcode `16` returns real frames, then decode `record+0x10`'s
+   meaning and `Variables`' byte layout before starting the real
+   `pbDebugAdapter.ts` DAP scaffolding.
 2. Full in-editor GUI smoke test (M1–M4 features) is still pending a working
    X display in this sandbox — flag to the user to manually verify in a real
    VS Code session before any marketplace publish.
