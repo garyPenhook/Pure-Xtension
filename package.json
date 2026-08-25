@@ -236,6 +236,11 @@
         ]
       }
     ],
+    "breakpoints": [
+      {
+        "language": "purebasic"
+      }
+    ],
     "debuggers": [
       {
         "type": "purebasic",
