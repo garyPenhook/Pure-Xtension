@@ -5,20 +5,23 @@ help, IntelliSense, build/run tasks, and a native debugger bridge.**
 
 - Status: M2, M3, M4 (deep help integration) complete. M5 (debugger) protocol
   spike well underway — wire opcodes mapped, FIFO transport confirmed
-  working end to end with a real throwaway client
-  (`src/debug/spike/fifo-client.mjs`), and the full command-dispatch model
-  is decoded (`Check`, running on the target's own main thread between
+  working end to end with real throwaway clients
+  (`src/debug/spike/fifo-client.mjs`, `fifo-go.mjs`,
+  `fifo-continue-client.mjs`), and the full command-dispatch model is
+  decoded (`Check`, running on the target's own main thread between
   statements, is the sole caller of `IncomingCommand` — the comms thread
-  only enqueues). The multi-frame call-stack opcode (16)'s empty live reply
-  is now **root-caused and confirmed with gdb, not a protocol bug**:
-  connecting an external debugger stops the target before it executes its
-  first real statement (an implicit "stop on entry"), and no client in this
-  spike has ever sent a continue/go command, so the call stack really is
-  empty every time it's been checked — `Outer`/`Inner` are never actually
-  called while a debugger is attached and idle. Next: find the continue/go
-  opcode (likely in `Control`, opcodes `0,1,2,36`) and retest opcode `16`
-  against a genuinely running target. DAP scaffolding (`pbDebugAdapter.ts`)
-  not started yet.
+  only enqueues). **The continue/go opcode is found and gdb-confirmed**
+  (`Control` opcode `2` — sending it visibly releases
+  `PB_DEBUGGER_EnterProcedure`, caught live in gdb), and **the multi-frame
+  call-stack opcode (16) is now confirmed to return real, correctly-shaped
+  frames** once the target is actually running: polling it after sending
+  opcode `2` returned `Outer(5)`/`Inner(5, 10)` with matching, confirmed
+  0-based call-site line numbers for the full duration those calls were
+  genuinely on the stack. This closes out the "empty reply" investigation
+  from last session for good — it was the stop-on-entry wait, and now a
+  real continue command is known. Next: decode `Variables`' byte layout and
+  breakpoint-setting (opcode `3`), then start the real `pbDebugAdapter.ts`
+  DAP scaffolding.
 - Target VS Code engine: `^1.85.0` (matches the existing help-viewer prototype)
 - Reference PureBasic install: `/home/gary/Apps/purebasic-v6.41` (v6.41, Linux x64)
 - Language: TypeScript (extension host) + a small Language Server (Node)
@@ -1031,25 +1034,27 @@ Pure_Xtension/
   `16` actually returns frames to inspect; (d) `Variables`' exact
   request/response byte layout; (e) `~/.pbdebugger.prefs`' format for the
   TCP path.
-- **Next spike steps:** (1) rerun the live FIFO test with the target parked
-  on a non-blocking statement while `Outer`/`Inner` are both still on the
-  stack (see "Next check" above) and confirm opcode `16` returns two
-  `(int32, cstring)` frames — this is the direct empirical test of the
-  corrected dispatch-model understanding, replacing the old thread-ID-
-  selector experiment; (2) once opcode `16` returns real frames, empirically
-  confirm what `record+0x10`'s per-frame integer is (line number is still
-  the leading guess) by diffing captured ints against known call-site line
-  numbers; (3) decode `ExternalDebugger_Variables`' request/response byte
-  layout — together with a working `stackTrace` this covers "launch +
-  breakpoint + continue + locals" for a first adapter pass; (4) only then
-  start the real `pbDebugAdapter.ts` DAP scaffolding. The throwaway FIFO
-  round-trip prototype this list used to call for for next steps is
-  **done**:
-  `src/debug/spike/fifo-client.mjs` + `test.pb` in this repo, confirmed
-  working end to end (connects via the env var, decodes the hello message,
-  sends/receives framed requests). (TCP path via `~/.pbdebugger.prefs`
-  remains a fallback/alternative to spike later — FIFO is simpler to
-  prototype from a CLI-launched debug session.)
+- **Next spike steps, updated now that continue/go and multi-frame
+  `stackTrace` are both live-confirmed:** (1) done — see the "Continue/go
+  opcode found and confirmed live with gdb" bullet above: opcode `2` is the
+  continue command, opcode `16` returns real frames, `record+0x10` is a
+  0-based call-site line number. (2) decode `ExternalDebugger_Variables`'
+  request/response byte layout — together with the now-working
+  `continue`/`stackTrace` pair this covers "launch + breakpoint + continue +
+  stack + locals" for a first adapter pass; (3) decode breakpoint-setting
+  (opcode `3`, `PB_DEBUGGER_ExternalBreakpoints`, routed directly rather than
+  through an `ExternalDebugger_*` wrapper) so the adapter can actually stop
+  somewhere other than entry; (4) confirm whether opcode `2`'s nonzero
+  sub-command is a distinct step-vs-run mode (untested); (5) only then start
+  the real `pbDebugAdapter.ts` DAP scaffolding. Spike prototypes in this repo
+  so far: `src/debug/spike/fifo-client.mjs` (initial connect/decode
+  round-trip), `fifo-poll.mjs` (opcode-16 polling across the spin loop,
+  predates the continue-opcode discovery so its empty results are expected),
+  `fifo-go.mjs` (sends continue, polls opcode 16, confirmed real frames),
+  `fifo-continue-client.mjs` (connect-only client used alongside gdb to
+  prove opcode `2` releases `EnterProcedure`). (TCP path via
+  `~/.pbdebugger.prefs` remains a fallback/alternative to spike later — FIFO
+  is simpler to prototype from a CLI-launched debug session.)
   - **Step (1) done, live — the statement-boundary-timing hypothesis is now
     falsified, not confirmed.** `test.pb` was changed from `Delay(4000)`
     (a blocking library call) to a non-blocking busy-wait
@@ -1135,6 +1140,98 @@ Pure_Xtension/
       poll from a genuinely running target and check whether it then
       returns real `(int32, cstring)` frames — this is the actual pending
       empirical test now, not the timing/draining variants already run.
+  - **Continue/go opcode found and confirmed live with gdb — opcode `16` now
+    returns real multi-frame call stacks. This closes out risk 1's last
+    "unconfirmed" item.** Disassembling `PB_DEBUGGER_Start` (`Debugger.o`)
+    turned up the actual stop-on-entry mechanism directly (not inferred):
+    when `PB_DEBUGGER_External` is set, `Start` writes `ThreadMemory+0x24 = 1`
+    on the main thread's per-thread record, then loops
+    `PB_DEBUGGER_IncomingCommand()` (draining the wire) + re-check
+    `ThreadMemory+0x24` + `nanosleep` until that field reads back `0` — this
+    is the actual block that keeps `Outer`/`Inner` from ever being called
+    while a debugger is attached and idle, confirming and fully explaining
+    last session's gdb finding. `PB_DEBUGGER_StoppedExternal`
+    (`ExternalDebugger.o`, called from `Check()` whenever a stop condition is
+    hit) is the *same* wait loop reused for later stops: it sends a `type=3`
+    notification (`SendCommand` with the per-thread record's fields at
+    `+0x18`/`+0x20`), then loops the identical
+    `IncomingCommand()`-then-check-`+0x24` pattern.
+    - **Two long-standing "unexplained spontaneous message" notes are now
+      resolved, not guessed at:** the `type=2, f12=0x20002` message every
+      session saw immediately after the hello is `PB_DEBUGGER_Start`'s own
+      *second*, unconditional startup announcement (hardcoded at
+      `Debugger.o+0x35a`, sent regardless of anything the client does) — not
+      a generic "first reply" artifact and not a reply to any client
+      request. The `type=3` message is `PB_DEBUGGER_StoppedExternal`'s stop
+      notification, confirmed by decode and now also by live capture
+      (`f8`=line, `f12`=stop-reason code, matching `Check()`'s `+0x24`
+      reason values `6`/`7`/`8`/`9` documented under the `Control`/`Misc`
+      decode above).
+    - **`ExternalDebugger_Control`'s opcode `2` handler, re-read against this
+      new context, is the continue/go command:** unlike opcode `1` (which
+      only clears `+0x24` in specific version-query sub-cases), opcode `2`
+      unconditionally writes `ThreadMemory+0x8 = 0` and `ThreadMemory+0x24 =
+      0` *before* even branching on its sub-command field — exactly the
+      "clear the stop flag" side effect `Start`/`StoppedExternal`'s wait
+      loops are polling for. (A nonzero sub-command additionally fires one
+      more `SendCommand` with a hardcoded value `4`, not yet decoded further
+      — plausibly a step-vs-run distinction; untested.)
+    - **Live confirmation, three ways, all consistent (`src/debug/spike/fifo-go.mjs`,
+      `fifo-continue-client.mjs`):**
+      1. **Timing:** sending opcode `2` (sub-command `0`) right after the
+         hello, then polling opcode `16`, produced the target's next
+         unsolicited message (a `type=5` variable notification for `result`)
+         at **t=4006ms** — matching `test.pb`'s `Inner()` spin-wait
+         (`Until ElapsedMilliseconds() - t > 4000`) almost exactly. The
+         target was not running that loop before; sending opcode `2` is
+         what started it running.
+      2. **gdb, the same method last session used to root-cause the
+         original empty-reply mystery:** breakpoints on
+         `PB_DEBUGGER_EnterProcedure`'s post-increment address (`0x406566`)
+         with a real FIFO connection held open and *no* message sent at all
+         reproduce last session's "never fires" result; sending Control
+         opcode `2` from a second, connect-only client
+         (`fifo-continue-client.mjs`) while `gdb -batch` sat blocked in
+         `run` **hit the breakpoint immediately** (`gdb`'s own log: `Thread
+         1 "test.bin" hit Breakpoint 1, 0x0000000000406566 in
+         PB_DEBUGGER_EnterProcedure ()`). Opcode `2` is confirmed, not
+         inferred, to be what releases the target.
+      3. **Opcode `16`'s reply, polled every 200ms starting 5ms after
+         sending opcode `2`:** first poll (5ms in, before `Outer` had been
+         entered) returned `frames=0`; every poll from **t=206ms through
+         t=3815ms** returned exactly `frames=2`:
+         `[{intField:14, str:"Outer(5)"}, {intField:9, str:"Inner(5, 10)"}]`
+         — real, correctly-ordered, correctly-named, correctly-argument-
+         formatted call-stack frames, present for the full duration `Inner`
+         was genuinely on the stack and gone as soon as the target finished
+         (the client's next request got no further reply and the target
+         exited cleanly, code `0`, once the FIFOs closed). **The
+         multi-frame call-stack design from the original static decode is
+         now fully live-confirmed, not just plausible.**
+    - **`record+0x10`'s meaning is now also empirically pinned down:**
+      comparing the two frames' `intField`s (`14` for `Outer`, `9` for
+      `Inner`) against `test.pb`'s real line numbers (`cat -n`: `Outer` is
+      declared at line 9 and called from line 15; `Inner` is declared at
+      line 1 and called from line 10, inside `Outer`) shows each frame's
+      `intField` is exactly **the 1-based source line of that frame's call
+      site, minus 1** (`Outer`'s caller line 15 → `14`; `Inner`'s caller
+      line 10 → `9`) — i.e. a 0-based call-site line number, consistent
+      across both frames. This resolves the field that PLAN.md has
+      repeatedly flagged as "unconfirmed" since the first static decode.
+    - **Net effect on risk 1 (§8), updated:** all items the previous
+      write-up called "remaining unknowns" for the call-stack/continue path
+      are now closed: opcode `16` is confirmed to return real, correctly-
+      shaped multi-frame call-stack data once the target is actually
+      running; opcode `2` is the confirmed continue/go command; both
+      previously-mysterious spontaneous messages (`type=2`/`type=3`) are
+      explained; `record+0x10` is confirmed to be a 0-based call-site line
+      number. What's *still* open: opcode `2`'s nonzero-sub-command branch
+      (possible step-vs-run distinction, untested); whether a *targeted*
+      stepping opcode exists separately from this "run" (no dedicated
+      step opcode has been identified yet — `Control`'s sub-commands under
+      opcode `1` were the only other decoded sub-command space and none of
+      them looked step-shaped); `Variables`' exact request/response byte
+      layout; `~/.pbdebugger.prefs`' format for the TCP path.
 - Probe pbdebugger protocol → minimal DAP (launch, breakpoint, continue, stack,
   variables) → full stepping/watch/eval.
 
@@ -1165,14 +1262,17 @@ Pure_Xtension/
    DEBUGGER` → `ACCEPT`, optional password/encryption) transport built into
    every `-d` executable via `debugger.a`, with a rich `PB_DEBUGGER_*`
    command surface (variables, arrays, breakpoints, call stack). All 40
-   `IncomingCommand` opcodes are mapped to their 9 handler categories, and
-   opcode `16` is confirmed to be a real multi-frame call-stack reply (not
-   the synthetic single-frame fallback an earlier pass concluded). Remaining
-   unknowns: exact byte layout of `Variables`' request/response, and what
-   opcode `16`'s per-frame integer field encodes (line number, unconfirmed).
-   The `Debug`/`OnError` stdout fallback (verified working, zero plumbing)
-   still de-risks shipping *something* even if further opcode decoding
-   stalls.
+   `IncomingCommand` opcodes are mapped to their 9 handler categories.
+   **Continue/go (`Control` opcode `2`) and multi-frame `stackTrace`
+   (opcode `16`) are now both confirmed working live** (gdb-verified opcode
+   `2` releases the target; opcode `16` returns real, correctly-named,
+   correctly-ordered frames with a confirmed 0-based call-site line number
+   per frame). Remaining unknowns: exact byte layout of `Variables`'
+   request/response; breakpoint-setting (opcode `3`) not yet decoded at the
+   instruction level; whether opcode `2`'s nonzero sub-command is a distinct
+   step mode. The `Debug`/`OnError` stdout fallback (verified working, zero
+   plumbing) still de-risks shipping *something* even if further opcode
+   decoding stalls.
 2. **`.help` binary format** — resolved by sidestepping it: neither offline
    pipeline in the original plan actually worked (`pbdocmaker` is GUI-only;
    no `.help` parser exists to reuse — see M4 notes). Help integration now
@@ -1200,21 +1300,20 @@ Pure_Xtension/
 ## 9. Immediate next steps
 1. M0–M4 done. **M5 — debugger** protocol spike is well underway (risk 1 in
    §8): opcode table mapped, the FIFO transport verified live end to end via
-   the throwaway `src/debug/spike/fifo-client.mjs` prototype (connects,
-   decodes the hello message, round-trips framed requests), and the full
-   command-dispatch model is now decoded (`ExternalDebugger_CommunicationsThread`
-   only enqueues onto `PB_DEBUGGER_CommandStack`; `PB_DEBUGGER_Check` —
-   running on the target's own main thread between source-line statements —
-   is the only caller of `IncomingCommand`). That decode rules out the
-   previous session's thread-scoping-mismatch theory for why opcode `16`
-   (call stack) read back empty; the corrected leading explanation is a
-   statement-boundary timing artifact (the request landed while the target
-   was inside a blocking library call). Continue per the "Next spike steps"
-   list in the M5 section: rerun the live FIFO test with the target parked
-   on a non-blocking statement while genuinely nested in `Outer`/`Inner`,
-   confirm opcode `16` returns real frames, then decode `record+0x10`'s
-   meaning and `Variables`' byte layout before starting the real
-   `pbDebugAdapter.ts` DAP scaffolding.
+   throwaway prototypes (`fifo-client.mjs`, `fifo-go.mjs`,
+   `fifo-continue-client.mjs`), and the full command-dispatch model is
+   decoded (`ExternalDebugger_CommunicationsThread` only enqueues onto
+   `PB_DEBUGGER_CommandStack`; `PB_DEBUGGER_Check` — running on the target's
+   own main thread between source-line statements — is the only caller of
+   `IncomingCommand`). **The continue/go opcode (`Control` opcode `2`) is
+   now found and gdb-confirmed, and opcode `16` is confirmed live to return
+   real multi-frame call-stack data** (`Outer(5)`/`Inner(5, 10)`, with a
+   confirmed 0-based call-site line number per frame) once the target is
+   actually running past the stop-on-entry wait. This fully resolves last
+   session's "empty reply" investigation. Continue per the "Next spike
+   steps" list in the M5 section: decode `ExternalDebugger_Variables`' byte
+   layout and breakpoint-setting (opcode `3`, `PB_DEBUGGER_ExternalBreakpoints`)
+   before starting the real `pbDebugAdapter.ts` DAP scaffolding.
 2. Full in-editor GUI smoke test (M1–M4 features) is still pending a working
    X display in this sandbox — flag to the user to manually verify in a real
    VS Code session before any marketplace publish.
