@@ -10,13 +10,15 @@ help, IntelliSense, build/run tasks, and a native debugger bridge.**
   is decoded (`Check`, running on the target's own main thread between
   statements, is the sole caller of `IncomingCommand` — the comms thread
   only enqueues). The multi-frame call-stack opcode (16)'s empty live reply
-  was retested with the target genuinely nested two calls deep in a
-  non-blocking loop (ruling out the statement-boundary-timing theory) and
-  **still came back empty** — that theory is now falsified, and a new,
-  unexplained wire fact surfaced along the way (the target sends spontaneous
-  unsolicited messages between replies, which can be misread as replies if
-  not drained). Root cause of the empty opcode-16 reply is open again. DAP
-  scaffolding (`pbDebugAdapter.ts`) not started yet.
+  is now **root-caused and confirmed with gdb, not a protocol bug**:
+  connecting an external debugger stops the target before it executes its
+  first real statement (an implicit "stop on entry"), and no client in this
+  spike has ever sent a continue/go command, so the call stack really is
+  empty every time it's been checked — `Outer`/`Inner` are never actually
+  called while a debugger is attached and idle. Next: find the continue/go
+  opcode (likely in `Control`, opcodes `0,1,2,36`) and retest opcode `16`
+  against a genuinely running target. DAP scaffolding (`pbDebugAdapter.ts`)
+  not started yet.
 - Target VS Code engine: `^1.85.0` (matches the existing help-viewer prototype)
 - Reference PureBasic install: `/home/gary/Apps/purebasic-v6.41` (v6.41, Linux x64)
 - Language: TypeScript (extension host) + a small Language Server (Node)
@@ -1079,27 +1081,60 @@ Pure_Xtension/
     re-verification with draining in place before being relied on.
     What triggers the spontaneous `type=3` message (period? statement
     count? something else) is not yet identified.
-  - **Revised state of risk 1:** the opcode-`16`-is-a-call-stack theory
-    (from the `.rodata` jump-table decode + `PB_DEBUGGER_GetProcedureCall`
-    disassembly) is not itself disproven — the *static* decode evidence for
-    what that handler's code does is unchanged — but the *live* claim that
-    it returns real frames under normal operation is now twice
-    unconfirmed under conditions that should have produced them. Plausible
-    explanations not yet ruled out: (a) `Thread+0x48`'s count requires an
-    explicit "enable call-stack tracking" opcode first (unsent so far —
-    candidates: an unexplored `Control` sub-command, or one of the still-
-    undecoded `Watchlist`/`Libraries` opcodes); (b) `Thread` (from
-    `PB_Object_GetThreadMemory`) still isn't resolving to the expected
-    per-OS-thread record for some reason not caught by the `Check`-only-
-    runs-on-main-thread decode; (c) the two nested calls in `test.pb` don't
-    actually stay "active" in whatever sense `Thread+0x48` counts (e.g. if
-    it's populated by `EnterProcedure`/`LeaveProcedure` instrumentation that
-    only fires under a compiler flag beyond plain `-d`, unverified). None of
-    these has been checked yet — next spike step should attempt (a) first
-    (cheapest to test: try a few plausible "enable tracking" requests before
-    opcode `16`) since it requires no new disassembly, then fall back to
-    re-disassembling `PB_Object_GetThreadMemory`'s actual TLS key resolution
-    for (b) if (a) doesn't pan out.
+  - **Root cause found and confirmed with gdb — mystery solved, not a bug
+    in opcode 16 at all.** Disassembled `PB_Object_GetThreadMemory`
+    (`objectmanagerthread.a`): it's a plain single-key `pthread_getspecific`
+    lookup with no thread-ID parameter, so candidate (b) (cross-thread
+    mismatch) is ruled out cleanly — it always resolves whichever OS thread
+    calls it. Disassembled `PB_DEBUGGER_EnterProcedure`/`LeaveProcedure`
+    (`Debugger.o`, real addresses `0x4064f0`/`0x406670` in `test.bin`):
+    confirmed they read/increment/decrement the exact same `Thread+0x48`
+    field via the exact same `PB_DEBUGGER_ThreadData` offset the opcode-16
+    handler uses (cross-checked via `objdump -d -r` relocation targets on
+    both sides) — no offset mismatch either.
+    - **Direct gdb proof the counter itself works:** running `test.bin`
+      under gdb with **no debugger connection** and breakpoints on the
+      post-increment/post-decrement addresses (`0x406566`/`0x4066bc`,
+      printing `*(int*)($rbp+0x48)`) showed the exact expected sequence:
+      `count=1` (Outer entered), `count=2` (Inner entered), `count=1`
+      (Inner left), `count=0` (Outer left) — the mechanism is correct and
+      the count does reach 2 while genuinely nested, for however long the
+      spin loop runs.
+    - **Direct gdb proof of what's actually different when a debugger is
+      connected:** re-ran the identical breakpoint (`0x406566`,
+      `EnterProcedure`'s post-increment address) **with
+      `PB_DEBUGGER_Communication` set** (the same env var the FIFO spike
+      client uses) and a real connection established (via
+      `fifo-poll.mjs`, and separately via a client that connects and then
+      sends nothing at all for 8+ seconds) — **the breakpoint never fires,
+      at all, ever, no matter how long the connection is held open.**
+      `Outer`/`Inner` are simply never called. Two extra OS threads
+      (`[New Thread ...]`) appear in gdb's output only in the
+      connected case, which weren't present in the unconnected run.
+    - **Conclusion:** connecting an external debugger puts the target into
+      a stopped/paused state before it ever executes `Define result.i` /
+      `result = Outer(5)` — i.e. PureBasic's external-debugger protocol has
+      an implicit "stop on entry, wait for an explicit continue/go command"
+      behavior, and **no client in this spike (including the throwaway
+      `fifo-client.mjs`/`fifo-poll.mjs` prototypes) has ever sent a
+      continue/go opcode.** Opcode `16`'s empty reply was not a protocol
+      bug or a misidentified opcode at all — it was truthfully reporting
+      that the call stack really is empty, because the program is
+      genuinely still parked before its first real statement, forever,
+      for lack of a "go" command. This also fully explains both prior
+      "falsifications" in this session (the non-blocking-loop retest and
+      the drain-then-retest): neither actually got the target past its
+      initial stop, so both were re-observing the same true-empty state,
+      not a race or a misrouted reply.
+    - **Next step, cheap and well-scoped:** find and send the actual
+      continue/go opcode — the likely home is the `Control` category
+      (opcodes `0,1,2,36`), whose sub-commands aren't fully enumerated yet
+      (only `1`'s sub-commands `-1,-2,-3,>0` are decoded; `0`, `2`, and `36`
+      itself are undecoded beyond `36`'s single `SetWarningMode` case).
+      Once a real continue/go command is found and sent, rerun the opcode-16
+      poll from a genuinely running target and check whether it then
+      returns real `(int32, cstring)` frames — this is the actual pending
+      empirical test now, not the timing/draining variants already run.
 - Probe pbdebugger protocol → minimal DAP (launch, breakpoint, continue, stack,
   variables) → full stepping/watch/eval.
 
