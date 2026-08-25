@@ -49,6 +49,7 @@ interface LaunchArgs extends DebugProtocol.LaunchRequestArguments {
 export class PureBasicDebugSession extends DebugSession {
   private pb = new PbDebugSession();
   private child?: cp.ChildProcess;
+  private workDir?: string;
   private fifoDir?: string;
   private sourcePath = "";
   /** opcode-16 order (0 = outermost); cached per stop so scopes/variables can address into it. */
@@ -58,11 +59,17 @@ export class PureBasicDebugSession extends DebugSession {
   /** Structure/array/list/map handles for the current stop, keyed by a variablesReference >= COMPOUND_REF_BASE. Rebuilt on every stop. */
   private compoundHandles = new Map<number, CompoundHandle>();
   private nextCompoundRef = COMPOUND_REF_BASE;
+  /** Resolves once VS Code sends configurationDone (i.e. setBreakpoints has landed), so the initial continue() can't race ahead of it. */
+  private configurationDone: Promise<void>;
+  private resolveConfigurationDone!: () => void;
 
   constructor() {
     super();
     this.setDebuggerLinesStartAt1(true);
     this.setDebuggerColumnsStartAt1(true);
+    this.configurationDone = new Promise((resolve) => {
+      this.resolveConfigurationDone = resolve;
+    });
     this.pb.on("stopped", ({ reason }: { line: number; reason: number }) => {
       this.lastFrames = [];
       this.compoundHandles.clear();
@@ -83,6 +90,18 @@ export class PureBasicDebugSession extends DebugSession {
     this.sendEvent(new TerminatedEvent());
   }
 
+  /** Removes the compile-output and FIFO temp dirs. Safe to call more than once and from any error path. */
+  private cleanupTempDirs(): void {
+    if (this.workDir) {
+      fs.rmSync(this.workDir, { recursive: true, force: true });
+      this.workDir = undefined;
+    }
+    if (this.fifoDir) {
+      fs.rmSync(this.fifoDir, { recursive: true, force: true });
+      this.fifoDir = undefined;
+    }
+  }
+
   protected initializeRequest(
     response: DebugProtocol.InitializeResponse,
     _args: DebugProtocol.InitializeRequestArguments,
@@ -98,6 +117,14 @@ export class PureBasicDebugSession extends DebugSession {
     this.sendEvent(new InitializedEvent());
   }
 
+  protected configurationDoneRequest(
+    response: DebugProtocol.ConfigurationDoneResponse,
+    args: DebugProtocol.ConfigurationDoneArguments,
+  ): void {
+    super.configurationDoneRequest(response, args);
+    this.resolveConfigurationDone();
+  }
+
   protected async launchRequest(
     response: DebugProtocol.LaunchResponse,
     args: LaunchArgs,
@@ -110,14 +137,28 @@ export class PureBasicDebugSession extends DebugSession {
       return;
     }
 
-    const workDir = fs.mkdtempSync(path.join(os.tmpdir(), "pure-xtension-debug-"));
-    const outBinary = path.join(workDir, "target.bin");
+    this.workDir = fs.mkdtempSync(path.join(os.tmpdir(), "pure-xtension-debug-"));
+    const outBinary = path.join(this.workDir, "target.bin");
     const compileArgs = ["-d", "-ds", "-l", "-o", outBinary, ...(args.compilerArgs ?? []), args.program];
     const compileResult = cp.spawnSync(compiler, compileArgs, { encoding: "utf8" });
     if (compileResult.status !== 0) {
       this.sendEvent(new OutputEvent(compileResult.stdout ?? "", "stdout"));
       this.sendEvent(new OutputEvent(compileResult.stderr ?? "", "stderr"));
       this.sendErrorResponse(response, 1002, "Pure Xtension: compile (debug build) failed — see debug console.");
+      this.cleanupTempDirs();
+      return;
+    }
+
+    if (process.platform === "win32") {
+      // FIFOs (POSIX-only) are the only transport this adapter implements —
+      // fail clearly instead of letting execFileSync("mkfifo", ...) throw an
+      // uncaught ENOENT before any of the surrounding cleanup can run.
+      this.sendErrorResponse(
+        response,
+        1006,
+        "Pure Xtension: the FIFO-based debugger transport isn't supported on Windows yet.",
+      );
+      this.cleanupTempDirs();
       return;
     }
 
@@ -154,6 +195,8 @@ export class PureBasicDebugSession extends DebugSession {
       // -d target (PLAN.md M5: live-tested, the process just ignores it) —
       // SIGKILL is the only signal verified to actually terminate it.
       this.child.kill("SIGKILL");
+      this.pb.close();
+      this.cleanupTempDirs();
       return;
     }
 
@@ -165,6 +208,9 @@ export class PureBasicDebugSession extends DebugSession {
       // no extra command needed to "arrive" at entry.
       this.sendEvent(new StoppedEvent("entry", MAIN_THREAD_ID));
     } else {
+      // Wait for configurationDone (fired once setBreakpoints has landed)
+      // before releasing the target, so first-run breakpoints actually bind.
+      await this.configurationDone;
       this.pb.continue();
     }
   }
@@ -173,8 +219,22 @@ export class PureBasicDebugSession extends DebugSession {
     response: DebugProtocol.SetBreakpointsResponse,
     args: DebugProtocol.SetBreakpointsArguments,
   ): Promise<void> {
-    this.pb.clearAllLineBreakpoints();
     const lines = args.breakpoints?.map((b) => b.line) ?? args.lines ?? [];
+
+    // This adapter only ever compiles/debugs one module (args.program from
+    // launchRequest) — there's no confirmed moduleId scoping for the wire
+    // protocol's breakpoint opcode (PLAN.md M5), so clearAllLineBreakpoints()
+    // is target-wide. VS Code sends one setBreakpoints call per file with
+    // breakpoints; without this guard, setting a breakpoint in an unrelated
+    // open file would wipe (and never restore) the real session's
+    // breakpoints in the file actually being debugged.
+    if (args.source.path && args.source.path !== this.sourcePath) {
+      response.body = { breakpoints: lines.map((line) => new Breakpoint(false, line)) };
+      this.sendResponse(response);
+      return;
+    }
+
+    this.pb.clearAllLineBreakpoints();
     for (const line of lines) {
       this.pb.addLineBreakpoint(line);
     }
@@ -383,9 +443,7 @@ export class PureBasicDebugSession extends DebugSession {
     // target, live-tested (the process just ignores it and keeps running).
     this.pb.close();
     this.child?.kill("SIGKILL");
-    if (this.fifoDir) {
-      fs.rmSync(this.fifoDir, { recursive: true, force: true });
-    }
+    this.cleanupTempDirs();
     this.sendResponse(response);
   }
 }

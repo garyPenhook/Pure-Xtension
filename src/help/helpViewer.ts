@@ -2,8 +2,24 @@ import * as vscode from "vscode";
 
 let panel: vscode.WebviewPanel | undefined;
 
+// Must match pageHtml's CSP frame-src below — any other host would render a
+// silent blank iframe with no explanation, so those are opened externally
+// instead of even creating the panel.
+const ALLOWED_HELP_HOSTS = new Set(["www.purebasic.com", "purebasic.com"]);
+
 /** Opens (or reuses) a single webview panel showing a live purebasic.com doc page in an iframe. */
 export function showHelpPage(title: string, url: string): void {
+  let host = "";
+  try {
+    host = new URL(url).hostname;
+  } catch {
+    // malformed URL — fall through, treated the same as a disallowed host
+  }
+  if (!ALLOWED_HELP_HOSTS.has(host)) {
+    void vscode.env.openExternal(vscode.Uri.parse(url));
+    return;
+  }
+
   if (panel) {
     panel.title = title;
     panel.webview.html = pageHtml(title, url);
@@ -19,6 +35,13 @@ export function showHelpPage(title: string, url: string): void {
   );
   panel.webview.html = pageHtml(title, url);
   panel.onDidDispose(() => (panel = undefined));
+}
+
+/** Closes the shared help panel, if open — called from deactivate() since the
+ *  panel is a module-level singleton, not registered in context.subscriptions. */
+export function disposeHelpPanel(): void {
+  panel?.dispose();
+  panel = undefined;
 }
 
 function esc(value: string): string {

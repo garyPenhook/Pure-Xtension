@@ -47,8 +47,18 @@ export function extractWorkspaceSymbols(text: string): WorkspaceSymbol[] {
           isPointer: pointer === "*",
           arraySize: arraySize ? Number(arraySize) : undefined,
         });
+        continue;
       }
-      continue;
+      // Not a field and no EndStructure seen yet — if this line starts a new
+      // top-level construct (the common mid-typing case: the user hasn't
+      // typed EndStructure yet), treat the structure as implicitly closed
+      // instead of swallowing everything below it. Otherwise it's a blank
+      // or garbage line inside the structure body — ignore it.
+      if (PROCEDURE_LINE.test(line) || STRUCTURE_LINE.test(line) || INTERFACE_LINE.test(line) || MACRO_LINE.test(line)) {
+        currentStructure = undefined;
+      } else {
+        continue;
+      }
     }
 
     const proc = PROCEDURE_LINE.exec(line);

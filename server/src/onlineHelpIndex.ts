@@ -41,7 +41,11 @@ export async function fetchHelpIndex(): Promise<HelpIndex> {
 
 async function readCache(cacheDir: string): Promise<HelpIndex | undefined> {
   try {
-    return JSON.parse(await readFile(cacheFile(cacheDir), "utf8")) as HelpIndex;
+    const parsed = JSON.parse(await readFile(cacheFile(cacheDir), "utf8")) as Partial<HelpIndex>;
+    // Valid JSON but a missing/malformed `commands` (e.g. `{}`) shouldn't be
+    // treated as a real index — getHelpUrl would throw indexing into it.
+    if (!parsed || typeof parsed.commands !== "object" || parsed.commands === null) return undefined;
+    return parsed as HelpIndex;
   } catch {
     return undefined;
   }
@@ -64,5 +68,5 @@ export async function loadOrFetchHelpIndex(cacheDir: string): Promise<HelpIndex 
 }
 
 export function getHelpUrl(index: HelpIndex | undefined, name: string): string | undefined {
-  return index?.commands[name.toLowerCase()]?.url;
+  return index?.commands?.[name.toLowerCase()]?.url;
 }

@@ -8,6 +8,9 @@ import * as fs from "fs";
 import { EventEmitter } from "events";
 
 const HEADER_SIZE = 20;
+// Sanity bound for a message's declared payload length (see drainMessages) —
+// real payloads (variable/array/list dumps) are a few KB at most.
+const MAX_MESSAGE_LEN = 16 * 1024 * 1024;
 
 // Opcodes confirmed live (PLAN.md M5).
 export const OP_CONTROL = 0; // sub-commands via f8; only "continue" (below) is used here
@@ -393,7 +396,7 @@ export class PbDebugSession extends EventEmitter {
   private writeStream?: fs.WriteStream;
   private readStream?: fs.ReadStream;
   private recvBuffer = Buffer.alloc(0);
-  private pendingResolvers: ((msg: PbMessage) => void)[] = [];
+  private pending: { resolve: (msg: PbMessage) => void; reject: (err: Error) => void }[] = [];
   private unclaimed: PbMessage[] = [];
 
   /**
@@ -413,10 +416,19 @@ export class PbDebugSession extends EventEmitter {
       this.recvBuffer = Buffer.concat([this.recvBuffer, chunk as Buffer]);
       this.drainMessages();
     });
-    this.readStream.on("close", () => this.emit("close"));
-    this.readStream.on("error", (err) => this.emit("error", err));
+    this.readStream.on("close", () => {
+      this.rejectPending(new Error("debugger connection closed"));
+      this.emit("close");
+    });
+    this.readStream.on("error", (err: Error) => {
+      this.rejectPending(err);
+      this.emit("error", err);
+    });
     this.writeStream = fs.createWriteStream(inFifo);
-    this.writeStream.on("error", (err) => this.emit("error", err));
+    this.writeStream.on("error", (err: Error) => {
+      this.rejectPending(err);
+      this.emit("error", err);
+    });
 
     const hello = this.nextMessage();
     const timeout = new Promise<PbMessage>((_, reject) => {
@@ -432,7 +444,17 @@ export class PbDebugSession extends EventEmitter {
     for (;;) {
       if (this.recvBuffer.length < HEADER_SIZE) return;
       const len = this.recvBuffer.readInt32LE(4);
-      const total = HEADER_SIZE + Math.max(0, len);
+      // Sanity-bound len before waiting for it: a corrupt/desynced stream
+      // (or a genuinely negative value) would otherwise make this loop wait
+      // for a buffer size that never arrives, silently stalling every
+      // subsequent message — including "stopped" — instead of surfacing an
+      // error. Real payloads (variable/array/list dumps) are a few KB at most.
+      if (len < 0 || len > MAX_MESSAGE_LEN) {
+        this.emit("error", new Error(`corrupt or desynced debugger stream: header declares an implausible message length (${len})`));
+        this.close();
+        return;
+      }
+      const total = HEADER_SIZE + len;
       if (this.recvBuffer.length < total) return;
       const msg: PbMessage = {
         type: this.recvBuffer.readInt32LE(0),
@@ -452,9 +474,9 @@ export class PbDebugSession extends EventEmitter {
       this.emit("stopped", { line: msg.f8, reason: msg.f12 });
       return;
     }
-    const resolver = this.pendingResolvers.shift();
-    if (resolver) {
-      resolver(msg);
+    const pending = this.pending.shift();
+    if (pending) {
+      pending.resolve(msg);
     } else {
       this.unclaimed.push(msg);
     }
@@ -463,7 +485,37 @@ export class PbDebugSession extends EventEmitter {
   private nextMessage(): Promise<PbMessage> {
     const buffered = this.unclaimed.shift();
     if (buffered) return Promise.resolve(buffered);
-    return new Promise((resolve) => this.pendingResolvers.push(resolve));
+    return new Promise((resolve, reject) => this.pending.push({ resolve, reject }));
+  }
+
+  /** Drains and rejects every outstanding request so a dead connection can't hang a caller forever. */
+  private rejectPending(err: Error): void {
+    const pending = this.pending.splice(0);
+    for (const p of pending) p.reject(err);
+  }
+
+  private requestChain: Promise<unknown> = Promise.resolve();
+
+  /**
+   * Serializes request/response round-trips over the shared FIFO connection.
+   * The wire protocol carries no request ID — replies are matched purely by
+   * arrival order (see {@link nextMessage}/{@link dispatch}) — so two
+   * overlapping requests (e.g. an `evaluate()` call racing `variablesRequest`'s
+   * `Promise.all` of `examineArrays`/`examineLists`/`examineMaps`) could
+   * otherwise hand one caller another caller's reply. Only `stopped` is
+   * genuinely unsolicited (handled separately in {@link dispatch}), so
+   * one-request-in-flight-at-a-time is actually correct here, not just a
+   * workaround.
+   */
+  private serialize<T>(fn: () => Promise<T>): Promise<T> {
+    const result = this.requestChain.then(fn, fn);
+    // Swallow rejections in the chain itself so one failed/timed-out request
+    // doesn't permanently wedge every later caller behind a rejected promise.
+    this.requestChain = result.then(
+      () => undefined,
+      () => undefined,
+    );
+    return result;
   }
 
   private write(opcode: number, f8 = 0, f12 = 0, f16 = 0, payload?: Buffer, len = 0): void {
@@ -477,9 +529,18 @@ export class PbDebugSession extends EventEmitter {
     if (payload) this.writeStream!.write(payload);
   }
 
-  /** Drain the unconditional startup announcement sent right after `hello`. */
-  drainStartupAnnouncement(): Promise<PbMessage> {
-    return this.nextMessage();
+  /** Drain the unconditional startup announcement sent right after `hello`. Bounded the same way
+   *  {@link connect} is — an unconditional await here would otherwise hang launchRequest forever
+   *  if the target sent hello but never followed up with the announcement. */
+  drainStartupAnnouncement(timeoutMs = 10000): Promise<PbMessage> {
+    const message = this.nextMessage();
+    const timeout = new Promise<PbMessage>((_, reject) => {
+      setTimeout(
+        () => reject(new Error(`timed out after ${timeoutMs}ms waiting for the debugger's startup announcement`)),
+        timeoutMs,
+      ).unref();
+    });
+    return Promise.race([message, timeout]);
   }
 
   /** Opcode 2: unconditionally clears the target's stop flag and lets it run. */
@@ -500,28 +561,36 @@ export class PbDebugSession extends EventEmitter {
   }
 
   async stackTrace(): Promise<PbFrame[]> {
-    this.write(OP_STACK_TRACE);
-    const msg = await this.nextMessage();
-    return parseFrames(msg.payload);
+    return this.serialize(async () => {
+      this.write(OP_STACK_TRACE);
+      const msg = await this.nextMessage();
+      return parseFrames(msg.payload);
+    });
   }
 
   async examineGlobals(): Promise<PbVariable[]> {
-    this.write(OP_EXAMINE_GLOBALS);
-    const msg = await this.nextMessage();
-    return parseVariables(msg.payload);
+    return this.serialize(async () => {
+      this.write(OP_EXAMINE_GLOBALS);
+      const msg = await this.nextMessage();
+      return parseVariables(msg.payload);
+    });
   }
 
   async examineCurrentFrame(): Promise<PbVariable[]> {
-    this.write(OP_EXAMINE_CURRENT_FRAME);
-    const msg = await this.nextMessage();
-    return parseVariables(msg.payload);
+    return this.serialize(async () => {
+      this.write(OP_EXAMINE_CURRENT_FRAME);
+      const msg = await this.nextMessage();
+      return parseVariables(msg.payload);
+    });
   }
 
   /** frameIndex is opcode-16 order: 0 = outermost caller, increasing toward the current frame. */
   async examineFrame(frameIndex: number): Promise<PbVariable[]> {
-    this.write(OP_EXAMINE_FRAME, frameIndex);
-    const msg = await this.nextMessage();
-    return parseVariables(msg.payload);
+    return this.serialize(async () => {
+      this.write(OP_EXAMINE_FRAME, frameIndex);
+      const msg = await this.nextMessage();
+      return parseVariables(msg.payload);
+    });
   }
 
   /**
@@ -533,23 +602,29 @@ export class PbDebugSession extends EventEmitter {
    * scalars.
    */
   async examineArrays(global = false): Promise<PbArrayDecl[]> {
-    this.write(OP_EXAMINE_ARRAYS, global ? 1 : 0);
-    const msg = await this.nextMessage();
-    return parseArrayDecls(msg.payload);
+    return this.serialize(async () => {
+      this.write(OP_EXAMINE_ARRAYS, global ? 1 : 0);
+      const msg = await this.nextMessage();
+      return parseArrayDecls(msg.payload);
+    });
   }
 
   /** Opcode 13: enumerate linked lists. Same f8/scope caveat as {@link examineArrays}. */
   async examineLists(global = false): Promise<PbListDecl[]> {
-    this.write(OP_EXAMINE_LISTS, global ? 1 : 0);
-    const msg = await this.nextMessage();
-    return parseListDecls(msg.payload);
+    return this.serialize(async () => {
+      this.write(OP_EXAMINE_LISTS, global ? 1 : 0);
+      const msg = await this.nextMessage();
+      return parseListDecls(msg.payload);
+    });
   }
 
   /** Opcode 14: enumerate maps. Same f8/scope caveat as {@link examineArrays}. */
   async examineMaps(global = false): Promise<PbMapDecl[]> {
-    this.write(OP_EXAMINE_MAPS, global ? 1 : 0);
-    const msg = await this.nextMessage();
-    return parseMapDecls(msg.payload);
+    return this.serialize(async () => {
+      this.write(OP_EXAMINE_MAPS, global ? 1 : 0);
+      const msg = await this.nextMessage();
+      return parseMapDecls(msg.payload);
+    });
   }
 
   /**
@@ -576,28 +651,30 @@ export class PbDebugSession extends EventEmitter {
     | { kind: "unsupported"; raw: Buffer }
     | { kind: "error"; message: string }
   > {
-    const payload = Buffer.concat([Buffer.from(expression, "latin1"), Buffer.from([0])]);
-    this.write(OP_EXAMINE_EXPRESSION, 0, frameContext, 0, payload, payload.length);
-    const msg = await this.nextMessage();
-    const echoesExpression = msg.payload.length >= expression.length && msg.payload.toString("latin1", 0, expression.length) === expression;
-    if (msg.type === 0x11 && echoesExpression) {
-      const { name, elements } = parseArrayElements(msg.payload);
-      return { kind: "array", name, elements };
-    }
-    if (msg.type === 0x15 && echoesExpression) {
-      const { name, elements } = parseMapElements(msg.payload);
-      return { kind: "map", name, elements };
-    }
-    if (msg.type === 0x13 && echoesExpression) {
-      const listResult = parseListElements(msg.payload, msg.f12);
-      if (listResult) return { kind: "list", name: listResult.name, elements: listResult.elements };
-      return { kind: "unsupported", raw: msg.payload };
-    }
-    // Not a recognized data reply, or the echoed-name check failed: treat
-    // the whole payload as the target's own error string.
-    const nul = msg.payload.indexOf(0);
-    const message = nul === -1 ? msg.payload.toString("latin1") : msg.payload.toString("latin1", 0, nul);
-    return { kind: "error", message };
+    return this.serialize(async () => {
+      const payload = Buffer.concat([Buffer.from(expression, "latin1"), Buffer.from([0])]);
+      this.write(OP_EXAMINE_EXPRESSION, 0, frameContext, 0, payload, payload.length);
+      const msg = await this.nextMessage();
+      const echoesExpression = msg.payload.length >= expression.length && msg.payload.toString("latin1", 0, expression.length) === expression;
+      if (msg.type === 0x11 && echoesExpression) {
+        const { name, elements } = parseArrayElements(msg.payload);
+        return { kind: "array", name, elements };
+      }
+      if (msg.type === 0x15 && echoesExpression) {
+        const { name, elements } = parseMapElements(msg.payload);
+        return { kind: "map", name, elements };
+      }
+      if (msg.type === 0x13 && echoesExpression) {
+        const listResult = parseListElements(msg.payload, msg.f12);
+        if (listResult) return { kind: "list", name: listResult.name, elements: listResult.elements };
+        return { kind: "unsupported", raw: msg.payload };
+      }
+      // Not a recognized data reply, or the echoed-name check failed: treat
+      // the whole payload as the target's own error string.
+      const nul = msg.payload.indexOf(0);
+      const message = nul === -1 ? msg.payload.toString("latin1") : msg.payload.toString("latin1", 0, nul);
+      return { kind: "error", message };
+    });
   }
 
   /**
@@ -609,18 +686,20 @@ export class PbDebugSession extends EventEmitter {
    * open question, not yet confirmed to work or to even be meaningful here.
    */
   async evaluate(expression: string, frameContext = -1): Promise<PbEvaluateResult> {
-    const payload = Buffer.concat([Buffer.from(expression, "latin1"), Buffer.from([0])]);
-    // len must be the full byte count actually sent (incl. the NUL) — the
-    // comm thread reads exactly `len` payload bytes off the wire before
-    // dispatching, regardless of where ParseExpressionExternal's own
-    // estrlen finds the string end. Sending len = expression.length
-    // (excl. NUL, matching the throwaway spike's convention) leaves one
-    // stray byte unread in the FIFO, which silently shifts and hangs the
-    // *next* request's header framing — only surfaces across two
-    // sequential requests on one connection, not a single one-off call.
-    this.write(OP_EVALUATE, 0, frameContext, 0, payload, payload.length);
-    const msg = await this.nextMessage();
-    return parseEvaluateReply(msg);
+    return this.serialize(async () => {
+      const payload = Buffer.concat([Buffer.from(expression, "latin1"), Buffer.from([0])]);
+      // len must be the full byte count actually sent (incl. the NUL) — the
+      // comm thread reads exactly `len` payload bytes off the wire before
+      // dispatching, regardless of where ParseExpressionExternal's own
+      // estrlen finds the string end. Sending len = expression.length
+      // (excl. NUL, matching the throwaway spike's convention) leaves one
+      // stray byte unread in the FIFO, which silently shifts and hangs the
+      // *next* request's header framing — only surfaces across two
+      // sequential requests on one connection, not a single one-off call.
+      this.write(OP_EVALUATE, 0, frameContext, 0, payload, payload.length);
+      const msg = await this.nextMessage();
+      return parseEvaluateReply(msg);
+    });
   }
 
   /**
@@ -636,12 +715,14 @@ export class PbDebugSession extends EventEmitter {
    * target-side `ModifyVariable` problem.
    */
   async setVariable(target: string, value: string): Promise<PbEvaluateResult> {
-    const payload = Buffer.concat(
-      [target, value].map((s) => Buffer.concat([Buffer.from(s, "latin1"), Buffer.from([0])])),
-    );
-    this.write(OP_MODIFY, 0, -1, 0, payload, payload.length);
-    const msg = await this.nextMessage();
-    return parseEvaluateReply(msg);
+    return this.serialize(async () => {
+      const payload = Buffer.concat(
+        [target, value].map((s) => Buffer.concat([Buffer.from(s, "latin1"), Buffer.from([0])])),
+      );
+      this.write(OP_MODIFY, 0, -1, 0, payload, payload.length);
+      const msg = await this.nextMessage();
+      return parseEvaluateReply(msg);
+    });
   }
 
   close(): void {
@@ -649,5 +730,6 @@ export class PbDebugSession extends EventEmitter {
     this.writeStream?.end();
     this.readStream = undefined;
     this.writeStream = undefined;
+    this.rejectPending(new Error("debugger session closed"));
   }
 }

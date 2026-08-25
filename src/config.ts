@@ -21,13 +21,24 @@ function expandHome(p: string): string {
 /** Directories to probe for a PureBasic install when no setting/env is given. */
 function candidateHomes(): string[] {
   const home = os.homedir();
-  const globPrefixes = [path.join(home, "Apps"), "/opt", "/usr/local", "/usr/share"];
+  const globPrefixes =
+    process.platform === "win32"
+      ? [
+          "C:\\Program Files",
+          "C:\\Program Files (x86)",
+          path.join(home, "AppData", "Local"),
+        ]
+      : process.platform === "darwin"
+        ? ["/Applications", path.join(home, "Applications")]
+        : [path.join(home, "Apps"), "/opt", "/usr/local", "/usr/share"];
   const found: string[] = [];
   for (const dir of globPrefixes) {
     try {
       for (const entry of fs.readdirSync(dir)) {
-        if (/^purebasic(-v[\d.]+)?$/i.test(entry)) {
-          found.push(path.join(dir, entry));
+        if (/^purebasic(-v[\d.]+)?(\.app)?$/i.test(entry)) {
+          const base = path.join(dir, entry);
+          // A macOS .app bundle's actual install root is Contents/Resources.
+          found.push(entry.toLowerCase().endsWith(".app") ? path.join(base, "Contents", "Resources") : base);
         }
       }
     } catch {
@@ -37,8 +48,12 @@ function candidateHomes(): string[] {
   return found;
 }
 
+function exeName(name: string): string {
+  return process.platform === "win32" ? `${name}.exe` : name;
+}
+
 function looksLikePureBasicHome(dir: string): boolean {
-  return fs.existsSync(path.join(dir, "compilers", "pbcompiler"));
+  return fs.existsSync(path.join(dir, "compilers", exeName("pbcompiler")));
 }
 
 // candidateHomes() does several readdirSync calls; resolvePureBasicHome() is
@@ -87,7 +102,7 @@ function resolvePureBasicHomeUncached(): string | undefined {
 }
 
 function backendBinaryName(backend: Backend): string {
-  return backend === "asm" ? "pbcompiler" : "pbcompilerc";
+  return exeName(backend === "asm" ? "pbcompiler" : "pbcompilerc");
 }
 
 /** Resolve the compiler binary path for a specific backend, or undefined if not found. */
@@ -156,6 +171,16 @@ export function resolveBackendSilent(): Backend | undefined {
 export async function resolveBackend(): Promise<Backend | undefined> {
   const configured = config().get<string>("backend", "auto");
   if (configured === "asm" || configured === "c") {
+    if (!resolveCompilerPath(configured)) {
+      // Without this, an explicit-but-unresolvable backend setting makes
+      // build/run/check silently no-op — the caller just gets undefined and
+      // falls back to a generic "no compiler found" message with no hint
+      // that the *configured* backend specifically is the problem.
+      vscode.window.showWarningMessage(
+        `Pure Xtension: the configured backend ("${configured}") compiler wasn't found. Check pureXtension.compilerPath.${configured} or pureXtension.purebasicHome.`,
+      );
+      return undefined;
+    }
     return configured;
   }
 

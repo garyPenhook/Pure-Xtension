@@ -83,8 +83,14 @@ export async function rebuildHelpIndexCommand(): Promise<void> {
  *  if the language server isn't running or the symbol isn't a known built-in. */
 export async function resolveHelpUrl(symbol: string): Promise<string | undefined> {
   if (!client) return undefined;
-  const result = await client.sendRequest<{ url?: string }>("pureXtension/helpUrl", { symbol });
-  return result.url;
+  try {
+    const result = await client.sendRequest<{ url?: string }>("pureXtension/helpUrl", { symbol });
+    return result.url;
+  } catch {
+    // A crashed/restarting server shouldn't surface a raw error toast for a
+    // hover/F1 lookup — callers already treat undefined as "no docs found".
+    return undefined;
+  }
 }
 
 export interface HelpEntry {
@@ -95,6 +101,13 @@ export interface HelpEntry {
 /** Lists every command in the online help index, or [] if the language server isn't running. */
 export async function listHelpEntries(): Promise<HelpEntry[]> {
   if (!client) return [];
-  const result = await client.sendRequest<{ entries: HelpEntry[] }>("pureXtension/helpEntries");
-  return result.entries;
+  try {
+    const result = await client.sendRequest<{ entries: HelpEntry[] }>("pureXtension/helpEntries");
+    return result.entries;
+  } catch {
+    // Same reasoning as resolveHelpUrl: HelpTreeProvider/searchHelp already
+    // treat [] as "not available yet" and retry later, so degrade quietly
+    // instead of rejecting into getChildren()/a command handler.
+    return [];
+  }
 }

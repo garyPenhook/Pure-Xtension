@@ -20,11 +20,7 @@
   ],
   "main": "./dist/extension.js",
   "activationEvents": [
-    "onLanguage:purebasic",
-    "onCommand:pureXtension.build",
-    "onCommand:pureXtension.buildAndRun",
-    "onCommand:pureXtension.checkSyntax",
-    "onCommand:pureXtension.selectBackend"
+    "onLanguage:purebasic"
   ],
   "contributes": {
     "languages": [
@@ -37,7 +33,8 @@
         "extensions": [
           ".pb",
           ".pbi",
-          ".pbf"
+          ".pbf",
+          ".pbp"
         ],
         "configuration": "./language-configuration.json"
       }
@@ -86,10 +83,6 @@
       }
     },
     "commands": [
-      {
-        "command": "pureXtension.helloWorld",
-        "title": "Pure Xtension: Hello World"
-      },
       {
         "command": "pureXtension.build",
         "title": "Pure Xtension: Build",
@@ -181,7 +174,7 @@
     "keybindings": [
       {
         "command": "pureXtension.openHelpForSymbol",
-        "key": "F1",
+        "key": "shift+F1",
         "when": "editorTextFocus && editorLangId == purebasic"
       }
     ],

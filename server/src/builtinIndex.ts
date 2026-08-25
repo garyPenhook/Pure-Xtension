@@ -43,9 +43,11 @@ async function detectVersion(compilerPath: string): Promise<string> {
   return stdout.trim() || "unknown";
 }
 
-/** Builds the built-in symbol index by running pbcompiler's dump flags once. */
-export async function buildBuiltinIndex(compilerPath: string): Promise<BuiltinIndex> {
-  const version = await detectVersion(compilerPath);
+/** Builds the built-in symbol index by running pbcompiler's dump flags once.
+ *  `knownVersion` lets a caller that already detected it (e.g. loadOrBuildBuiltinIndex,
+ *  to pick a cache file) skip spawning `pbcompiler -v` a second time. */
+export async function buildBuiltinIndex(compilerPath: string, knownVersion?: string): Promise<BuiltinIndex> {
+  const version = knownVersion ?? (await detectVersion(compilerPath));
   const dir = await mkdtemp(join(tmpdir(), "pure-xtension-"));
   const stubSource = join(dir, "stub.pb");
   const funcsFile = join(dir, "funcs.txt");
@@ -88,8 +90,6 @@ export async function queryStructureFields(
     await runCompiler(compilerPath, [stubSource, "-qs", structureName, "-o", outFile, "-k", "-q"]);
     const text = await readFile(outFile, "utf8");
     return parseStructureFieldsDump(text);
-  } catch {
-    return [];
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
@@ -115,7 +115,7 @@ export async function loadOrBuildBuiltinIndex(
     // no cache yet, or unreadable — fall through and rebuild.
   }
 
-  const index = await buildBuiltinIndex(compilerPath);
+  const index = await buildBuiltinIndex(compilerPath, version);
   await mkdir(cacheDir, { recursive: true });
   await writeFile(file, JSON.stringify(index), "utf8");
   return index;

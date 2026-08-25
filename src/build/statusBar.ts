@@ -1,4 +1,5 @@
 import * as vscode from "vscode";
+import { resolveBackendSilent } from "../config";
 
 export function createStatusBar(): vscode.Disposable[] {
   const buildItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 20);
@@ -28,7 +29,16 @@ export function createStatusBar(): vscode.Disposable[] {
 
   function refreshBackendLabel(): void {
     const backend = vscode.workspace.getConfiguration("pureXtension").get<string>("backend", "auto");
-    backendItem.text = `$(package) ${backend === "c" ? "C backend" : backend === "asm" ? "ASM backend" : "auto backend"}`;
+    if (backend === "c" || backend === "asm") {
+      backendItem.text = `$(package) ${backend === "c" ? "C backend" : "ASM backend"}`;
+      return;
+    }
+    // "auto" mode silently resolves to a concrete backend behind the scenes
+    // (or stays ambiguous) — reflect that instead of always saying "auto
+    // backend", which reads as if nothing had been resolved yet.
+    const resolved = resolveBackendSilent();
+    const resolvedLabel = resolved === "c" ? "C" : resolved === "asm" ? "ASM" : "unresolved";
+    backendItem.text = `$(package) auto (${resolvedLabel} backend)`;
   }
 
   refreshVisibility(vscode.window.activeTextEditor);
@@ -36,7 +46,11 @@ export function createStatusBar(): vscode.Disposable[] {
 
   const editorListener = vscode.window.onDidChangeActiveTextEditor(refreshVisibility);
   const configListener = vscode.workspace.onDidChangeConfiguration((e) => {
-    if (e.affectsConfiguration("pureXtension.backend")) {
+    if (
+      e.affectsConfiguration("pureXtension.backend") ||
+      e.affectsConfiguration("pureXtension.purebasicHome") ||
+      e.affectsConfiguration("pureXtension.compilerPath")
+    ) {
       refreshBackendLabel();
     }
   });

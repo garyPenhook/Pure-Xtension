@@ -33,15 +33,17 @@ export function parseCompilerOutput(output: string): ParsedProblem[] {
       const [, kind, file] = includeMatch;
       const next = lines[i + 1] ?? "";
       const contMatch = CONTINUATION_LINE_PATTERN.exec(next);
+      const severity = kind === "Error" ? vscode.DiagnosticSeverity.Error : vscode.DiagnosticSeverity.Warning;
       if (contMatch) {
         const [, lineStr, message] = contMatch;
-        problems.push({
-          file,
-          line: Number(lineStr),
-          severity: kind === "Error" ? vscode.DiagnosticSeverity.Error : vscode.DiagnosticSeverity.Warning,
-          message,
-        });
+        problems.push({ file, line: Number(lineStr), severity, message });
         i++; // consume the continuation line
+      } else {
+        // No continuation line matched (unexpected compiler output shape) —
+        // still surface the header itself as a file-level problem instead of
+        // dropping it; line 1 is a reasonable placeholder with no better
+        // location available.
+        problems.push({ file, line: 1, severity, message: line });
       }
       continue;
     }

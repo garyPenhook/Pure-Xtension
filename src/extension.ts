@@ -11,7 +11,7 @@ import {
   startLanguageClient,
   stopLanguageClient,
 } from "./client";
-import { showHelpPage } from "./help/helpViewer";
+import { disposeHelpPanel, showHelpPage } from "./help/helpViewer";
 import { HelpTreeProvider, openHelpEntry, searchHelp } from "./help/helpTreeProvider";
 import {
   DEBUG_TYPE,
@@ -19,8 +19,12 @@ import {
   PureBasicDebugConfigurationProvider,
 } from "./debug/debugConfigProvider";
 
+// \w is ASCII-only; PB identifiers can carry the `$` string-type suffix
+// (e.g. "Name$") and, in practice, Unicode letters — \p{L} covers those too.
+const WORD_CHAR = /[\w#$]|\p{L}/u;
+
 function wordAt(text: string, offset: number): string | undefined {
-  const isWordChar = (ch: string) => /[\w#]/.test(ch);
+  const isWordChar = (ch: string) => WORD_CHAR.test(ch);
   let start = offset;
   let end = offset;
   while (start > 0 && isWordChar(text[start - 1])) start--;
@@ -65,9 +69,23 @@ export function activate(context: vscode.ExtensionContext): void {
   // The tree's data lives behind the language client; refresh it every time the
   // client (re)starts so a sidebar expanded before the compiler resolved (or
   // before a backend switch) picks up the newly available entries.
+  //
+  // Serialized behind restartInFlight: selectBackend's handler and the
+  // onDidChangeConfiguration listener below can both fire a restart for the
+  // very same backend change (config().update() triggers the listener too),
+  // and startLanguageClient() races on module-level state in client.ts
+  // (stop the old client, then set the shared `client` var) — two concurrent
+  // calls can interleave and leave a second, orphaned server running.
+  let restartInFlight: Promise<void> | undefined;
   async function restartLanguageClient(): Promise<void> {
-    await startLanguageClient(context);
-    helpTree.refresh();
+    if (restartInFlight) return restartInFlight;
+    restartInFlight = (async () => {
+      await startLanguageClient(context);
+      helpTree.refresh();
+    })().finally(() => {
+      restartInFlight = undefined;
+    });
+    return restartInFlight;
   }
 
   context.subscriptions.push(
@@ -75,9 +93,6 @@ export function activate(context: vscode.ExtensionContext): void {
     ...createStatusBar(),
     vscode.tasks.registerTaskProvider(TASK_TYPE, new PureBasicTaskProvider()),
     vscode.window.registerTreeDataProvider("pureXtension.helpBrowser", helpTree),
-    vscode.commands.registerCommand("pureXtension.helloWorld", () => {
-      vscode.window.showInformationMessage("Pure Xtension is active.");
-    }),
     vscode.commands.registerCommand("pureXtension.build", () => runTask("build")),
     vscode.commands.registerCommand("pureXtension.buildAndRun", () => runTask("buildRun")),
     vscode.commands.registerCommand("pureXtension.checkSyntax", () => runTask("check")),
@@ -125,5 +140,6 @@ export function activate(context: vscode.ExtensionContext): void {
 }
 
 export async function deactivate(): Promise<void> {
+  disposeHelpPanel();
   await stopLanguageClient();
 }

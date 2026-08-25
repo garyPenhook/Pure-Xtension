@@ -13,6 +13,10 @@ export class PureBasicDiagnostics implements vscode.Disposable {
    * fixed include (or one that's no longer reachable) has its diagnostics
    * cleared instead of lingering forever. */
   private readonly relatedUris = new Map<string, Set<string>>();
+  /** Bumped per document on every check() call; lets a check detect a newer
+   *  check for the same document started (and will finish) after it, so it
+   *  can drop its own now-stale results instead of overwriting them. */
+  private readonly generations = new Map<string, number>();
 
   constructor() {
     this.collection = vscode.languages.createDiagnosticCollection("purebasic");
@@ -45,6 +49,9 @@ export class PureBasicDiagnostics implements vscode.Disposable {
 
   clear(document: vscode.TextDocument): void {
     const key = document.uri.toString();
+    // Invalidate any check() still in flight for this document so it can't
+    // land results after the document has closed.
+    this.generations.set(key, (this.generations.get(key) ?? 0) + 1);
     this.collection.delete(document.uri);
     for (const relatedUri of this.relatedUris.get(key) ?? []) {
       this.collection.delete(vscode.Uri.parse(relatedUri));
@@ -66,6 +73,10 @@ export class PureBasicDiagnostics implements vscode.Disposable {
       return;
     }
 
+    const mainKey = document.uri.toString();
+    const generation = (this.generations.get(mainKey) ?? 0) + 1;
+    this.generations.set(mainKey, generation);
+
     let stdout = "";
     let stderr = "";
     try {
@@ -73,7 +84,7 @@ export class PureBasicDiagnostics implements vscode.Disposable {
         execFile(
           compilerPath,
           ["-k", "-q", document.fileName],
-          { cwd: path.dirname(document.fileName), timeout: 15000 },
+          { cwd: path.dirname(document.fileName), timeout: 15000, maxBuffer: 10 * 1024 * 1024 },
           (_error, out, err) => {
             stdout = out;
             stderr = err;
@@ -85,8 +96,14 @@ export class PureBasicDiagnostics implements vscode.Disposable {
       return;
     }
 
+    // A save during the execFile above may have started (and by now
+    // finished) a newer check for this same document — if so, its results
+    // are already current; don't let this older run overwrite them.
+    if (this.generations.get(mainKey) !== generation) {
+      return;
+    }
+
     const problems = parseCompilerOutput(`${stdout}\n${stderr}`);
-    const mainKey = document.uri.toString();
     this.collection.delete(document.uri);
     for (const staleUri of this.relatedUris.get(mainKey) ?? []) {
       this.collection.delete(vscode.Uri.parse(staleUri));

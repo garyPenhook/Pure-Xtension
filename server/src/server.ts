@@ -26,7 +26,7 @@ import {
 import { TextDocument } from "vscode-languageserver-textdocument";
 import { BuiltinIndex, loadOrBuildBuiltinIndex, queryStructureFields } from "./builtinIndex";
 import { WorkspaceSymbol } from "./workspaceSymbols";
-import { resolveIncludeGraphSymbols, ResolvedSymbol } from "./includeGraph";
+import { invalidateIncludeGraphCache, resolveIncludeGraphSymbols, ResolvedSymbol } from "./includeGraph";
 import { StructureField } from "./dumpParsers";
 import { HelpIndex, getHelpUrl, loadOrFetchHelpIndex } from "./onlineHelpIndex";
 import { getKeywordHelpUrl } from "./keywordHelp";
@@ -40,6 +40,7 @@ const connection = createConnection(ProposedFeatures.all);
 const documents = new TextDocuments(TextDocument);
 
 let builtinIndex: BuiltinIndex | undefined;
+let builtinIndexPromise: Promise<BuiltinIndex | undefined> | undefined;
 let compilerPath = "";
 let cacheDir = "";
 const structureFieldsCache = new Map<string, StructureField[]>();
@@ -60,29 +61,52 @@ function ensureHelpIndex(): Promise<HelpIndex | undefined> {
   return helpIndexPromise;
 }
 
-async function ensureBuiltinIndex(): Promise<BuiltinIndex | undefined> {
-  if (builtinIndex) return builtinIndex;
-  if (!compilerPath) return undefined;
-  try {
-    builtinIndex = await loadOrBuildBuiltinIndex(compilerPath, cacheDir);
-  } catch (error) {
-    connection.console.error(`Pure Xtension: failed to build symbol index: ${String(error)}`);
+/** Memoizes on the in-flight promise (not just the resolved index) so concurrent
+ *  completion/hover/signatureHelp calls on activation share one compiler build
+ *  instead of each spawning pbcompiler and racing to write the same cache file. */
+function ensureBuiltinIndex(): Promise<BuiltinIndex | undefined> {
+  if (builtinIndex) return Promise.resolve(builtinIndex);
+  if (!compilerPath) return Promise.resolve(undefined);
+  if (!builtinIndexPromise) {
+    builtinIndexPromise = loadOrBuildBuiltinIndex(compilerPath, cacheDir)
+      .then((index) => (builtinIndex = index))
+      .catch((error) => {
+        connection.console.error(`Pure Xtension: failed to build symbol index: ${String(error)}`);
+        return undefined;
+      })
+      .finally(() => {
+        builtinIndexPromise = undefined;
+      });
   }
-  return builtinIndex;
+  return builtinIndexPromise;
 }
 
 async function getBuiltinStructureFields(name: string): Promise<StructureField[]> {
   const key = name.toLowerCase();
-  const cached = structureFieldsCache.get(key);
-  if (cached) return cached;
+  // .has(), not a truthy check on .get() — a legitimately empty field list
+  // ([]) is truthy too, so a truthy check would be indistinguishable from
+  // "never cached" and this fast path would never trigger for it.
+  if (structureFieldsCache.has(key)) return structureFieldsCache.get(key)!;
   if (!compilerPath) return [];
-  const fields = await queryStructureFields(compilerPath, name);
-  structureFieldsCache.set(key, fields);
-  return fields;
+  try {
+    const fields = await queryStructureFields(compilerPath, name);
+    structureFieldsCache.set(key, fields);
+    return fields;
+  } catch (error) {
+    // Don't cache a failed query as "no fields" — a transient compiler
+    // timeout would otherwise permanently poison this structure's hover/
+    // completion for the rest of the session. Just retry next time.
+    connection.console.warn(`Pure Xtension: structure-fields query for "${name}" failed: ${String(error)}`);
+    return [];
+  }
 }
 
+// \w is ASCII-only; PB identifiers can carry the `$` string-type suffix
+// (e.g. "Name$") and, in practice, Unicode letters — \p{L} covers those too.
+const WORD_CHAR = /[\w#$]|\p{L}/u;
+
 function isWordChar(ch: string): boolean {
-  return /[\w#]/.test(ch);
+  return WORD_CHAR.test(ch);
 }
 
 function wordAt(text: string, offset: number): string | undefined {
@@ -103,8 +127,39 @@ function wordRangeAt(text: string, offset: number): { start: number; end: number
   return { start, end };
 }
 
+/** Blanks out `;`-comment and `"`-string contents (preserving offsets/newlines)
+ *  so a word-boundary scan run over the result can't match inside them. */
+function maskStringsAndComments(text: string): string {
+  const out = text.split("");
+  let inString = false;
+  for (let i = 0; i < out.length; i++) {
+    const ch = out[i];
+    if (inString) {
+      if (ch === '"') {
+        inString = false;
+      } else if (ch !== "\n") {
+        out[i] = " ";
+      }
+      continue;
+    }
+    if (ch === '"') {
+      inString = true;
+      continue;
+    }
+    if (ch === ";") {
+      let j = i;
+      while (j < out.length && out[j] !== "\n") {
+        out[j] = " ";
+        j++;
+      }
+      i = j - 1;
+    }
+  }
+  return out.join("");
+}
+
 function findWordRanges(doc: TextDocument, word: string): Range[] {
-  const text = doc.getText();
+  const text = maskStringsAndComments(doc.getText());
   const lower = word.toLowerCase();
   const ranges: Range[] = [];
   let i = 0;
@@ -192,9 +247,14 @@ function knownStructureNames(symbols: ResolvedSymbol[], index: BuiltinIndex | un
 /** First-occurrence `variable.TypeName` declarations where TypeName is a known structure. */
 function buildVariableTypeMap(text: string, structureNames: Set<string>): Map<string, string> {
   const map = new Map<string, string>();
-  const DECL = /\b(\w+)\.(\w+)\b/g;
+  // Mask comments/strings first — otherwise a comment like `; player.Position
+  // resets` or a float literal like `3.14` can register a bogus mapping, and
+  // since only the first occurrence wins, one before the real declaration
+  // poisons field completion for the rest of the document.
+  const masked = maskStringsAndComments(text);
+  const DECL = /\b([A-Za-z_]\w*)\.(\w+)\b/g;
   let match: RegExpExecArray | null;
-  while ((match = DECL.exec(text))) {
+  while ((match = DECL.exec(masked))) {
     const [, varName, typeName] = match;
     const key = varName.toLowerCase();
     if (!map.has(key) && structureNames.has(typeName.toLowerCase())) {
@@ -212,7 +272,7 @@ async function structureFieldCompletions(
   const varWord = wordAt(text, backslashOffset - 1);
   if (!varWord) return [];
 
-  const symbols = resolveIncludeGraphSymbols(uri, documents);
+  const symbols = await resolveIncludeGraphSymbols(uri, documents);
   const index = await ensureBuiltinIndex();
   const structureNames = knownStructureNames(symbols, index);
   const typeName = buildVariableTypeMap(text, structureNames).get(varWord.toLowerCase());
@@ -252,6 +312,7 @@ connection.onInitialize((params: InitializeParams): InitializeResult => {
 
 connection.onRequest("pureXtension/rebuildSymbolCache", async () => {
   builtinIndex = undefined;
+  builtinIndexPromise = undefined;
   structureFieldsCache.clear();
   await ensureBuiltinIndex();
 });
@@ -278,6 +339,35 @@ connection.onRequest(
   },
 );
 
+// Rebuilding ~1888 builtin CompletionItems from scratch on every keystroke is
+// wasted work once `index`/`helpIndex` have settled, so cache the built list
+// keyed by object identity of both inputs — invalidates itself exactly once,
+// when helpIndex first resolves from undefined to a real index.
+let builtinCompletionCache: { index: BuiltinIndex; help: HelpIndex | undefined; items: CompletionItem[] } | undefined;
+
+function builtinCompletionItems(index: BuiltinIndex): CompletionItem[] {
+  if (builtinCompletionCache && builtinCompletionCache.index === index && builtinCompletionCache.help === helpIndex) {
+    return builtinCompletionCache.items;
+  }
+  const items: CompletionItem[] = [];
+  for (const fn of index.functions) {
+    const url = getHelpUrl(helpIndex, fn.name);
+    items.push({
+      label: fn.name,
+      kind: CompletionItemKind.Function,
+      detail: fn.signature,
+      documentation: url
+        ? { kind: "markdown", value: `${fn.description}\n\n[Open documentation](${url})` }
+        : fn.description,
+    });
+  }
+  for (const name of index.structures) {
+    items.push({ label: name, kind: CompletionItemKind.Struct });
+  }
+  builtinCompletionCache = { index, help: helpIndex, items };
+  return items;
+}
+
 connection.onCompletion(async (params): Promise<CompletionItem[]> => {
   const doc = documents.get(params.textDocument.uri);
   if (!doc) return [];
@@ -293,23 +383,10 @@ connection.onCompletion(async (params): Promise<CompletionItem[]> => {
 
   const index = await ensureBuiltinIndex();
   if (index) {
-    for (const fn of index.functions) {
-      const url = getHelpUrl(helpIndex, fn.name);
-      items.push({
-        label: fn.name,
-        kind: CompletionItemKind.Function,
-        detail: fn.signature,
-        documentation: url
-          ? { kind: "markdown", value: `${fn.description}\n\n[Open documentation](${url})` }
-          : fn.description,
-      });
-    }
-    for (const name of index.structures) {
-      items.push({ label: name, kind: CompletionItemKind.Struct });
-    }
+    items.push(...builtinCompletionItems(index));
   }
 
-  for (const symbol of resolveIncludeGraphSymbols(doc.uri, documents)) {
+  for (const symbol of await resolveIncludeGraphSymbols(doc.uri, documents)) {
     items.push({
       label: symbol.name,
       kind:
@@ -344,7 +421,7 @@ connection.onHover(async (params): Promise<Hover | undefined> => {
     };
   }
 
-  const symbol = resolveIncludeGraphSymbols(doc.uri, documents).find(
+  const symbol = (await resolveIncludeGraphSymbols(doc.uri, documents)).find(
     (s) => s.name.toLowerCase() === word.toLowerCase(),
   );
   if (symbol) {
@@ -383,12 +460,12 @@ connection.onHover(async (params): Promise<Hover | undefined> => {
   return undefined;
 });
 
-connection.onDocumentSymbol((params): DocumentSymbol[] => {
+connection.onDocumentSymbol(async (params): Promise<DocumentSymbol[]> => {
   const doc = documents.get(params.textDocument.uri);
   if (!doc) return [];
 
   const lines = doc.getText().split(/\r?\n/);
-  return resolveIncludeGraphSymbols(doc.uri, documents)
+  return (await resolveIncludeGraphSymbols(doc.uri, documents))
     .filter((symbol) => symbol.uri === doc.uri)
     .map((symbol) => {
       // LSP's `uinteger` caps at 2^32-1; Number.MAX_SAFE_INTEGER overflows that
@@ -407,7 +484,7 @@ connection.onDocumentSymbol((params): DocumentSymbol[] => {
     });
 });
 
-connection.onDefinition((params): Definition | undefined => {
+connection.onDefinition(async (params): Promise<Definition | undefined> => {
   const doc = documents.get(params.textDocument.uri);
   if (!doc) return undefined;
 
@@ -415,7 +492,7 @@ connection.onDefinition((params): Definition | undefined => {
   const word = wordAt(doc.getText(), offset);
   if (!word) return undefined;
 
-  const symbol = resolveIncludeGraphSymbols(doc.uri, documents).find(
+  const symbol = (await resolveIncludeGraphSymbols(doc.uri, documents)).find(
     (s) => s.name.toLowerCase() === word.toLowerCase(),
   );
   if (!symbol) return undefined;
@@ -449,7 +526,7 @@ connection.onSignatureHelp(async (params): Promise<SignatureHelp | undefined> =>
     };
   }
 
-  const procedure = resolveIncludeGraphSymbols(doc.uri, documents).find(
+  const procedure = (await resolveIncludeGraphSymbols(doc.uri, documents)).find(
     (s) => s.kind === "procedure" && s.name.toLowerCase() === call.name.toLowerCase(),
   );
   if (procedure) {
@@ -504,6 +581,8 @@ connection.onRenameRequest((params: RenameParams): WorkspaceEdit | undefined => 
   const edits: TextEdit[] = findWordRanges(doc, word).map((range) => TextEdit.replace(range, params.newName));
   return { changes: { [doc.uri]: edits } };
 });
+
+documents.onDidClose((event) => invalidateIncludeGraphCache(event.document.uri));
 
 documents.listen(connection);
 connection.listen();
