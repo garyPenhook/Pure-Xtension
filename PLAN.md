@@ -9,9 +9,13 @@ help, IntelliSense, build/run tasks, and a native debugger bridge.**
   (`src/debug/spike/fifo-client.mjs`), and the full command-dispatch model
   is decoded (`Check`, running on the target's own main thread between
   statements, is the sole caller of `IncomingCommand` — the comms thread
-  only enqueues). The multi-frame call-stack opcode (16) is decoded and its
-  empty live reply is now attributed to a statement-boundary timing
-  artifact rather than a thread-scoping bug, pending a retest. DAP
+  only enqueues). The multi-frame call-stack opcode (16)'s empty live reply
+  was retested with the target genuinely nested two calls deep in a
+  non-blocking loop (ruling out the statement-boundary-timing theory) and
+  **still came back empty** — that theory is now falsified, and a new,
+  unexplained wire fact surfaced along the way (the target sends spontaneous
+  unsolicited messages between replies, which can be misread as replies if
+  not drained). Root cause of the empty opcode-16 reply is open again. DAP
   scaffolding (`pbDebugAdapter.ts`) not started yet.
 - Target VS Code engine: `^1.85.0` (matches the existing help-viewer prototype)
 - Reference PureBasic install: `/home/gary/Apps/purebasic-v6.41` (v6.41, Linux x64)
@@ -1044,6 +1048,58 @@ Pure_Xtension/
   sends/receives framed requests). (TCP path via `~/.pbdebugger.prefs`
   remains a fallback/alternative to spike later — FIFO is simpler to
   prototype from a CLI-launched debug session.)
+  - **Step (1) done, live — the statement-boundary-timing hypothesis is now
+    falsified, not confirmed.** `test.pb` was changed from `Delay(4000)`
+    (a blocking library call) to a non-blocking busy-wait
+    (`Repeat : Until ElapsedMilliseconds() - t > 4000`) inside `Inner`, so
+    `Check` runs every loop iteration while `Outer`→`Inner` are genuinely
+    both still on the call stack, and the client was changed to wait 1.5s
+    after connecting before requesting opcode `16` (well past program
+    start, deep inside the loop). Result: **opcode `16` still came back
+    `type=22, len=0`** — empty, exactly as before. The condition the plan's
+    "Next check" said would confirm the hypothesis was met, and the
+    predicted outcome did not happen.
+  - **New finding made along the way: the wire is not strictly
+    request/reply — the target sends spontaneous, unsolicited messages
+    between our requests.** A non-blocking peek (`O_NONBLOCK` open of a
+    second fd on the same read FIFO) taken right before sending the opcode
+    `16` request, after a 1.5s idle gap, found a queued 20-byte message
+    (`type=3, len=0`) that neither client request had asked for — a
+    spontaneous event, not a reply. Before this drain step was added, that
+    stray message was being misread as the reply to the *previous* request
+    (explains the earlier session's odd `type=3` reading when the same
+    experiment was tried with only a longer delay and no drain: the "reply"
+    it read was actually this unrelated spontaneous message, not the real
+    opcode-16 reply, which is why that run's result should not be trusted).
+    With the drain in place, the real opcode-16 reply was correctly read as
+    `type=22`, and it was empty. **Implication for the "first reply is
+    always generic `type=2`" note above:** that observation is now suspect
+    for the same reason — it may also have been a misread spontaneous
+    message rather than a genuine per-connection handshake quirk. Needs
+    re-verification with draining in place before being relied on.
+    What triggers the spontaneous `type=3` message (period? statement
+    count? something else) is not yet identified.
+  - **Revised state of risk 1:** the opcode-`16`-is-a-call-stack theory
+    (from the `.rodata` jump-table decode + `PB_DEBUGGER_GetProcedureCall`
+    disassembly) is not itself disproven — the *static* decode evidence for
+    what that handler's code does is unchanged — but the *live* claim that
+    it returns real frames under normal operation is now twice
+    unconfirmed under conditions that should have produced them. Plausible
+    explanations not yet ruled out: (a) `Thread+0x48`'s count requires an
+    explicit "enable call-stack tracking" opcode first (unsent so far —
+    candidates: an unexplored `Control` sub-command, or one of the still-
+    undecoded `Watchlist`/`Libraries` opcodes); (b) `Thread` (from
+    `PB_Object_GetThreadMemory`) still isn't resolving to the expected
+    per-OS-thread record for some reason not caught by the `Check`-only-
+    runs-on-main-thread decode; (c) the two nested calls in `test.pb` don't
+    actually stay "active" in whatever sense `Thread+0x48` counts (e.g. if
+    it's populated by `EnterProcedure`/`LeaveProcedure` instrumentation that
+    only fires under a compiler flag beyond plain `-d`, unverified). None of
+    these has been checked yet — next spike step should attempt (a) first
+    (cheapest to test: try a few plausible "enable tracking" requests before
+    opcode `16`) since it requires no new disassembly, then fall back to
+    re-disassembling `PB_Object_GetThreadMemory`'s actual TLS key resolution
+    for (b) if (a) doesn't pan out.
 - Probe pbdebugger protocol → minimal DAP (launch, breakpoint, continue, stack,
   variables) → full stepping/watch/eval.
 

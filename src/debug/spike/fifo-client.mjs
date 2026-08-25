@@ -69,6 +69,30 @@ readMessage("hello");
 sendHeader(1, 0, -1);
 readMessage("control-1,-1-reply");
 
+// Give the target plenty of time to reach the middle of the Inner() spin
+// loop (test.pb's loop runs ~4s) before asking for the call stack, to rule
+// out "request landed before Outer/Inner were even entered".
+await new Promise((r) => setTimeout(r, 1500));
+
+// Drain any unsolicited traffic that queued up during the wait (non-blocking
+// peek on a second fd to the same FIFO) so it isn't misread as the reply to
+// our next request below.
+{
+  const peekFd = fs.openSync(OUT_FIFO, fs.constants.O_RDONLY | fs.constants.O_NONBLOCK);
+  const peekBuf = Buffer.alloc(65536);
+  try {
+    while (true) {
+      const n = fs.readSync(peekFd, peekBuf, 0, peekBuf.length, null);
+      if (n === 0) break;
+      console.error(`[drain] ${n}B pending:`, peekBuf.subarray(0, n).toString("hex"));
+    }
+  } catch (e) {
+    if (e.code !== "EAGAIN") throw e;
+    console.error("[drain] nothing pending");
+  }
+  fs.closeSync(peekFd);
+}
+
 // Request opcode 16 (call stack), per the M5 spike decode.
 sendHeader(16);
 const { payload } = readMessage("opcode16-reply");

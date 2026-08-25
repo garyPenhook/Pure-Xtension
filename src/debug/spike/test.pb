@@ -1,6 +1,8 @@
 Procedure.i Inner(a.i, b.i)
   Define c.i = a + b
-  Delay(4000)
+  Define t.i = ElapsedMilliseconds()
+  Repeat
+  Until ElapsedMilliseconds() - t > 4000
   ProcedureReturn c
 EndProcedure
 
