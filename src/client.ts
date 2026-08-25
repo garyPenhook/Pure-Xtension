@@ -86,3 +86,15 @@ export async function resolveHelpUrl(symbol: string): Promise<string | undefined
   const result = await client.sendRequest<{ url?: string }>("pureXtension/helpUrl", { symbol });
   return result.url;
 }
+
+export interface HelpEntry {
+  name: string;
+  url: string;
+}
+
+/** Lists every command in the online help index, or [] if the language server isn't running. */
+export async function listHelpEntries(): Promise<HelpEntry[]> {
+  if (!client) return [];
+  const result = await client.sendRequest<{ entries: HelpEntry[] }>("pureXtension/helpEntries");
+  return result.entries;
+}

@@ -4,6 +4,7 @@ import { PureBasicDiagnostics } from "./build/diagnostics";
 import { createStatusBar } from "./build/statusBar";
 import { PureBasicTaskProvider, TASK_TYPE } from "./build/taskProvider";
 import {
+  HelpEntry,
   rebuildHelpIndexCommand,
   rebuildSymbolCacheCommand,
   resolveHelpUrl,
@@ -11,6 +12,7 @@ import {
   stopLanguageClient,
 } from "./client";
 import { showHelpPage } from "./help/helpViewer";
+import { HelpTreeProvider, openHelpEntry } from "./help/helpTreeProvider";
 
 function wordAt(text: string, offset: number): string | undefined {
   const isWordChar = (ch: string) => /[\w#]/.test(ch);
@@ -53,11 +55,21 @@ async function runTask(mode: "build" | "buildRun" | "check"): Promise<void> {
 
 export function activate(context: vscode.ExtensionContext): void {
   const diagnostics = new PureBasicDiagnostics();
+  const helpTree = new HelpTreeProvider();
+
+  // The tree's data lives behind the language client; refresh it every time the
+  // client (re)starts so a sidebar expanded before the compiler resolved (or
+  // before a backend switch) picks up the newly available entries.
+  async function restartLanguageClient(): Promise<void> {
+    await startLanguageClient(context);
+    helpTree.refresh();
+  }
 
   context.subscriptions.push(
     diagnostics,
     ...createStatusBar(),
     vscode.tasks.registerTaskProvider(TASK_TYPE, new PureBasicTaskProvider()),
+    vscode.window.registerTreeDataProvider("pureXtension.helpBrowser", helpTree),
     vscode.commands.registerCommand("pureXtension.helloWorld", () => {
       vscode.window.showInformationMessage("Pure Xtension is active.");
     }),
@@ -66,15 +78,19 @@ export function activate(context: vscode.ExtensionContext): void {
     vscode.commands.registerCommand("pureXtension.checkSyntax", () => runTask("check")),
     vscode.commands.registerCommand("pureXtension.selectBackend", async () => {
       await selectBackendCommand();
-      await startLanguageClient(context);
+      await restartLanguageClient();
     }),
     vscode.commands.registerCommand("pureXtension.rebuildSymbolCache", () =>
       rebuildSymbolCacheCommand(),
     ),
-    vscode.commands.registerCommand("pureXtension.rebuildHelpIndex", () =>
-      rebuildHelpIndexCommand(),
-    ),
+    vscode.commands.registerCommand("pureXtension.rebuildHelpIndex", async () => {
+      await rebuildHelpIndexCommand();
+      helpTree.refresh();
+    }),
     vscode.commands.registerCommand("pureXtension.openHelpForSymbol", () => openHelpForSymbol()),
+    vscode.commands.registerCommand("pureXtension.openHelpEntry", (entry: HelpEntry) =>
+      openHelpEntry(entry),
+    ),
     vscode.workspace.onDidSaveTextDocument((doc) => diagnostics.scheduleCheck(doc)),
     vscode.workspace.onDidOpenTextDocument((doc) => diagnostics.scheduleCheck(doc)),
     vscode.workspace.onDidCloseTextDocument((doc) => diagnostics.clear(doc)),
@@ -86,7 +102,7 @@ export function activate(context: vscode.ExtensionContext): void {
         e.affectsConfiguration("pureXtension.backend") ||
         e.affectsConfiguration("pureXtension.compilerPath")
       ) {
-        startLanguageClient(context).catch((error) =>
+        restartLanguageClient().catch((error) =>
           vscode.window.showErrorMessage(`Pure Xtension: ${String(error)}`),
         );
       }
@@ -97,7 +113,7 @@ export function activate(context: vscode.ExtensionContext): void {
     diagnostics.scheduleCheck(editor.document);
   }
 
-  void startLanguageClient(context);
+  void restartLanguageClient();
 }
 
 export async function deactivate(): Promise<void> {

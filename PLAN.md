@@ -491,14 +491,51 @@ Pure_Xtension/
   data (`-qs` is structures-only) so they only get name + link, not a
   method list — that's a real gap, not a bug: interface methods aren't
   captured by any dump parser yet.
+- **Help browser sidebar** ✅ (started): `pureXtension.helpBrowser`, a
+  `TreeDataProvider` under the Explorer view (`views.explorer` — no custom
+  activity-bar icon asset needed for this). Two-level tree: 88 library
+  categories (derived from the doc URL's path segment, e.g.
+  `.../documentation/string/left.html` → category `string` — verified
+  against all 1888 real entries, zero fell into the `other` fallback), each
+  expanding to its commands sorted alphabetically; clicking a leaf opens it
+  in the same help webview as `F1`. A refresh button (`$(refresh)` in the
+  view title, bound to the existing `pureXtension.rebuildHelpIndex`) forces
+  a re-fetch and repopulates the tree.
+  - **Fixed before shipping:** `HelpIndex.commands` previously stored only
+    the lowercase key with the URL as the value, discarding the real-case
+    command name (`"AddGadgetItem"`) the tree needs to display — the map's
+    value is now `{ name, url }` (`server/src/onlineHelpIndex.ts`).
+  - **Fixed before shipping:** the tree's in-memory entry cache checked
+    `if (!this.entries)`, but `listHelpEntries()` returns `[]` (not
+    `undefined`) when the language client hasn't started yet (e.g. sidebar
+    expanded before a compiler backend resolves) — `[]` is truthy, so that
+    empty result would've been cached permanently and the tree would stay
+    blank forever with no way to recover short of a manual refresh. Now
+    retries on an empty result, and `extension.ts` also calls
+    `helpTree.refresh()` every time the language client (re)starts (initial
+    activation, backend switch, `pureXtension.compilerPath`/`backend`
+    config changes) so a sidebar opened early self-heals once the client
+    comes up.
+  - **Fixed before shipping:** the `commands` shape change above also broke
+    the disk cache written by the *previous* commit (which stored
+    `Record<string, string>`, name→url) — an old cache would parse without
+    error but hand back `entry.name`/`entry.url` as `undefined` for every
+    tree node, silently, for up to the 30-day TTL. Renamed the cache file
+    (`help-index.json` → `help-index-v2.json`) so an old-shape cache just
+    misses and gets re-fetched, instead of being trusted as-is. Caught by
+    the `/code-review` self-review pass, not by testing (there was no
+    real on-disk cache from a live run to test against in this sandbox).
+  - Verified: category-extraction regex tested against a real fetch of all
+    1888 `commandindex.html` entries (88 categories, 0 uncategorized).
+    `tsc --noEmit` (both tsconfigs) and esbuild clean.
 - Remaining for M4: language-keyword hover/help (`If`, `For`, `Procedure`,
   ...) is still uncovered — those aren't in `builtinIndex` at all (that index
   only holds `-lf`/`-ls`/`-li` dump contents, which are functions/
   structures/interfaces, not language keywords), and `commandindex.html`
   doesn't list them either (verified: it's function/structure/interface
   commands only, not the `reference/*.html` keyword pages) — would need a
-  separate, hand-maintained keyword → `reference/*.html` URL table. No
-  dedicated Help browser sidebar/tree view yet (deep-link webview only).
+  separate, hand-maintained keyword → `reference/*.html` URL table. The
+  sidebar has no search/filter box yet, just category browsing.
 
 **M5 — Debugger (0.6)**
 - Probe pbdebugger protocol → minimal DAP (launch, breakpoint, continue, stack,

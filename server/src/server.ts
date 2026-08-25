@@ -269,6 +269,14 @@ connection.onRequest(
   },
 );
 
+connection.onRequest(
+  "pureXtension/helpEntries",
+  async (): Promise<{ entries: { name: string; url: string }[] }> => {
+    const index = await ensureHelpIndex();
+    return { entries: Object.values(index?.commands ?? {}) };
+  },
+);
+
 connection.onCompletion(async (params): Promise<CompletionItem[]> => {
   const doc = documents.get(params.textDocument.uri);
   if (!doc) return [];

@@ -110,11 +110,16 @@
       },
       {
         "command": "pureXtension.rebuildHelpIndex",
-        "title": "Pure Xtension: Refresh Help Index from purebasic.com"
+        "title": "Pure Xtension: Refresh Help Index from purebasic.com",
+        "icon": "$(refresh)"
       },
       {
         "command": "pureXtension.openHelpForSymbol",
         "title": "Pure Xtension: Open Help for Symbol Under Cursor"
+      },
+      {
+        "command": "pureXtension.openHelpEntry",
+        "title": "Pure Xtension: Open Help Entry"
       }
     ],
     "menus": {
@@ -134,6 +139,25 @@
         {
           "command": "pureXtension.openHelpForSymbol",
           "when": "editorLangId == purebasic"
+        },
+        {
+          "command": "pureXtension.openHelpEntry",
+          "when": "false"
+        }
+      ],
+      "view/title": [
+        {
+          "command": "pureXtension.rebuildHelpIndex",
+          "when": "view == pureXtension.helpBrowser",
+          "group": "navigation"
+        }
+      ]
+    },
+    "views": {
+      "explorer": [
+        {
+          "id": "pureXtension.helpBrowser",
+          "name": "PureBasic Help"
         }
       ]
     },
