@@ -19,9 +19,15 @@ help, IntelliSense, build/run tasks, and a native debugger bridge.**
   0-based call-site line numbers for the full duration those calls were
   genuinely on the stack. This closes out the "empty reply" investigation
   from last session for good — it was the stop-on-entry wait, and now a
-  real continue command is known. Next: decode `Variables`' byte layout and
-  breakpoint-setting (opcode `3`), then start the real `pbDebugAdapter.ts`
-  DAP scaffolding.
+  real continue command is known. **Breakpoint-setting (opcode `3`,
+  `PB_DEBUGGER_ExternalBreakpoints`) is decoded and live-tested** — a 7-way
+  sub-dispatch covering line-breakpoint add/remove/bulk-clear and
+  data/watch-breakpoint add/remove/clear; add, remove-by-key, and
+  bulk-clear-all are all gdb-free-but-wire-confirmed (the target genuinely
+  stops on the breakpointed line and genuinely runs to completion once
+  cleared). Only the data/watch-breakpoint sub-command remains
+  static-decode-only. Next: decode `Variables`' byte layout, then start the
+  real `pbDebugAdapter.ts` DAP scaffolding.
 - Target VS Code engine: `^1.85.0` (matches the existing help-viewer prototype)
 - Reference PureBasic install: `/home/gary/Apps/purebasic-v6.41` (v6.41, Linux x64)
 - Language: TypeScript (extension host) + a small Language Server (Node)
@@ -1232,6 +1238,102 @@ Pure_Xtension/
       opcode `1` were the only other decoded sub-command space and none of
       them looked step-shaped); `Variables`' exact request/response byte
       layout; `~/.pbdebugger.prefs`' format for the TCP path.
+- **Opcode `3` (`PB_DEBUGGER_ExternalBreakpoints`) decoded — it is itself a
+  7-way sub-dispatch keyed on `header+0x8` (the same "sub-command" field
+  idiom `Control`/opcode `1` uses), not a single flat "set breakpoints"
+  handler as the earlier per-category pass assumed. Verified by forcing the
+  same relocation-resolution technique the opcode-`16` inner-dispatch table
+  needed (`ar x debugger.a`, then `ld -shared -o ext.so ExternalDebugger.o
+  --unresolved-symbols=ignore-all -z notext`, then `objdump -d` on the
+  linked `.so` so the jump table's `R_X86_64_PC32` entries resolve to real
+  addresses instead of reading as zero) — the object file alone can't be
+  disassembled straight into concrete case targets for this table either.
+  The 7 sub-commands (`header+0x8` values `0`-`6`):
+  - `0`: no-op (falls straight to the epilogue — a reserved/undefined slot,
+    same pattern as opcode `37` being absent from the outer table).
+  - `1`: add a line breakpoint. Binary-searches the sorted `UserBreakPoints`
+    array for a key read from `header+0xc`; if not already present, shifts
+    the array to insert it, resolves its address via
+    `PB_DEBUGGER_GetExecutableLine`, stores that into the parallel
+    `ExecBreakPoints` array, bumps `NbBreakPoints`, and re-`qsort`s both
+    arrays. The key format (confirmed from sub-command `3`'s comparison,
+    below) packs a module ID into the top 12 bits and a line number into
+    the bottom 20 bits (`key = (moduleID << 20) | line`).
+  - `2`: remove a line breakpoint by exact key (same binary search over
+    `UserBreakPoints`), then falls through into the same
+    `DataBreakPoints`-cleanup loop sub-command `4`'s add path also feeds —
+    removing a line breakpoint also sweeps any data breakpoint tied to that
+    same key.
+  - `3`: bulk per-module operation. If `header+0xc == 0xffffffff`, this is
+    **clear all line breakpoints** (`NbBreakPoints = 0`, one instruction,
+    no per-entry cleanup). Otherwise it's a **per-module bulk re-set**:
+    linear-scans `UserBreakPoints` comparing each entry's top 12 bits
+    (`entry >> 20`, i.e. the module field of the key format above) against
+    the `header+0xc` module ID, and for matches re-resolves the address via
+    `GetExecutableLine` and re-sorts — the shape the IDE would use when a
+    module is reloaded/recompiled and all its breakpoint line numbers need
+    re-resolving against new addresses without touching breakpoints in
+    other modules.
+  - `4`: add a **data breakpoint** (watch expression), distinct from the
+    line-breakpoint path above. Payload after the header is a variable-name
+    string; calls `PB_DEBUGGER_GetProcedureID` (scopes the name to the
+    current procedure) then `PB_DEBUGGER_AddDataBreakPoint(procID, name,
+    isUnicode, nameLen)`, and always replies via `SendCommand` tagged type
+    `0x27` — the only sub-command of the seven that sends a reply at all
+    (the rest are fire-and-forget, matching the outer opcode-`16`
+    request/reply asymmetry noted earlier: not every opcode replies).
+  - `5`: remove a data breakpoint by ID — linear scan of `DataBreakPoints`
+    (stride `0x1a8`) matching `header+0xc`, calls `RemoveDataBreakPoint` on
+    the first hit.
+  - `6`: clear all data breakpoints (`PB_DEBUGGER_ClearDataBreakPoints()`,
+    unconditional).
+  - **Net implication for the DAP adapter:** breakpoint-setting is two
+    independent arrays (line breakpoints vs. data/watch breakpoints) behind
+    one opcode, sub-command-routed exactly like `Control`. A `setBreakPoints`
+    DAP handler needs sub-command `3` with `header+0xc=0xffffffff` (clear
+    existing for the file/module) followed by one sub-command-`1` call per
+    new line, mirroring how VS Code re-sends the full breakpoint set on
+    every edit rather than diffing — the module-scoped bulk-clear (rather
+    than a global one) means multi-file breakpoint state won't collide.
+    Only sub-command `4` (add data breakpoint) has been observed to reply;
+    the request/response byte layout for that reply (type `0x27`) is not
+    yet decoded byte-by-byte.
+  - **Live-tested against a real FIFO session — sub-commands `1` (add),
+    `2` (remove by key), and `3` (bulk-clear, `key=0xffffffff`) all confirmed
+    working exactly as statically decoded** (`src/debug/spike/
+    fifo-breakpoint.mjs`, `fifo-breakpoint2.mjs`, `fifo-breakpoint3.mjs`).
+    Method: set a line breakpoint on `test.pb` line `4` (the `Repeat` top of
+    `Inner`'s spin loop, so it would re-trigger every iteration if not
+    actually cleared), send continue, and check whether the target stops
+    there or runs to completion.
+    - **Add (sub-command `1`) confirmed:** sending opcode `3` sub-command `1`
+      with `header+0xc = 4` (key = line, moduleID `0` for a single-file
+      target — matches the `(moduleID<<20)|line` format from the static
+      decode) then opcode `2` (continue) produced a `type=3`
+      `StoppedExternal` notification at `t=6ms`, with **`f8=4`** — exactly
+      the breakpointed line, confirming the stop notification's `f8` field
+      is the (1-based, unlike opcode `16`'s 0-based call-site field) source
+      line — and **`f12=7`**, a stop-reason code distinct from the
+      already-observed `f12` values, i.e. "hit a line breakpoint".
+    - **Remove-by-key (sub-command `2`) confirmed:** after the stop above,
+      sending opcode `3` sub-command `2` with the same key (`4`) then
+      continue let the target run to actual completion — the `Inner` spin
+      loop (which re-executes line `4` every iteration) never stopped again,
+      and the program's real `Debug "result=..."` output (`type=5`/`type=1`
+      variable-notification messages, matching the earlier live decode) and
+      clean exit followed at `t=4006ms`, matching `test.pb`'s ~4000ms
+      spin-wait almost exactly.
+    - **Bulk-clear (sub-command `3`, `key=0xffffffff`) confirmed** with the
+      identical set-stop-clear-verify shape: after the stop, bulk-clear
+      instead of single-key remove also let the target run to completion
+      with no second stop, at the same `t=4006ms` mark.
+    - **Net implication:** the `setBreakPoints` DAP handler design from the
+      static decode is now empirically validated, not just plausible — both
+      the per-edit "clear existing, then add the new set" shapes VS Code
+      might send (bulk-clear-then-readd, or remove-then-add) work as
+      predicted. Sub-command `4` (data/watch breakpoints) remains
+      static-decode-only; its reply layout (type `0x27`) is still
+      unconfirmed.
 - Probe pbdebugger protocol → minimal DAP (launch, breakpoint, continue, stack,
   variables) → full stepping/watch/eval.
 
@@ -1267,9 +1369,11 @@ Pure_Xtension/
    (opcode `16`) are now both confirmed working live** (gdb-verified opcode
    `2` releases the target; opcode `16` returns real, correctly-named,
    correctly-ordered frames with a confirmed 0-based call-site line number
-   per frame). Remaining unknowns: exact byte layout of `Variables`'
-   request/response; breakpoint-setting (opcode `3`) not yet decoded at the
-   instruction level; whether opcode `2`'s nonzero sub-command is a distinct
+   per frame). **Breakpoint-setting (opcode `3`) is also decoded and
+   live-confirmed** — add/remove-by-key/bulk-clear-all all verified against
+   a real FIFO session; only the data/watch-breakpoint sub-command is
+   static-decode-only. Remaining unknowns: exact byte layout of `Variables`'
+   request/response; whether opcode `2`'s nonzero sub-command is a distinct
    step mode. The `Debug`/`OnError` stdout fallback (verified working, zero
    plumbing) still de-risks shipping *something* even if further opcode
    decoding stalls.
@@ -1310,10 +1414,17 @@ Pure_Xtension/
    real multi-frame call-stack data** (`Outer(5)`/`Inner(5, 10)`, with a
    confirmed 0-based call-site line number per frame) once the target is
    actually running past the stop-on-entry wait. This fully resolves last
-   session's "empty reply" investigation. Continue per the "Next spike
-   steps" list in the M5 section: decode `ExternalDebugger_Variables`' byte
-   layout and breakpoint-setting (opcode `3`, `PB_DEBUGGER_ExternalBreakpoints`)
-   before starting the real `pbDebugAdapter.ts` DAP scaffolding.
+   session's "empty reply" investigation. **Breakpoint-setting (opcode `3`,
+   `PB_DEBUGGER_ExternalBreakpoints`) is now decoded and live-tested** —
+   it's a 7-way sub-dispatch (line breakpoints add/remove/bulk-clear-by-
+   module, data/watch breakpoints add/remove/clear-all), not a flat
+   handler; add, remove-by-key, and bulk-clear-all were each confirmed live
+   against a real FIFO session (`src/debug/spike/fifo-breakpoint*.mjs`) —
+   the target genuinely stops at a breakpointed line and genuinely resumes
+   to completion once it's cleared, either way. Only the data/watch
+   sub-command (`4`) remains static-decode-only. Continue per the "Next
+   spike steps" list in the M5 section: decode `ExternalDebugger_Variables`'
+   byte layout, then start the real `pbDebugAdapter.ts` DAP scaffolding.
 2. Full in-editor GUI smoke test (M1–M4 features) is still pending a working
    X display in this sandbox — flag to the user to manually verify in a real
    VS Code session before any marketplace publish.

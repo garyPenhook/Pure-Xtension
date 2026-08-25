@@ -90,10 +90,16 @@ feature. Findings so far (see `PLAN.md` for the full, verified write-up):
   opcodes and 9 handler categories.
 - Continue/go, and a real multi-frame call stack, are both confirmed working
   against a live target (verified with gdb, not just static analysis).
+- Line-breakpoint setting (add, remove-by-key, bulk-clear) is decoded and
+  live-tested against a running target — the target genuinely stops on the
+  breakpointed line and genuinely runs to completion once it's cleared.
+  Data/watch-breakpoint setting is decoded from the binary but not yet
+  live-tested.
 
 Throwaway protocol-spike clients live in `src/debug/spike/` for anyone
 following along or picking up the remaining work (variable inspection,
-breakpoint setting, and the actual `pbDebugAdapter.ts` DAP implementation).
+live-testing data/watch breakpoints, and the actual `pbDebugAdapter.ts` DAP
+implementation).
 
 ## Development
 
