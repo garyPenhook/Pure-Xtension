@@ -562,7 +562,71 @@ Pure_Xtension/
   `ProcedureReturn` semantically — both resolve correctly, the mapping is
   just per-token, not context-aware. Neither gap blocks real usage.
 
-**M5 — Debugger (0.6)**
+**M5 — Debugger (0.6)** — spike started
+- **Protocol spike (verified against the real binaries, not guessed):**
+  `compilers/pbdebugger` is itself a GTK GUI application (confirmed via
+  `strings` — `gtk_scrolled_window_add_with_viewport` etc. — and `strace`,
+  which shows it opening X11/GTK/dbus sockets on launch with no args). It is
+  **not** a headless protocol daemon we spawn and talk to.
+  - The debugger is actually embedded in the *compiled target executable*.
+    A `pbcompiler -d` build run standalone (`strace -f`) does **no**
+    fork/exec/socket at all — it just writes `[Debugger]  <value>` straight
+    to stdout for each `Debug` statement. This confirms the §4.5 fallback
+    ("`Debug`/`OnError` trace approach") works today with zero extra
+    plumbing: redirecting/capturing a debug-build's stdout is a legitimate,
+    already-working "debug console" for logpoint-style output.
+  - For a *real* attached debugger, the target executable looks for
+    `/tmp/.pbdebugger.out` (warns and ignores it if stale) and
+    `~/.pbdebugger.prefs`; these are written by the real PureBasic IDE and
+    are the connection handoff — a file-based rendezvous, not a fixed port.
+  - `compilers/debugger.a` (the static lib linked into every `-d` build) is
+    **unstripped** and was disassembled directly (`ar x` + `objdump -d -r
+    -M intel`) — this is where the real protocol details came from:
+    - Communication is pluggable: `PB_DEBUGGER_ClientPlugin` /
+      `ServerPlugin` / `PipePlugin` / `FifoPlugin`, backed by
+      `NetworkCommunication.o` (TCP) and `UnixPipeCommunication.o` (named
+      FIFOs). `FifoConnect` parses the rendezvous file's contents with
+      `strchr`, `fopen64`s a FIFO pair, sets them `O_NONBLOCK` via
+      `fcntl64`, and spawns `ExternalDebugger_CommunicationsThread` on a
+      `pthread`.
+    - The TCP path (`ServerConnect`/`ClientConnect`) is a real, adoptable
+      wire protocol: the target listens ("`[Debugger] Waiting for network
+      connection on port %i.`" / "`...on %s (port %i).`"), the client sends
+      `CONNECT %i DEBUGGER\n\n` (parsed with `sscanf`), and the server
+      replies with an `ACCEPT`/`ERROR %i ... Message: %s` line handshake.
+      An optional password/encryption step follows (`ENCRYPTION`,
+      `EncryptionHash`, `[Debugger] Password: `, seeded from
+      `/dev/urandom`) — `SetupEncryption.isra.0` gates both connect paths.
+      Other framing keywords confirmed in the string table: `Length`,
+      `WrongVersion`, `InvalidRequest`, `CallOnStart`/`CallOnEnd`,
+      `Unicode`/`BigEndian` (so the protocol is endian/charset-negotiated,
+      not fixed).
+    - `ExternalDebugger.o` exports the full command surface as
+      `PB_DEBUGGER_*` symbols — confirms this is a real, complete external
+      debugger API, not a stub: `ExamineVariables`/`ModifyVariable`,
+      `ExamineArrays`/`Maps`/`LinkedLists`/`Structures`, breakpoints
+      (`AddDataBreakPoint`, `ClearDataBreakPoints`, `NbBreakPoints`,
+      `BreakpointSort`, `ExecBreakPoints`), call-stack/procedure info
+      (`GetProcedureCall`/`Name`/`ID`/`Module`), `IncomingCommand`/
+      `CommandStack` with `ByteSwapIncomingCommand`/`ByteSwapOutgoingCommand`
+      (binary, byte-order-aware framing after the text handshake).
+  - **Not yet established:** the exact numeric opcode values `IncomingCommand`
+    dispatches on (they're a binary switch in `Debugger.o`/`ExternalDebugger.o`,
+    not string literals — needs deeper disassembly than this pass did), and
+    the exact byte layout of `/tmp/.pbdebugger.out`. Both are well-scoped
+    follow-up spikes, not open-ended unknowns anymore.
+- **Net effect on risk 1 (§8):** downgraded from "biggest unknown" to
+  "known shape, unmapped detail" — there is a real, non-GUI, socket-based
+  external debugger protocol built into every `-d` executable; the DAP
+  adapter's job is to speak the TCP `ServerConnect` handshake ourselves
+  (skip `pbdebugger.exe`/GTK entirely) and finish mapping the binary command
+  opcodes.
+- **Next spike steps:** (1) disassemble `Debugger.o`'s `IncomingCommand`
+  dispatch to enumerate opcode numbers per `PB_DEBUGGER_*` operation: (2)
+  write a throwaway Node/TS prototype that does the `CONNECT %i DEBUGGER`
+  handshake against a real `-d` build and confirms a captured breakpoint
+  hit round-trips; (3) only then start the real `pbDebugAdapter.ts` DAP
+  scaffolding.
 - Probe pbdebugger protocol → minimal DAP (launch, breakpoint, continue, stack,
   variables) → full stepping/watch/eval.
 
@@ -587,8 +651,15 @@ Pure_Xtension/
 ---
 
 ## 8. Risks & open questions
-1. **pbdebugger control protocol is undocumented** — biggest unknown. M5 starts
-   with a spike; the `Debug`/`OnError` fallback de-risks shipping *something*.
+1. **pbdebugger control protocol is undocumented** — spike done (see M5
+   notes): `pbdebugger.exe` itself is a GTK GUI, not the protocol endpoint;
+   the real protocol is a TCP handshake (`CONNECT %i DEBUGGER` → `ACCEPT`,
+   optional password/encryption) built into every `-d` executable via
+   `debugger.a`'s `ServerConnect`, with a rich `PB_DEBUGGER_*` command
+   surface (variables, arrays, breakpoints, call stack). Remaining unknown:
+   exact binary opcode values for `IncomingCommand`. The `Debug`/`OnError`
+   stdout fallback (verified working, zero plumbing) still de-risks shipping
+   *something* even if opcode mapping stalls.
 2. **`.help` binary format** — resolved by sidestepping it: neither offline
    pipeline in the original plan actually worked (`pbdocmaker` is GUI-only;
    no `.help` parser exists to reuse — see M4 notes). Help integration now
