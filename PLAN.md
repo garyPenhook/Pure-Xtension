@@ -26,8 +26,19 @@ help, IntelliSense, build/run tasks, and a native debugger bridge.**
   bulk-clear-all are all gdb-free-but-wire-confirmed (the target genuinely
   stops on the breakpointed line and genuinely runs to completion once
   cleared). Only the data/watch-breakpoint sub-command remains
-  static-decode-only. Next: decode `Variables`' byte layout, then start the
-  real `pbDebugAdapter.ts` DAP scaffolding.
+  static-decode-only. **`ExternalDebugger_Variables` (opcodes `9,10,11,17`)
+  is now decoded and live-tested against a running, stopped target** — the
+  per-variable wire record (7-byte header: PB type byte, flag byte, kind
+  byte, 4-byte reserved/proc-id field; null-terminated name; 8-byte
+  little-endian value for numeric types) was read directly off real
+  replies containing `test.pb`'s actual `a=5`, `b=10`, `c=15`, and a live
+  `ElapsedMilliseconds()` value for `t`, plus the top-level `result`
+  variable via the global-scope opcode. Next: start the real
+  `pbDebugAdapter.ts` DAP scaffolding using the now-decoded
+  continue/stack/breakpoints/variables opcodes; decode array/list/map and
+  structure-field expansion (opcodes `12`-`15`, `ExamineStructure`/
+  `NextStructureField`) only when a DAP `variables` request actually needs
+  to expand a compound value.
 - Target VS Code engine: `^1.85.0` (matches the existing help-viewer prototype)
 - Reference PureBasic install: `/home/gary/Apps/purebasic-v6.41` (v6.41, Linux x64)
 - Language: TypeScript (extension host) + a small Language Server (Node)
@@ -1334,6 +1345,58 @@ Pure_Xtension/
       predicted. Sub-command `4` (data/watch breakpoints) remains
       static-decode-only; its reply layout (type `0x27`) is still
       unconfirmed.
+  - **`ExternalDebugger_Variables` (opcodes `9`, `10`, `11`, `17`) — decoded
+    and live-tested against a real, stopped FIFO session**
+    (`src/debug/spike/fifo-variables.mjs`). Unlike `Control` and
+    `ExternalBreakpoints`, the dispatch switches on the *raw incoming
+    opcode value* itself (the first 4 bytes of the wire header), not a
+    payload sub-command field:
+    - `9` — examine module/global-scope variables (`ExamineVariables(-1)`,
+      reply type `0xd`). Confirmed live: against `test.pb` (which declares
+      no `Threaded` vars) this returned the single top-level `Define
+      result.i`, with value `0` (Outer hadn't returned yet) and a kind
+      byte of `0x00`, vs. `0x03` for the locals below — the kind byte
+      distinguishes global from local storage.
+    - `10` — "continue examine" (reply type `0xe`), meant to fetch the next
+      batch when a prior `9`/`11`/`17` reply didn't fit in one message.
+      Re-invokes `ExamineVariables(-1)` internally rather than resuming a
+      cursor, so calling it standalone (no preceding `9`) returns a 9-byte
+      empty/terminator record (`type=0x15` `len=9`, all other fields
+      zero). Not exercised with a large enough variable set to force real
+      pagination — worth revisiting once genuinely large frames are
+      involved.
+    - `11` — examine variables of the current/topmost active frame, no
+      request payload needed (reply type `0xf`). Confirmed live: at a
+      breakpoint stopped inside `Inner(a, b)`, returned all 4 locals
+      (`a`, `b`, `c`, `t`) in a single 68-byte reply.
+    - `17` — examine variables of an explicit frame, addressed via the
+      20-byte wire header's `f8` field (reply type `0x17`/23, bounds-
+      checked against the thread's live procedure-call count before
+      calling `PB_DEBUGGER_GetProcedureIndex`). Confirmed live: `f8=0`
+      returned `Outer`'s locals (`r`, `x`); `f8=1` returned `Inner`'s
+      locals, byte-identical to opcode `11`'s reply — i.e. frame index `0`
+      is the **outermost** caller and the highest index is the
+      **currently-executing** frame, the *opposite* direction from
+      `stackTrace` (opcode `16`)'s typical DAP frame-0-is-innermost
+      convention (not yet cross-checked against `16`'s own frame order on
+      the same live session — the DAP adapter's `variables` handler will
+      need to translate `stackFrame.id` into this scheme either way, so
+      getting the direction right before wiring `16→17` together matters).
+    - **Per-variable wire record — read directly off real replies, not
+      just inferred from the disassembly:** 7-byte header (`type` byte —
+      `0x15`/21 for every `.i` var seen so far, presumably a PB internal
+      type-tag rather than a wire-protocol constant; a flag byte, always
+      `0x00` in this sample; a `kind` byte — `0x03` for locals, `0x00` for
+      the one global seen; a 4-byte reserved/proc-id field, always `0`
+      here), then a null-terminated variable name, then an 8-byte
+      little-endian value for numeric types (verified against known
+      values: `a=5`, `b=10`, `c=15`, `t=`a live `ElapsedMilliseconds()`
+      reading, `x=5`, `r=0` pre-return, `result=0` pre-return). String,
+      array/list/map, and structure-typed variables are not yet
+      live-tested — `PB_DEBUGGER_ExamineStructure`/`NextStructureField`
+      (statically identified as the nested-field expansion path) and the
+      `ArraysLists` category (opcodes `12`-`15`) remain for whenever the
+      DAP adapter actually needs to expand a compound value.
 - Probe pbdebugger protocol → minimal DAP (launch, breakpoint, continue, stack,
   variables) → full stepping/watch/eval.
 
@@ -1422,9 +1485,23 @@ Pure_Xtension/
    against a real FIFO session (`src/debug/spike/fifo-breakpoint*.mjs`) —
    the target genuinely stops at a breakpointed line and genuinely resumes
    to completion once it's cleared, either way. Only the data/watch
-   sub-command (`4`) remains static-decode-only. Continue per the "Next
-   spike steps" list in the M5 section: decode `ExternalDebugger_Variables`'
-   byte layout, then start the real `pbDebugAdapter.ts` DAP scaffolding.
+   sub-command (`4`) remains static-decode-only. **`ExternalDebugger_Variables`
+   (opcodes `9`/`10`/`11`/`17`) is now decoded and live-tested**
+   (`src/debug/spike/fifo-variables.mjs`) — opcode `9` reads module/global
+   scope, `11` reads the current/topmost frame with no request payload,
+   and `17` reads an explicit frame via the wire header's `f8` field
+   (frame `0` = outermost caller, increasing toward the currently-
+   executing frame — the opposite direction from `stackTrace`'s usual
+   frame-0-is-innermost convention, so the DAP adapter must translate
+   indices when wiring `16` and `17` together). The per-variable record
+   (type/flag/kind header, name, little-endian value) was read directly
+   off real replies containing `test.pb`'s live variable values. Next: the
+   continue/stack/breakpoints/variables opcodes now on hand cover enough
+   surface for a first `pbDebugAdapter.ts` DAP-adapter pass (launch,
+   breakpoints, continue, stack trace, locals); array/list/map and
+   structure-field expansion (opcodes `12`-`15`,
+   `ExamineStructure`/`NextStructureField`) can wait until a DAP
+   `variables` request actually needs to expand a compound value.
 2. Full in-editor GUI smoke test (M1–M4 features) is still pending a working
    X display in this sandbox — flag to the user to manually verify in a real
    VS Code session before any marketplace publish.

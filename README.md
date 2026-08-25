@@ -95,11 +95,16 @@ feature. Findings so far (see `PLAN.md` for the full, verified write-up):
   breakpointed line and genuinely runs to completion once it's cleared.
   Data/watch-breakpoint setting is decoded from the binary but not yet
   live-tested.
+- Variable inspection (global scope, current-frame locals, and explicit-frame
+  locals) is decoded and live-tested against a running, stopped target — real
+  variable names and values (including a live `ElapsedMilliseconds()` reading)
+  round-tripped correctly over the wire.
 
-Throwaway protocol-spike clients live in `src/debug/spike/` for anyone
-following along or picking up the remaining work (variable inspection,
-live-testing data/watch breakpoints, and the actual `pbDebugAdapter.ts` DAP
-implementation).
+Enough of the protocol (continue, breakpoints, call stack, variables) is now
+confirmed working end to end to start the real `pbDebugAdapter.ts` DAP
+implementation. Throwaway protocol-spike clients live in `src/debug/spike/`
+for anyone following along or picking up the remaining work (structure/array
+value expansion, stepping, watch expressions, and the adapter itself).
 
 ## Development
 
