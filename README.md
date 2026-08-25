@@ -5,9 +5,11 @@ highlighting, IntelliSense backed by the real compiler, build/run tasks with
 inline diagnostics, and deep links into PureBasic's live online documentation.
 
 > Status: language support, IntelliSense, build/diagnostics, and help
-> integration are implemented and usable. A debugger integration (breakpoints,
-> stepping, variable inspection via VS Code's Debug Adapter Protocol) is under
-> active research — see [Debugger support](#debugger-support-in-progress)
+> integration are implemented and usable. A first debugger integration
+> (launch, breakpoints, continue, call stack, locals via VS Code's Debug
+> Adapter Protocol) is implemented but not yet verified in a real VS Code
+> session; stepping, watch expressions, and compound-value inspection are
+> not yet implemented — see [Debugger support](#debugger-support-in-progress)
 > below.
 
 ## Features
@@ -100,11 +102,20 @@ feature. Findings so far (see `PLAN.md` for the full, verified write-up):
   variable names and values (including a live `ElapsedMilliseconds()` reading)
   round-tripped correctly over the wire.
 
-Enough of the protocol (continue, breakpoints, call stack, variables) is now
-confirmed working end to end to start the real `pbDebugAdapter.ts` DAP
-implementation. Throwaway protocol-spike clients live in `src/debug/spike/`
-for anyone following along or picking up the remaining work (structure/array
-value expansion, stepping, watch expressions, and the adapter itself).
+A first `pbDebugAdapter.ts` pass is now implemented on top of the confirmed
+protocol: `src/debug/pbSession.ts` (a reusable, async wire-protocol client)
+and `src/debug/pbDebugAdapter.ts` (a `@vscode/debugadapter` `DebugSession`)
+cover launch (compiling a `-d` debug build and spawning it with the FIFO
+transport wired up), line breakpoints, continue, stack trace, and locals,
+registered via `src/debug/debugConfigProvider.ts` and package.json's new
+`debuggers` contribution. The wire-protocol client is smoke-tested standalone
+against a real compiled target; an actual VS Code Run-and-Debug-view session
+is not yet manually verified (same X-display limitation noted above for the
+language-support features). Not yet implemented: stepping (no step opcode
+has been confirmed), watch/`evaluate` expressions, and array/list/map/
+structure value expansion. Throwaway protocol-spike clients remain in
+`src/debug/spike/` for anyone following along or picking up that remaining
+work.
 
 ## Development
 

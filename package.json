@@ -231,6 +231,90 @@
           }
         ]
       }
+    ],
+    "debuggers": [
+      {
+        "type": "purebasic",
+        "label": "PureBasic Debug",
+        "languages": [
+          "purebasic"
+        ],
+        "configurationAttributes": {
+          "launch": {
+            "required": [
+              "program"
+            ],
+            "properties": {
+              "program": {
+                "type": "string",
+                "description": "Path to the .pb source file to debug.",
+                "default": "${file}"
+              },
+              "args": {
+                "type": "array",
+                "description": "Command-line arguments passed to the compiled target.",
+                "items": {
+                  "type": "string"
+                },
+                "default": []
+              },
+              "cwd": {
+                "type": "string",
+                "description": "Working directory for the target. Defaults to the source file's directory.",
+                "default": "${workspaceFolder}"
+              },
+              "env": {
+                "type": "object",
+                "description": "Extra environment variables for the target.",
+                "default": {}
+              },
+              "stopOnEntry": {
+                "type": "boolean",
+                "description": "Stop before the first statement runs.",
+                "default": false
+              },
+              "backend": {
+                "type": "string",
+                "enum": [
+                  "asm",
+                  "c"
+                ],
+                "description": "Compiler backend to use for the debug build. Defaults to the workspace's configured/auto-detected backend."
+              },
+              "compilerArgs": {
+                "type": "array",
+                "description": "Extra arguments passed to the compiler for the debug build.",
+                "items": {
+                  "type": "string"
+                },
+                "default": []
+              }
+            }
+          }
+        },
+        "initialConfigurations": [
+          {
+            "type": "purebasic",
+            "request": "launch",
+            "name": "Debug current PureBasic file",
+            "program": "${file}",
+            "stopOnEntry": false
+          }
+        ],
+        "configurationSnippets": [
+          {
+            "label": "Pure Xtension: Debug current file",
+            "description": "Launch and debug the active PureBasic file.",
+            "body": {
+              "type": "purebasic",
+              "request": "launch",
+              "name": "Debug current PureBasic file",
+              "program": "^\"\\${file}\"",
+              "stopOnEntry": false
+            }
+          }
+        ]
+      }
     ]
   },
   "scripts": {
@@ -251,6 +335,8 @@
     "esbuild@0.28.2": true
   },
   "dependencies": {
+    "@vscode/debugadapter": "^1.68.0",
+    "@vscode/debugprotocol": "^1.68.0",
     "vscode-languageclient": "^10.1.0",
     "vscode-languageserver": "^10.1.0",
     "vscode-languageserver-textdocument": "^1.0.13"

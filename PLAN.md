@@ -1399,6 +1399,59 @@ Pure_Xtension/
       DAP adapter actually needs to expand a compound value.
 - Probe pbdebugger protocol → minimal DAP (launch, breakpoint, continue, stack,
   variables) → full stepping/watch/eval.
+- **First `pbDebugAdapter.ts` pass implemented, built directly on the
+  confirmed opcodes above:**
+  - `src/debug/pbSession.ts` — the reusable wire-protocol client, extracted
+    from the throwaway `src/debug/spike/*.mjs` prototypes once their
+    findings were live-confirmed. Async (`fs.createReadStream`/
+    `createWriteStream`, not the spikes' blocking `readSync`/`writeSync`)
+    so it can't stall the extension host; emits a `stopped` event for
+    unsolicited `StoppedExternal` notifications (opcode `3`'s message type)
+    and exposes `continue`, `addLineBreakpoint`/`removeLineBreakpoint`/
+    `clearAllLineBreakpoints`, `stackTrace`, and `examineGlobals`/
+    `examineCurrentFrame`/`examineFrame` as promise-returning methods.
+    Smoke-tested standalone against `src/debug/spike/test.bin` (esbuild-
+    bundled, driven the same way the spikes were) — breakpoint add/remove,
+    continue, stack trace, and variable values all round-tripped correctly,
+    including reproducing the documented "closes FIFOs → target prints
+    `[Fatal Debugger Error] Broken communication pipe` but still exits 0"
+    shutdown behavior.
+  - `src/debug/pbDebugAdapter.ts` — a `@vscode/debugadapter` `DebugSession`
+    covering `initialize`, `launch` (compiles a `-d -ds -l` debug build with
+    the resolved backend, `mkfifo`s a FIFO pair, spawns the target with
+    `PB_DEBUGGER_Communication` set, forwards stdout/stderr to the debug
+    console), `setBreakPoints` (bulk-clear-then-readd, matching what the
+    breakpoint spike validated), `continue`, `threads` (single synthetic
+    thread — the protocol has no multi-thread debugging surface),
+    `stackTrace` (translates opcode `16`'s outermost-first order to DAP's
+    innermost-first), `scopes`/`variables` (one "Locals" scope per frame,
+    `variablesReference` encoding the opcode-`17` frame index directly), and
+    `disconnect`. Run as an in-process `vscode.DebugAdapterInlineImplementation`
+    rather than a spawned child process, since `DebugSession` implements the
+    `handleMessage`/`onDidSendMessage` shape VS Code's inline adapter API
+    expects.
+  - `src/debug/debugConfigProvider.ts` + `package.json`'s new `debuggers`
+    contribution (type `purebasic`, `program`/`args`/`cwd`/`env`/
+    `stopOnEntry`/`backend`/`compilerArgs` launch schema) wire it into VS
+    Code's Run and Debug view.
+  - **Deliberately not implemented yet, because the protocol doesn't
+    support it or it hasn't been decoded:** stepping (no dedicated
+    step-vs-run opcode has been found — `Control` opcode `2`'s nonzero
+    sub-command is the only lead and it's untested), `evaluate`/watch
+    expressions (`Expression` category, opcodes `8`/`33`-`35`, not yet
+    decoded), compound-value expansion (arrays/lists/maps/structures,
+    opcodes `12`-`15` plus `ExamineStructure`/`NextStructureField`, not yet
+    live-tested), and data/watch breakpoints (opcode `3` sub-command `4`,
+    static-decode-only). A clean `disconnect` opcode is also still
+    unconfirmed — `disconnectRequest` just closes the FIFOs and kills the
+    target, which is what the spikes did too.
+  - **Not yet verified: an actual VS Code Run-and-Debug-view session.**
+    `tsc --noEmit` and the esbuild bundle are clean, and the underlying
+    wire-protocol client is smoke-tested standalone (above), but launching
+    a real debug session through VS Code's UI needs a working display —
+    the same X/pointer limitation noted under M1 — so this is still
+    pending a manual check in a real VS Code window before it can be
+    called done.
 
 **M6 — Polish & ship (1.0)**
 - Walkthrough, tree views, formatter, semantic tokens, README/docs, marketplace
@@ -1502,8 +1555,24 @@ Pure_Xtension/
    structure-field expansion (opcodes `12`-`15`,
    `ExamineStructure`/`NextStructureField`) can wait until a DAP
    `variables` request actually needs to expand a compound value.
+   **That first adapter pass is now implemented** — see the "First
+   `pbDebugAdapter.ts` pass implemented" bullet at the end of the M5
+   section above for what it covers (`launch`/breakpoints/`continue`/
+   `stackTrace`/`variables`/`disconnect`) and what's deliberately still
+   missing (stepping, `evaluate`, compound-value expansion, data
+   breakpoints, a clean disconnect opcode).
 2. Full in-editor GUI smoke test (M1–M4 features) is still pending a working
    X display in this sandbox — flag to the user to manually verify in a real
-   VS Code session before any marketplace publish.
+   VS Code session before any marketplace publish. **The new debug adapter
+   has the same gap**: its wire-protocol client is smoke-tested standalone
+   (esbuild-bundled, driven headlessly against `test.bin`), but an actual
+   Run-and-Debug-view session through VS Code's UI is unverified.
 3. Confirm scope/priorities (esp. whether the debugger or a Form Designer is
    in the 1.0 cut) before M5/M6.
+4. Next debugger work, roughly in cost order: (a) find a real step opcode
+   (only untested lead is `Control` opcode `2`'s nonzero sub-command); (b)
+   decode `Expression` (opcodes `8`/`33`-`35`) for `evaluate`/watch
+   support; (c) live-test array/list/map/structure expansion so
+   `variablesRequest` can return non-zero `variablesReference`s for
+   compound values; (d) find/confirm a clean disconnect opcode instead of
+   the FIFO-close-and-kill fallback.

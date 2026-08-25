@@ -13,6 +13,11 @@ import {
 } from "./client";
 import { showHelpPage } from "./help/helpViewer";
 import { HelpTreeProvider, openHelpEntry, searchHelp } from "./help/helpTreeProvider";
+import {
+  DEBUG_TYPE,
+  PureBasicDebugAdapterDescriptorFactory,
+  PureBasicDebugConfigurationProvider,
+} from "./debug/debugConfigProvider";
 
 function wordAt(text: string, offset: number): string | undefined {
   const isWordChar = (ch: string) => /[\w#]/.test(ch);
@@ -92,6 +97,8 @@ export function activate(context: vscode.ExtensionContext): void {
       openHelpEntry(entry),
     ),
     vscode.commands.registerCommand("pureXtension.searchHelp", () => searchHelp()),
+    vscode.debug.registerDebugConfigurationProvider(DEBUG_TYPE, new PureBasicDebugConfigurationProvider()),
+    vscode.debug.registerDebugAdapterDescriptorFactory(DEBUG_TYPE, new PureBasicDebugAdapterDescriptorFactory()),
     vscode.workspace.onDidSaveTextDocument((doc) => diagnostics.scheduleCheck(doc)),
     vscode.workspace.onDidOpenTextDocument((doc) => diagnostics.scheduleCheck(doc)),
     vscode.workspace.onDidCloseTextDocument((doc) => diagnostics.clear(doc)),
