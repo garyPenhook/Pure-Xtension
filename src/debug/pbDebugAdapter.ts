@@ -79,6 +79,7 @@ export class PureBasicDebugSession extends DebugSession {
     // only run/continue is exposed until one is found.
     response.body.supportsStepInTargetsRequest = false;
     response.body.supportsEvaluateForHovers = true;
+    response.body.supportsSetVariable = true;
     this.sendResponse(response);
     this.sendEvent(new InitializedEvent());
   }
@@ -234,6 +235,22 @@ export class PureBasicDebugSession extends DebugSession {
       return;
     }
     response.body = { result: result.value ?? "", variablesReference: 0 };
+    this.sendResponse(response);
+  }
+
+  protected async setVariableRequest(
+    response: DebugProtocol.SetVariableResponse,
+    args: DebugProtocol.SetVariableArguments,
+  ): Promise<void> {
+    // Same frame-context caveat as evaluateRequest: only the currently-
+    // stopped line's scope is wired up, since that's the only case PLAN.md's
+    // M5 spike live-tested for opcode 35.
+    const result = await this.pb.setVariable(args.name, args.value);
+    if (result.kind === 0) {
+      this.sendErrorResponse(response, 1005, result.error ?? "setVariable failed");
+      return;
+    }
+    response.body = { value: result.value ?? "" };
     this.sendResponse(response);
   }
 

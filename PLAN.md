@@ -4,8 +4,9 @@
 help, IntelliSense, build/run tasks, and a native debugger bridge.**
 
 - Status: M2, M3, M4 (deep help integration) complete. M5 (debugger)
-  protocol is now fully decoded for everything the DAP scaffolding needs,
-  and a first working adapter is implemented on top of it. Wire opcodes
+  protocol is now fully decoded for everything the DAP scaffolding needs
+  (including `setVariable`), and a first working adapter is implemented
+  on top of it. Wire opcodes
   mapped, FIFO transport confirmed working end to end with real throwaway
   clients (`src/debug/spike/fifo-client.mjs`, `fifo-go.mjs`,
   `fifo-continue-client.mjs`, `fifo-step-probe.mjs`), and the full
@@ -41,9 +42,10 @@ help, IntelliSense, build/run tasks, and a native debugger bridge.**
   expression parsing (not just bare variable names, e.g. `a+b` correctly
   evaluates to `15`) with a fully-confirmed reply wire format, everything
   a DAP `evaluate` request needs. Its write side (opcode `35`, for
-  `setVariable`/`setExpression`) is decoded to the instruction level and
-  live-tested, but blocked on an unexplained `ModifyVariable` failure that
-  needs a gdb trace to resolve, not more static reading. Opcode `8` was
+  `setVariable`/`setExpression`) is now decoded and live-tested too —
+  the earlier `ModifyVariable` failure turned out to be the same
+  `len`-header framing bug as the read side, not a target-side problem;
+  no gdb trace was needed. Opcode `8` was
   ruled out as an evaluator — it's the memory-inspector's address/length
   field, live-confirmed by its own error message. **`pbDebugAdapter.ts`'s
   `evaluateRequest` is now wired to opcode `33`**
@@ -60,9 +62,24 @@ help, IntelliSense, build/run tasks, and a native debugger bridge.**
   evaluates on one connection: `a` → `5`, `a+b` → `15` (real expression
   parsing, not bare lookup), `nosuchvar` → the target's own `"Variable not
   found: 'nosuchvar'."` (routed to `sendErrorResponse`, not a result body).
-  Next: gdb-trace `ModifyVariable`'s failure to unblock `setVariable`; then
+  **Opcode `35` (`setVariable`/`setExpression` write side) is now working
+  live too, and the earlier `ModifyVariable` failure needed no gdb trace at
+  all** — it was the exact same `len`-must-include-every-NUL-terminator
+  framing bug just found for opcode `33`, only re-checked once the M5
+  "next steps" list flagged it as a cheap thing to retry first. The spike
+  script (`src/debug/spike/fifo-expression.mjs`) previously set `len` to
+  only the first string's byte length; setting it to the full two-string
+  (plus both NULs) payload length made `ModifyVariable` succeed on the
+  first try. Live-verified end to end: `a` read as `5` (opcode `33`), set
+  to `99` (opcode `35`, reply payload `63 00000000 00000000` = little-
+  endian int64 `99`, echoing `"a\0"`/`"99\0"`), then read back as `99`
+  (opcode `33` again) — same connection, three requests in a row. Wired
+  into `PbDebugSession.setVariable()` (`src/debug/pbSession.ts`) and
+  `pbDebugAdapter.ts`'s new `setVariableRequest`
+  (`supportsSetVariable = true`), reusing `parseEvaluateReply` since
+  opcode 35's success/error reply shares opcode 33/34's layout. Next:
   compound-value expansion once a DAP `variables` request actually needs
-  to expand one.
+  to expand one; then a clean disconnect opcode.
 - Target VS Code engine: `^1.85.0` (matches the existing help-viewer prototype)
 - Reference PureBasic install: `/home/gary/Apps/purebasic-v6.41` (v6.41, Linux x64)
 - Language: TypeScript (extension host) + a small Language Server (Node)
@@ -1575,35 +1592,47 @@ Pure_Xtension/
     `"Missing a value to assign."` failure documented below is this exact
     off-by-the-terminator bug rather than a genuine target-side issue, and
     should be re-tried with a corrected `len` before reaching for gdb.
-  - **Opcode `35` (modify/write) is decoded to the instruction level but
-    *not yet working live* — a real target-side failure, not (yet) a
-    framing bug on our side.** Statically: it expects the payload to hold
-    two back-to-back null-terminated strings — a target lvalue expression
-    (parsed with `ParseExpressionExternal`'s mode flag `1`, i.e.
-    address/lvalue mode — confirmed by reading the actual `mov $0x1,%edx`
-    immediately before that call, correcting an initial misreading of the
-    instruction stream that had both parses sharing mode `0`) followed by
-    a value expression (parsed with mode `0`, the same "give me a value"
-    mode opcodes `33`/`34` use) — then calls `PB_DEBUGGER_ModifyVariable`
-    with both parsed results. Live-testing: sending `target="a"` alone
-    with a value string `"99"` at the byte offset the disassembly implies
-    (`rbx + *CharSizeExternal + strlen(target)`) gets **both individual
-    `ParseExpressionExternal` calls to succeed** (no "cannot locate
-    variable"/"parse error" reply — ruling out a framing mistake in how
-    the two strings are laid out) but `ModifyVariable` itself then fails
-    with *"Missing a value to assign."* — a message that reads as
-    describing an assignment-parser-level problem, not a
-    variable-not-writable problem, which doesn't obviously match "two
-    already-successfully-parsed operands, one lvalue one integer literal".
-    Concatenating both halves into a single string (`"a=99"`) was also
-    tried and fails differently and earlier (*"Cannot locate target
-    variable."*, from the *target* parse trying to resolve the literal
-    text `"a=99"` as a variable name) — ruling out the "single combined
-    expression" framing entirely. **Root cause not yet found**; next step
-    is a gdb breakpoint on `PB_DEBUGGER_ModifyVariable` itself (the method
-    already used successfully to gdb-confirm the continue opcode) rather
-    than further blind byte-layout guessing. DAP `setVariable`/
-    `setExpression` support is blocked on this.
+  - **Opcode `35` (modify/write) — statically decoded to the instruction
+    level; the earlier live failure is now resolved, and it needed no gdb
+    trace.** Statically: it expects the payload to hold two back-to-back
+    null-terminated strings — a target lvalue expression (parsed with
+    `ParseExpressionExternal`'s mode flag `1`, i.e. address/lvalue mode —
+    confirmed by reading the actual `mov $0x1,%edx` immediately before
+    that call, correcting an initial misreading of the instruction stream
+    that had both parses sharing mode `0`) followed by a value expression
+    (parsed with mode `0`, the same "give me a value" mode opcodes `33`/
+    `34` use) — then calls `PB_DEBUGGER_ModifyVariable` with both parsed
+    results. Earlier live-testing (before the framing fix below): sending
+    `target="a"` alone with a value string `"99"` at the byte offset the
+    disassembly implies (`rbx + *CharSizeExternal + strlen(target)`) got
+    **both individual `ParseExpressionExternal` calls to succeed** (no
+    "cannot locate variable"/"parse error" reply — ruling out a mistake in
+    how the two strings are laid out) but `ModifyVariable` itself then
+    failed with *"Missing a value to assign."* Concatenating both halves
+    into a single string (`"a=99"`) was also tried and failed differently
+    and earlier (*"Cannot locate target variable."*, from the *target*
+    parse trying to resolve the literal text `"a=99"` as a variable name)
+    — ruling out the "single combined expression" framing entirely.
+    **2026-08-25: resolved — it was the same `len`-must-include-every-NUL
+    framing bug found for opcode `33` (see the dated entry immediately
+    above), not a genuine `ModifyVariable` problem.** The spike script's
+    `sendExpressionOp` (and its `len = parts[0].length` convention, the
+    first string's byte length only) was the exact bug the "open lead"
+    note above flagged as worth trying before reaching for gdb. Fixing it
+    to `len = payload.length` (both strings, both NULs) made `a = 99`
+    succeed on the very next run — reply payload `63 00000000 00000000`
+    (little-endian int64 `99`) followed by the echoed `"a\0"`/`"99\0"`
+    strings, and a follow-up opcode-`33` evaluate of `a` on the same
+    connection read back `99` (having read `5` before the modify). No gdb
+    trace was needed — the "already-successfully-parsed operands" puzzle
+    from the earlier note was itself an artifact of the framing bug
+    corrupting request boundaries, not evidence the operands were actually
+    fine. Wired into `PbDebugSession.setVariable()`
+    (`src/debug/pbSession.ts`) and `pbDebugAdapter.ts`'s new
+    `setVariableRequest` (`supportsSetVariable = true`), reusing
+    `parseEvaluateReply` since the success/error reply layout is shared
+    with opcodes `33`/`34`. DAP `setVariable`/`setExpression` support is
+    no longer blocked.
 
 **M6 — Polish & ship (1.0)**
 - Walkthrough, tree views, formatter, semantic tokens, README/docs, marketplace
@@ -1732,13 +1761,14 @@ Pure_Xtension/
    2026-08-25 dated entry in the M5 section above for the full
    root-cause trail) — live-verified with three evaluates in a row on one
    session (`a` → `5`, `a+b` → `15`, `nosuchvar` → the target's own error
-   string). Its write side (opcode `35`) is decoded but not yet working
-   live — `ModifyVariable` fails with an unexplained message even with
-   correctly laid-out operands. **New lead, not yet tried:** the same
-   `len`-must-include-every-terminator framing bug just found and fixed
-   for opcode `33` was never re-checked against opcode `35`'s two-string
-   payload — worth a quick retry with a corrected `len` before reaching
-   for a gdb trace. Opcode `8` turned out to be the memory-inspector's
+   string). **Its write side (opcode `35`) is now working live too** — the
+   earlier `ModifyVariable` failure turned out to be the exact same
+   `len`-must-include-every-terminator framing bug just found for opcode
+   `33`, not a real target-side issue; fixing `len` to the full two-string
+   payload length made `a = 99` succeed immediately, no gdb trace needed
+   (see the 2026-08-25 dated entry in the M5 section above). Wired into
+   `PbDebugSession.setVariable()` and `pbDebugAdapter.ts`'s new
+   `setVariableRequest`. Opcode `8` turned out to be the memory-inspector's
    address/length field, not an evaluator — ruled out for this purpose.
 2. Full in-editor GUI smoke test (M1–M4 features) is still pending a working
    X display in this sandbox — flag to the user to manually verify in a real
@@ -1751,13 +1781,12 @@ Pure_Xtension/
 4. Next debugger work, roughly in cost order: (a) **done** —
    `pbDebugAdapter.ts`'s `evaluateRequest` is wired to opcode `33`, which
    also found and fixed a real `len`-header framing bug (see item 1's
-   2026-08-25 note); (b) retry opcode `35` with the same `len`-including-
-   terminators fix before reaching for a gdb trace on
-   `PB_DEBUGGER_ModifyVariable` — new lead, not yet tried, to unblock
-   `setVariable`/`setExpression`; (c) live-test array/list/map/structure
-   expansion so `variablesRequest` can return non-zero
-   `variablesReference`s for compound values; (d) find/confirm a clean
-   disconnect opcode instead of the FIFO-close-and-kill fallback.
+   2026-08-25 note); (b) **done** — opcode `35` retried with the same
+   `len`-including-terminators fix, succeeded immediately (no gdb trace
+   needed), and is now wired into `setVariableRequest`; (c) live-test
+   array/list/map/structure expansion so `variablesRequest` can return
+   non-zero `variablesReference`s for compound values; (d) find/confirm a
+   clean disconnect opcode instead of the FIFO-close-and-kill fallback.
    (Finding a real step opcode via `Control` opcode `2`'s nonzero
    sub-command is done — live-tested and ruled out; no further lead is
    known, see item 1 above.)

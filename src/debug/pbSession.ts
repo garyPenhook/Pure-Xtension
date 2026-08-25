@@ -19,6 +19,7 @@ export const OP_EXAMINE_CURRENT_FRAME = 11;
 export const OP_STACK_TRACE = 16;
 export const OP_EXAMINE_FRAME = 17; // f8 = frame index, 0 = outermost
 export const OP_EVALUATE = 33; // ExternalDebugger_Expression read side; 34 is byte-identical
+export const OP_MODIFY = 35; // ExternalDebugger_Expression write side (ModifyVariable)
 
 // Breakpoint sub-commands (opcode 3's f8 field).
 export const BP_ADD_LINE = 1;
@@ -287,6 +288,27 @@ export class PbDebugSession extends EventEmitter {
     // *next* request's header framing — only surfaces across two
     // sequential requests on one connection, not a single one-off call.
     this.write(OP_EVALUATE, 0, frameContext, 0, payload, payload.length);
+    const msg = await this.nextMessage();
+    return parseEvaluateReply(msg);
+  }
+
+  /**
+   * Opcode 35 (`setVariable`/`setExpression` write side): payload is two
+   * back-to-back NUL-terminated strings, `target` (parsed lvalue-mode) then
+   * `value` (parsed value-mode). Reply shares opcode 33/34's layout (8-byte
+   * LE result, or a NUL-terminated error string when `f12 === 0`) with the
+   * echoed `target`/`value` strings trailing it, which `parseEvaluateReply`
+   * already ignores. Live-confirmed: `a` went from `5` to `99` and read back
+   * as `99` on a subsequent opcode-33 evaluate (see PLAN.md's M5 section) —
+   * the earlier "Missing a value to assign." failure was this same
+   * len-must-include-every-NUL framing bug found for opcode 33, not a real
+   * target-side `ModifyVariable` problem.
+   */
+  async setVariable(target: string, value: string): Promise<PbEvaluateResult> {
+    const payload = Buffer.concat(
+      [target, value].map((s) => Buffer.concat([Buffer.from(s, "latin1"), Buffer.from([0])])),
+    );
+    this.write(OP_MODIFY, 0, -1, 0, payload, payload.length);
     const msg = await this.nextMessage();
     return parseEvaluateReply(msg);
   }

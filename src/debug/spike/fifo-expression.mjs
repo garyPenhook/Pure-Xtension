@@ -89,12 +89,15 @@ for (let i = 0; i < 30 && !stopped; i++) {
 
 function sendExpressionOp(opcode, expr, f8 = 0, f12 = 0) {
   // opcode 35 (modify) takes two back-to-back null-terminated strings
-  // (target lvalue, then value expression); len (header[4]) is the first
-  // string's byte length, same convention as the read path.
+  // (target lvalue, then value expression). len (header[4]) must be the
+  // full byte count actually sent, including every NUL terminator - the
+  // same off-by-the-terminator bug found and fixed for opcode 33's
+  // evaluate path (see PLAN.md's 2026-08-25 entry) was never re-checked
+  // here before now.
   const parts = expr.split("\x1f");
   const payload = Buffer.concat(parts.map((p) => Buffer.concat([Buffer.from(p, "latin1"), Buffer.from([0])])));
   console.error(`\nsending opcode ${opcode}, expr=${JSON.stringify(expr)}, f8=${f8}, f12=${f12}...`);
-  sendHeader(opcode, parts[0].length, f8, f12, 0, payload);
+  sendHeader(opcode, payload.length, f8, f12, 0, payload);
 }
 
 const opcode = Number(process.argv[2] ?? 8);
