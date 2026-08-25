@@ -136,7 +136,10 @@ export class PureBasicDebugSession extends DebugSession {
         1003,
         `Pure Xtension: failed to connect to the target's debugger (${String(err)}). Is "${path.basename(outBinary)}" a real -d debug build?`,
       );
-      this.child.kill();
+      // SIGTERM (the default) is confirmed ineffective against a running
+      // -d target (PLAN.md M5: live-tested, the process just ignores it) —
+      // SIGKILL is the only signal verified to actually terminate it.
+      this.child.kill("SIGKILL");
       return;
     }
 
@@ -258,11 +261,21 @@ export class PureBasicDebugSession extends DebugSession {
     response: DebugProtocol.DisconnectResponse,
     _args: DebugProtocol.DisconnectArguments,
   ): void {
-    // No confirmed clean-disconnect opcode yet (PLAN.md M5 flags this as
-    // open) — closing the FIFOs and killing the target is what the spikes
-    // did too; the target logs a harmless "Broken communication pipe".
+    // No clean-disconnect opcode exists (PLAN.md M5: confirmed by decoding
+    // ExternalDebugger_CommunicationsThread's read-error path — any FIFO
+    // read failure other than EAGAIN unconditionally calls exit(1) in the
+    // target itself, with no flag to suppress it or opcode to gate it;
+    // Control opcode 0, the only candidate, was live-tested and doesn't
+    // change this). So closing the FIFOs is the actual termination
+    // mechanism here, not just cleanup — it reliably fires even while the
+    // target's main thread is stuck in a tight loop, since the comms
+    // thread's blocked fread() is what hits the fatal path. The
+    // child.kill() below is a fallback for the case the FIFO close didn't
+    // land (e.g. target never got that far); it must be SIGKILL — SIGTERM
+    // (Node's default) is confirmed ineffective against a running -d
+    // target, live-tested (the process just ignores it and keeps running).
     this.pb.close();
-    this.child?.kill();
+    this.child?.kill("SIGKILL");
     if (this.fifoDir) {
       fs.rmSync(this.fifoDir, { recursive: true, force: true });
     }

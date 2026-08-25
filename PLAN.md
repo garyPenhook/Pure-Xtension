@@ -77,9 +77,56 @@ help, IntelliSense, build/run tasks, and a native debugger bridge.**
   into `PbDebugSession.setVariable()` (`src/debug/pbSession.ts`) and
   `pbDebugAdapter.ts`'s new `setVariableRequest`
   (`supportsSetVariable = true`), reusing `parseEvaluateReply` since
-  opcode 35's success/error reply shares opcode 33/34's layout. Next:
-  compound-value expansion once a DAP `variables` request actually needs
-  to expand one; then a clean disconnect opcode.
+  opcode 35's success/error reply shares opcode 33/34's layout.
+  **Disconnect is now settled — verified, not just implemented as a
+  placeholder: there is no clean-disconnect opcode, and this is now
+  confirmed by decode, not just by absence of a candidate.** `Control`
+  opcode `0` (the only previously-undecoded Control opcode alongside `36`)
+  was instruction-level decoded from `ExternalDebugger.o`
+  (`ExternalDebugger_Control`, offset `0x1550`): it just writes a literal
+  `8` into the per-thread reply struct's status field (offset `0x24`) and
+  returns — no `SendCommand` call, no other side effect. Live-tested as a
+  disconnect candidate (`src/debug/spike/fifo-disconnect.mjs`, run in both
+  `baseline` and `opcode0` modes against a target confirmed genuinely
+  running via a real 2-frame `stackTrace` poll first): sending it before
+  closing the FIFOs made no difference — both modes crashed the target
+  identically (`[Fatal Debugger Error] Broken communication pipe.`, exit
+  code `1`). Root-caused by decoding
+  `ExternalDebugger_CommunicationsThread` in `UnixPipeCommunication.o`
+  (offset `0x200`-`0x244`, the FIFO read loop): a `fread()` short-read is
+  only tolerated when `errno == EAGAIN` (`0xb`) — any other outcome,
+  including the plain EOF a closed write end produces, falls straight
+  through to an unconditional `fwrite(stderr, "...Broken communication
+  pipe...")` + `exit(1)` at offset `0x413`, gated by nothing. **So closing
+  the FIFOs is not just cleanup, it's the actual, and only, termination
+  mechanism** — confirmed to fire reliably even while the target's main
+  thread is stuck in a busy-loop (the comms thread's blocked `fread()` is
+  what hits the fatal path, independent of whatever the main thread is
+  doing). Separately, while building a "kill the process directly instead
+  of closing FIFOs, to avoid the scary stderr line" experiment, found and
+  live-confirmed a second fact worth recording: **plain `SIGTERM` (Node's
+  `child.kill()` default) does not terminate a running `-d` target at
+  all** — a real target left running under `PB_DEBUGGER_Communication`,
+  sent `SIGTERM` directly (`ps`/`kill -TERM` from a separate shell,
+  independent of the FIFO connection entirely), stayed alive and running
+  indefinitely; `SIGKILL` was required and worked immediately
+  (`signal:"SIGKILL"` on the resulting `exit` event, confirmed with a
+  dedicated verification script). `pbDebugAdapter.ts`'s
+  `disconnectRequest` already closed the FIFOs first (so it was already
+  correctly relying on the real mechanism, not guessing), but its
+  fallback `child.kill()` call — and the separate one in the launch
+  error-handling path — both used Node's default `SIGTERM`, which this
+  session's live test shows would silently fail to terminate an orphaned
+  target if the FIFO-close path ever didn't fire first. Both call sites
+  now explicitly pass `"SIGKILL"`, with comments recording why. M5's
+  "Next" list item for a clean disconnect opcode is now closed out — not
+  by finding one, but by confirming none exists and making the adapter's
+  actual termination path (FIFO-close, `SIGKILL`-fallback) provably
+  reliable instead of merely working by accident. Remaining M5 gap: only
+  compound-value expansion (arrays/lists/maps/structures, opcodes
+  `12`-`15`), once a DAP `variables` request actually needs to expand one.
+  Remaining, and now the only open M5 item: compound-value expansion
+  (arrays/lists/maps/structures, opcodes `12`-`15`).
 - Target VS Code engine: `^1.85.0` (matches the existing help-viewer prototype)
 - Reference PureBasic install: `/home/gary/Apps/purebasic-v6.41` (v6.41, Linux x64)
 - Language: TypeScript (extension host) + a small Language Server (Node)
@@ -1785,8 +1832,22 @@ Pure_Xtension/
    `len`-including-terminators fix, succeeded immediately (no gdb trace
    needed), and is now wired into `setVariableRequest`; (c) live-test
    array/list/map/structure expansion so `variablesRequest` can return
-   non-zero `variablesReference`s for compound values; (d) find/confirm a
-   clean disconnect opcode instead of the FIFO-close-and-kill fallback.
+   non-zero `variablesReference`s for compound values — **the only item
+   still open**; (d) **done, 2026-08-25** — `Control` opcode `0` (the last
+   undecoded Control opcode) was instruction-level decoded and live-tested
+   as a disconnect candidate; it doesn't gate or prevent the target's
+   fatal-exit-on-FIFO-close path, and decoding
+   `ExternalDebugger_CommunicationsThread`'s read-error handling confirms
+   why: that exit is unconditional on any non-`EAGAIN` read failure, with
+   no opcode able to suppress it. So there is no clean disconnect opcode to
+   find — closing the FIFOs *is* the correct, reliable termination
+   mechanism, and `pbDebugAdapter.ts` already used it first. What the same
+   investigation did find and fix: the `child.kill()` fallback (both in
+   `disconnectRequest` and the launch-failure path) used Node's default
+   `SIGTERM`, which a live test showed a running `-d` target simply
+   ignores — both call sites now pass `SIGKILL` explicitly, the only
+   signal confirmed to work. See item 1's disconnect entry above and
+   `src/debug/spike/fifo-disconnect.mjs` for the live-test detail.
    (Finding a real step opcode via `Control` opcode `2`'s nonzero
    sub-command is done — live-tested and ruled out; no further lead is
    known, see item 1 above.)

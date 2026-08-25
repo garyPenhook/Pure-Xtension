@@ -6,12 +6,12 @@ inline diagnostics, and deep links into PureBasic's live online documentation.
 
 > Status: language support, IntelliSense, build/diagnostics, and help
 > integration are implemented and usable. A first debugger integration
-> (launch, breakpoints, continue, call stack, locals, and read-only watch/
-> hover expressions via VS Code's Debug Adapter Protocol) is implemented
-> but not yet verified in a real VS Code session; stepping, writing to
-> variables via watch/hover, and compound-value inspection are not yet
-> implemented — see [Debugger support](#debugger-support-in-progress)
-> below.
+> (launch, breakpoints, continue, call stack, locals, evaluate/watch
+> expressions including writes via `setVariable`, and disconnect via VS
+> Code's Debug Adapter Protocol) is implemented but not yet verified in a
+> real VS Code session; stepping and compound-value (array/list/map/
+> structure) inspection are not yet implemented — see
+> [Debugger support](#debugger-support-in-progress) below.
 
 ## Features
 
@@ -114,17 +114,31 @@ against a real compiled target; an actual VS Code Run-and-Debug-view session
 is not yet manually verified (same X-display limitation noted above for the
 language-support features). Not yet implemented: stepping (the one known
 lead — the continue opcode's nonzero sub-command — was live-tested and
-ruled out; no dedicated step opcode is known to exist), watch/`evaluate`
-expressions for writes (`setVariable`/`setExpression` — the write-side
-opcode is decoded but blocked on an unexplained target-side failure), and
-array/list/map/structure value expansion. The **read side of `evaluate`**
-(hover, watch, and Debug Console expressions) is implemented and
-live-tested: wiring it up surfaced a real wire-framing bug (a request
-header's `len` field must count every byte sent, including string NUL
-terminators, or the next request on the same connection hangs) that a
-single-shot test script never exposed — fixed and verified with several
-expressions evaluated in a row on one live session, including full
-arithmetic (`a+b`) and the target's own error text for an unknown name.
+ruled out; no dedicated step opcode is known to exist) and array/list/map/
+structure value expansion.
+
+`evaluate` (hover, watch, and Debug Console expressions) works both ways:
+reads are live-tested (full arithmetic like `a+b`, not just bare variable
+lookups, plus the target's own error text for an unknown name), and writes
+via `setVariable`/`setExpression` are live-tested too — the earlier
+"blocked on an unexplained target-side failure" turned out to be the same
+wire-framing bug as the read side (a request header's `len` field must
+count every byte sent, including string NUL terminators, or the next
+request on the same connection hangs), not a real protocol problem.
+
+`disconnect` is implemented and its behavior is fully understood, not
+guessed: the wire protocol has **no graceful-disconnect opcode** — decoding
+`ExternalDebugger_CommunicationsThread`'s read-error path shows any FIFO
+read failure other than `EAGAIN` unconditionally calls `exit(1)` inside the
+target itself, with nothing gating it (Control opcode 0, the only
+candidate, was live-tested and doesn't change this). So closing the FIFOs
+*is* the termination mechanism, and it's reliable — confirmed to fire even
+while the target's main thread is stuck in a busy-loop, since it's the
+comms thread's blocked read that hits the fatal path, not anything on the
+main thread. The `child.kill()` fallback uses `SIGKILL` specifically:
+plain `SIGTERM` (Node's default) was live-tested and found to be silently
+ignored by a running `-d` target.
+
 Throwaway protocol-spike clients remain in `src/debug/spike/` for anyone
 following along or picking up the remaining work.
 
