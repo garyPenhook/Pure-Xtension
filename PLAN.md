@@ -1242,13 +1242,14 @@ Pure_Xtension/
       running; opcode `2` is the confirmed continue/go command; both
       previously-mysterious spontaneous messages (`type=2`/`type=3`) are
       explained; `record+0x10` is confirmed to be a 0-based call-site line
-      number. What's *still* open: opcode `2`'s nonzero-sub-command branch
-      (possible step-vs-run distinction, untested); whether a *targeted*
-      stepping opcode exists separately from this "run" (no dedicated
-      step opcode has been identified yet — `Control`'s sub-commands under
-      opcode `1` were the only other decoded sub-command space and none of
-      them looked step-shaped); `Variables`' exact request/response byte
-      layout; `~/.pbdebugger.prefs`' format for the TCP path.
+      number. What's *still* open: whether a *targeted* stepping opcode
+      exists separately from this "run" (opcode `2`'s nonzero-sub-command
+      branch was later live-tested and ruled out as a step mode — see the
+      dated entry near the end of this M5 section — and `Control`'s
+      sub-commands under opcode `1` were the only other decoded sub-command
+      space and none of them looked step-shaped, so no lead remains);
+      `Variables`' exact request/response byte layout; `~/.pbdebugger.prefs`'
+      format for the TCP path.
 - **Opcode `3` (`PB_DEBUGGER_ExternalBreakpoints`) decoded — it is itself a
   7-way sub-dispatch keyed on `header+0x8` (the same "sub-command" field
   idiom `Control`/opcode `1` uses), not a single flat "set breakpoints"
@@ -1435,9 +1436,7 @@ Pure_Xtension/
     `stopOnEntry`/`backend`/`compilerArgs` launch schema) wire it into VS
     Code's Run and Debug view.
   - **Deliberately not implemented yet, because the protocol doesn't
-    support it or it hasn't been decoded:** stepping (no dedicated
-    step-vs-run opcode has been found — `Control` opcode `2`'s nonzero
-    sub-command is the only lead and it's untested), `evaluate`/watch
+    support it or it hasn't been decoded:** stepping (`evaluate`/watch
     expressions (`Expression` category, opcodes `8`/`33`-`35`, not yet
     decoded), compound-value expansion (arrays/lists/maps/structures,
     opcodes `12`-`15` plus `ExamineStructure`/`NextStructureField`, not yet
@@ -1452,6 +1451,27 @@ Pure_Xtension/
     the same X/pointer limitation noted under M1 — so this is still
     pending a manual check in a real VS Code window before it can be
     called done.
+- **`Control` opcode `2`'s nonzero sub-command live-tested and ruled out as
+  a step mode** (`src/debug/spike/fifo-step-probe.mjs`, against a new
+  `test-step.pb` fixture with five sequential non-looping statements inside
+  a procedure — chosen over `test.pb` specifically because its busy-wait
+  loop can't distinguish "stepped one line" from "ran free and looped back
+  the same line"). Method: set a breakpoint on the target's first statement,
+  confirm the stop, then send opcode `2` with `f8` (the sub-command field)
+  set to `0` (baseline), `1`, `2`, and `-1` in separate runs. **All four
+  produced byte-identical downstream behavior** — the target ran to
+  completion in every case (all four `Debug` notifications plus the final
+  message arrived within the same millisecond, no second `type=3` stop was
+  ever seen, and the child exited). The only difference a nonzero
+  sub-command makes is exactly what the static decode predicted: one extra
+  `type=4` message (`f8` a large, address-shaped value, not yet decoded
+  further) is emitted before the same free-run sequence. **This closes risk
+  1's last open item on the continue/step side**: opcode `2` has no
+  step-vs-run distinction under any of the sub-command values tried; if a
+  dedicated single-step command exists in the protocol at all, it isn't
+  reachable through `Control`'s sub-command field. No further leads are
+  known — stepping is off the table for this milestone unless a fresh
+  static-decode pass turns up an opcode outside the `Control` category.
 
 **M6 — Polish & ship (1.0)**
 - Walkthrough, tree views, formatter, semantic tokens, README/docs, marketplace
@@ -1488,11 +1508,13 @@ Pure_Xtension/
    per frame). **Breakpoint-setting (opcode `3`) is also decoded and
    live-confirmed** — add/remove-by-key/bulk-clear-all all verified against
    a real FIFO session; only the data/watch-breakpoint sub-command is
-   static-decode-only. Remaining unknowns: exact byte layout of `Variables`'
-   request/response; whether opcode `2`'s nonzero sub-command is a distinct
-   step mode. The `Debug`/`OnError` stdout fallback (verified working, zero
-   plumbing) still de-risks shipping *something* even if further opcode
-   decoding stalls.
+   static-decode-only. **Opcode `2`'s nonzero sub-command has been
+   live-tested (`f8` = `0`/`1`/`2`/`-1`) and ruled out as a step mode** — all
+   four values produce an identical free-run, so no dedicated stepping
+   opcode is known to exist. Remaining unknowns: exact byte layout of
+   `Variables`' request/response. The `Debug`/`OnError` stdout fallback
+   (verified working, zero plumbing) still de-risks shipping *something*
+   even if further opcode decoding stalls.
 2. **`.help` binary format** — resolved by sidestepping it: neither offline
    pipeline in the original plan actually worked (`pbdocmaker` is GUI-only;
    no `.help` parser exists to reuse — see M4 notes). Help integration now
@@ -1560,7 +1582,14 @@ Pure_Xtension/
    section above for what it covers (`launch`/breakpoints/`continue`/
    `stackTrace`/`variables`/`disconnect`) and what's deliberately still
    missing (stepping, `evaluate`, compound-value expansion, data
-   breakpoints, a clean disconnect opcode).
+   breakpoints, a clean disconnect opcode). **The one open lead on
+   stepping has since been closed, with a negative result**: `Control`
+   opcode `2`'s nonzero sub-command (`f8` = `0`/`1`/`2`/`-1`, all tried)
+   produces an identical free-run every time, not a step — see the dated
+   entry at the end of the M5 section above
+   (`src/debug/spike/fifo-step-probe.mjs`). No further leads on a
+   dedicated step opcode are known; stepping stays out of scope for M5
+   barring a fresh static-decode pass.
 2. Full in-editor GUI smoke test (M1–M4 features) is still pending a working
    X display in this sandbox — flag to the user to manually verify in a real
    VS Code session before any marketplace publish. **The new debug adapter
@@ -1569,10 +1598,11 @@ Pure_Xtension/
    Run-and-Debug-view session through VS Code's UI is unverified.
 3. Confirm scope/priorities (esp. whether the debugger or a Form Designer is
    in the 1.0 cut) before M5/M6.
-4. Next debugger work, roughly in cost order: (a) find a real step opcode
-   (only untested lead is `Control` opcode `2`'s nonzero sub-command); (b)
-   decode `Expression` (opcodes `8`/`33`-`35`) for `evaluate`/watch
-   support; (c) live-test array/list/map/structure expansion so
-   `variablesRequest` can return non-zero `variablesReference`s for
-   compound values; (d) find/confirm a clean disconnect opcode instead of
-   the FIFO-close-and-kill fallback.
+4. Next debugger work, roughly in cost order: (a) decode `Expression`
+   (opcodes `8`/`33`-`35`) for `evaluate`/watch support; (b) live-test
+   array/list/map/structure expansion so `variablesRequest` can return
+   non-zero `variablesReference`s for compound values; (c) find/confirm a
+   clean disconnect opcode instead of the FIFO-close-and-kill fallback.
+   (The former item (a), finding a real step opcode via `Control` opcode
+   `2`'s nonzero sub-command, is done — live-tested and ruled out; no
+   further lead is known, see item 1 above.)

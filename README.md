@@ -111,11 +111,12 @@ registered via `src/debug/debugConfigProvider.ts` and package.json's new
 `debuggers` contribution. The wire-protocol client is smoke-tested standalone
 against a real compiled target; an actual VS Code Run-and-Debug-view session
 is not yet manually verified (same X-display limitation noted above for the
-language-support features). Not yet implemented: stepping (no step opcode
-has been confirmed), watch/`evaluate` expressions, and array/list/map/
-structure value expansion. Throwaway protocol-spike clients remain in
-`src/debug/spike/` for anyone following along or picking up that remaining
-work.
+language-support features). Not yet implemented: stepping (the one known
+lead — the continue opcode's nonzero sub-command — was live-tested and
+ruled out; no dedicated step opcode is known to exist), watch/`evaluate`
+expressions, and array/list/map/structure value expansion. Throwaway
+protocol-spike clients remain in `src/debug/spike/` for anyone following
+along or picking up that remaining work.
 
 ## Development
 
