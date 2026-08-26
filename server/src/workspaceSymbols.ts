@@ -6,6 +6,14 @@ import { StructureField } from "./dumpParsers";
 
 export type WorkspaceSymbolKind = "procedure" | "structure" | "interface" | "constant" | "macro";
 
+export interface InterfaceMethod {
+  name: string;
+  /** Return type after the method name, e.g. `Perimeter.i()` -> "i". */
+  returnType?: string;
+  /** Raw parameter-list text between the parens. */
+  params: string;
+}
+
 export interface WorkspaceSymbol {
   kind: WorkspaceSymbolKind;
   name: string;
@@ -15,13 +23,19 @@ export interface WorkspaceSymbol {
   detail: string;
   /** Populated for `structure` symbols: fields declared between Structure/EndStructure. */
   fields?: StructureField[];
+  /** Populated for `interface` symbols: methods declared between Interface/EndInterface. */
+  methods?: InterfaceMethod[];
+  /** Populated for `interface` symbols with an `Extends <name>` clause. */
+  extends?: string;
 }
 
 const PROCEDURE_LINE = /^\s*Procedure(?:C|DLL|CDLL)?(?:\.\w+)?\s+(\w+)\s*\(([^)]*)\)/i;
 const STRUCTURE_LINE = /^\s*Structure\s+(\w+)/i;
 const END_STRUCTURE_LINE = /^\s*EndStructure\b/i;
 const STRUCTURE_FIELD_LINE = /^(\*?)([A-Za-z_]\w*)\.([A-Za-z_]\w*)(\[(\d+)\])?/;
-const INTERFACE_LINE = /^\s*Interface\s+(\w+)/i;
+const INTERFACE_LINE = /^\s*Interface\s+(\w+)(?:\s+Extends\s+(\w+))?/i;
+const END_INTERFACE_LINE = /^\s*EndInterface\b/i;
+const INTERFACE_METHOD_LINE = /^([A-Za-z_]\w*)(?:\.([A-Za-z_]\w*))?\s*\(([^)]*)\)/;
 const MACRO_LINE = /^\s*Macro\s+(\w+)/i;
 const CONSTANT_LINE = /^\s*#(\w+)(?:\.\w+)?\s*=\s*(.*)$/;
 
@@ -29,6 +43,7 @@ export function extractWorkspaceSymbols(text: string): WorkspaceSymbol[] {
   const symbols: WorkspaceSymbol[] = [];
   const lines = text.split(/\r?\n/);
   let currentStructure: WorkspaceSymbol | undefined;
+  let currentInterface: WorkspaceSymbol | undefined;
 
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i];
@@ -61,6 +76,25 @@ export function extractWorkspaceSymbols(text: string): WorkspaceSymbol[] {
       }
     }
 
+    if (currentInterface) {
+      if (END_INTERFACE_LINE.test(line)) {
+        currentInterface = undefined;
+        continue;
+      }
+      const method = INTERFACE_METHOD_LINE.exec(line.trim());
+      if (method) {
+        const [, name, returnType, params] = method;
+        (currentInterface.methods ??= []).push({ name, returnType, params: params.trim() });
+        continue;
+      }
+      // Same implicit-close rule as currentStructure above, for mid-typing.
+      if (PROCEDURE_LINE.test(line) || STRUCTURE_LINE.test(line) || INTERFACE_LINE.test(line) || MACRO_LINE.test(line)) {
+        currentInterface = undefined;
+      } else {
+        continue;
+      }
+    }
+
     const proc = PROCEDURE_LINE.exec(line);
     if (proc) {
       symbols.push({ kind: "procedure", name: proc[1], line: i, detail: `(${proc[2].trim()})` });
@@ -83,7 +117,16 @@ export function extractWorkspaceSymbols(text: string): WorkspaceSymbol[] {
 
     const iface = INTERFACE_LINE.exec(line);
     if (iface) {
-      symbols.push({ kind: "interface", name: iface[1], line: i, detail: "Interface" });
+      const symbol: WorkspaceSymbol = {
+        kind: "interface",
+        name: iface[1],
+        line: i,
+        detail: iface[2] ? `Interface Extends ${iface[2]}` : "Interface",
+        methods: [],
+        extends: iface[2],
+      };
+      symbols.push(symbol);
+      currentInterface = symbol;
       continue;
     }
 

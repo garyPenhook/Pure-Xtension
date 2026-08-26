@@ -5,5 +5,5 @@
     "outDir": "out-test",
     "noUnusedLocals": false
   },
-  "include": ["src/debug/pbSession.ts", "src/debug/lineAddressMap.ts", "src/debug/ptraceEngine.ts", "test/**/*.test.ts", "test/vscodeIntegration/runTest.ts", "test/vscodeIntegration/suite/index.ts"]
+  "include": ["src/debug/pbSession.ts", "src/debug/lineAddressMap.ts", "src/debug/ptraceEngine.ts", "server/src/workspaceSymbols.ts", "server/src/dumpParsers.ts", "test/**/*.test.ts", "test/vscodeIntegration/runTest.ts", "test/vscodeIntegration/suite/index.ts"]
 }

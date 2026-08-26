@@ -432,8 +432,19 @@ connection.onHover(async (params): Promise<Hover | undefined> => {
     (s) => s.name.toLowerCase() === word.toLowerCase(),
   );
   if (symbol) {
+    const fieldList = symbol.fields?.length
+      ? `\n\n${symbol.fields
+          .map((f) => `- ${f.isPointer ? "*" : ""}${f.name}.${f.type}${f.arraySize ? `[${f.arraySize}]` : ""}`)
+          .join("\n")}`
+      : "";
+    const methodList = symbol.methods?.length
+      ? `\n\n${symbol.methods.map((m) => `- ${m.name}${m.returnType ? `.${m.returnType}` : ""}(${m.params})`).join("\n")}`
+      : "";
     return {
-      contents: { kind: "markdown", value: `**${symbol.name}** _(${symbol.kind})_\n\n${symbol.detail}` },
+      contents: {
+        kind: "markdown",
+        value: `**${symbol.name}** _(${symbol.kind})_\n\n${symbol.detail}${fieldList}${methodList}`,
+      },
     };
   }
 
