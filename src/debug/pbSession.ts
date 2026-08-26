@@ -571,12 +571,23 @@ export class PbDebugSession extends EventEmitter {
           reject(err);
         },
       };
+      // Deliberately not .unref()'d: this timer is the only thing that ever
+      // settles this promise, so it must be allowed to keep the process
+      // alive until it fires or is cleared. An unref'd timer can be skipped
+      // entirely if nothing else refs the event loop at the moment it's
+      // pending (e.g. this exact promise, awaited in isolation with no open
+      // FIFO/child-process handles, as a unit test does) — Node can decide
+      // the loop is done and exit without ever calling the callback,
+      // leaving the promise permanently unsettled. Confirmed live: this is
+      // what broke `nextMessageWithTimeout`'s own regression test in CI
+      // (no compiler installed there, so no other handle keeps the loop
+      // alive) while passing locally, where other live e2e tests in the
+      // same run happen to keep the loop busy and mask it.
       const timer = setTimeout(() => {
         const index = this.pending.indexOf(waiter);
         if (index !== -1) this.pending.splice(index, 1);
         reject(new Error(`timed out after ${timeoutMs}ms waiting for ${description}`));
       }, timeoutMs);
-      timer.unref();
       this.pending.push(waiter);
     });
   }
