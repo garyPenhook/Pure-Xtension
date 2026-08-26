@@ -321,15 +321,19 @@
     "compile": "tsc --noEmit -p ./ && tsc --noEmit -p ./server && node esbuild.mjs",
     "watch": "node esbuild.mjs --watch",
     "test": "tsc -p tsconfig.test.json && node esbuild.adapter.mjs && node --test out-test/test/*.test.js",
+    "test:vscode": "tsc -p tsconfig.test.json && mkdir -p out-test/test/vscodeIntegration/fixture && cp test/vscodeIntegration/fixture/*.pb out-test/test/vscodeIntegration/fixture/ && node out-test/test/vscodeIntegration/runTest.js",
     "package": "vsce package",
     "vscode:prepublish": "node esbuild.mjs --production"
   },
   "devDependencies": {
+    "@types/mocha": "^10.0.10",
     "@types/node": "^20.0.0",
     "@types/vscode": "^1.85.0",
     "@vscode/debugadapter-testsupport": "^1.68.0",
+    "@vscode/test-electron": "^3.1.0",
     "@vscode/vsce": "^3.9.2",
     "esbuild": "^0.28.2",
+    "mocha": "^11.8.0",
     "typescript": "^5.9.2"
   },
   "allowScripts": {

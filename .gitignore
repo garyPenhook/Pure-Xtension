@@ -4,8 +4,7 @@ out-test/
 dist/
 *.vsix
 .DS_Store
-src/debug/spike/test.bin
-src/debug/spike/test-step.bin
-src/debug/spike/test-arrays.bin
+src/debug/spike/*.bin
 purebasic.asm
 PLAN.md
+.vscode-test/
