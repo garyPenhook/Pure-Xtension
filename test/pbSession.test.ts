@@ -10,6 +10,7 @@ import {
   parseArrayElements,
   parseEvaluateReply,
   parseFrames,
+  parseGlobalDecls,
   parseListDecls,
   parseListElements,
   parseMapDecls,
@@ -94,6 +95,32 @@ test("parseVariables falls back to a hex dump when the trailing value is truncat
     Buffer.from([0xde, 0xad]), // only 2 bytes, not the full 8-byte value
   ]);
   assert.deepEqual(parseVariables(payload), [{ type: 0x15, kind: 3, name: "a", value: "0xdead" }]);
+});
+
+test("parseGlobalDecls decodes name-only records (7-byte header + name + 1 pad byte, no value)", () => {
+  // Exact bytes captured live from opcode 9 for a mixed-type module scope
+  // (.i alpha, .f z, .s bb, .q c3, Global .i gg): each record is header +
+  // NUL name + a single trailing pad byte, and carries NO 8-byte value.
+  const rec = (type: number, kind: number, name: string) =>
+    Buffer.concat([Buffer.from([type, 0, kind, 0, 0, 0, 0]), nulString(name), Buffer.from([0])]);
+  const payload = Buffer.concat([
+    rec(0x15, 0, "alpha"),
+    rec(0x09, 0, "z"),
+    rec(0x08, 0, "bb"),
+    rec(0x0d, 0, "c3"),
+    rec(0x15, 1, "gg"),
+  ]);
+  assert.deepEqual(parseGlobalDecls(payload), [
+    { name: "alpha", type: 0x15, kind: 0 },
+    { name: "z", type: 0x09, kind: 0 },
+    { name: "bb", type: 0x08, kind: 0 },
+    { name: "c3", type: 0x0d, kind: 0 },
+    { name: "gg", type: 0x15, kind: 1 },
+  ]);
+});
+
+test("parseGlobalDecls returns an empty list for an empty (no module variables) payload", () => {
+  assert.deepEqual(parseGlobalDecls(Buffer.alloc(0)), []);
 });
 
 test("parseArrayDecls extracts the bare name up to the dimension parens", () => {

@@ -99,6 +99,15 @@ export interface PbMapDecl {
   currentKey?: string;
 }
 
+export interface PbGlobalDecl {
+  /** Module/global-scope variable name. */
+  name: string;
+  /** Type tag byte (e.g. 0x15 = `.i`, 0x09 = `.f`, 0x08 = `.s`, 0x0d = `.q`). */
+  type: number;
+  /** 0 = module-scope `Define`, 1 = `Global` (the record's scope-flag byte). */
+  kind: number;
+}
+
 export interface PbArrayElement {
   index: string;
   value: string;
@@ -181,6 +190,23 @@ export function parseFrames(payload: Buffer): PbFrame[] {
 // `y` fields, src/debug/spike/fifo-arrayslists.mjs). Strings and
 // array/list/map-typed *scalar* variables (as opposed to the dedicated
 // ArraysLists opcodes) are still not live-tested.
+/** Shared by parseVariables and parseGlobalDecls: the common 7-byte header (type, flag, kind/scope, 4-byte reserved) + NUL-terminated name every record starts with. Returns null at a truncated/empty-name record so callers can stop cleanly. */
+function readHeaderAndName(
+  payload: Buffer,
+  off: number,
+): { type: number; kind: number; nested: boolean; name: string; next: number } | null {
+  if (off + 7 >= payload.length) return null;
+  const type = payload.readUInt8(off);
+  const kind = payload.readUInt8(off + 2);
+  const nested = payload.readInt32LE(off + 3) !== 0;
+  off += 7;
+  const nul = payload.indexOf(0, off);
+  if (nul === -1) return null;
+  const name = payload.toString("latin1", off, nul);
+  if (!name) return null;
+  return { type, kind, nested, name, next: nul + 1 };
+}
+
 export function parseVariables(payload: Buffer): PbVariable[] {
   interface FlatRecord {
     type: number;
@@ -191,16 +217,11 @@ export function parseVariables(payload: Buffer): PbVariable[] {
   }
   const flat: FlatRecord[] = [];
   let off = 0;
-  while (off + 7 < payload.length) {
-    const type = payload.readUInt8(off);
-    const kind = payload.readUInt8(off + 2);
-    const nested = payload.readInt32LE(off + 3) !== 0;
-    off += 7;
-    const nul = payload.indexOf(0, off);
-    if (nul === -1) break;
-    const name = payload.toString("latin1", off, nul);
-    off = nul + 1;
-    if (!name) break;
+  for (;;) {
+    const header = readHeaderAndName(payload, off);
+    if (!header) break;
+    const { type, kind, nested, name } = header;
+    off = header.next;
     let value: string | undefined;
     if (type !== STRUCT_TYPE_TAG) {
       if (off + 8 <= payload.length) {
@@ -223,6 +244,39 @@ export function parseVariables(payload: Buffer): PbVariable[] {
     }
   }
   return result;
+}
+
+// Opcode 9 (ExamineVariables(-1)) reply: the module/global scope's variable
+// declarations — *names and types only, no values*. Live-confirmed layout
+// (PLAN.md M6): each record is the same 7-byte header as parseVariables
+// (type, flag, kind/scope, 4-byte reserved) + a NUL-terminated name + a
+// single trailing pad byte, with NO 8-byte value field. A 5-variable reply of
+// mixed .i/.f/.s/.q/.i types measured exactly 14+10+11+11+11 = 57 bytes,
+// matching this record shape for every name length. The value-bearing parts
+// of parseVariables must NOT be reused here — a value-less opcode-9 payload
+// would make it read across record boundaries — but the header+name scan
+// itself is shared via readHeaderAndName. Values for these names are
+// recovered separately via evaluate() (opcode 33), which resolves
+// module-scope names from any stop context (live-confirmed from inside a
+// procedure too).
+//
+// NOT YET LIVE-TESTED: a module-scope *structure* variable. parseVariables'
+// structure records (STRUCT_TYPE_TAG, no value, "reserved" field reused as a
+// nesting flag — see its own comment above) were only confirmed for opcode
+// 11/17's frame-scoped stream; if opcode 9 uses a different/no pad byte for
+// a structure header, this loop's fixed "+1 pad byte" would desync every
+// record after it. Flagged, not guessed at — same policy as the LinkedList
+// element gap (PLAN.md M5).
+export function parseGlobalDecls(payload: Buffer): PbGlobalDecl[] {
+  const decls: PbGlobalDecl[] = [];
+  let off = 0;
+  for (;;) {
+    const header = readHeaderAndName(payload, off);
+    if (!header) break;
+    off = header.next + 1; // past the name's NUL terminator + 1 trailing pad byte (0x00 in every observed record)
+    decls.push({ name: header.name, type: header.type, kind: header.kind });
+  }
+  return decls;
 }
 
 // Declaration records from opcodes 12/13/14 (PLAN.md M5, live-confirmed
@@ -568,11 +622,19 @@ export class PbDebugSession extends EventEmitter {
     });
   }
 
-  async examineGlobals(): Promise<PbVariable[]> {
+  /**
+   * Opcode 9: the module/global scope's variable *declarations* (names +
+   * types, no values — see {@link parseGlobalDecls}). Values are read per-name
+   * via {@link evaluate}. This is how the debug adapter populates the
+   * synthetic "main" stack frame's locals: opcode 16 reports no frame and
+   * opcode 11 no locals when the target is stopped at module scope (outside
+   * any procedure), so the main-body variables are only reachable this way.
+   */
+  async examineModuleScope(): Promise<PbGlobalDecl[]> {
     return this.serialize(async () => {
       this.write(OP_EXAMINE_GLOBALS);
       const msg = await this.nextMessage();
-      return parseVariables(msg.payload);
+      return parseGlobalDecls(msg.payload);
     });
   }
 

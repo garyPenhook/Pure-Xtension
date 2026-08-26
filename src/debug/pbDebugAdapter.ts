@@ -17,7 +17,7 @@ import {
 } from "@vscode/debugadapter";
 import { DebugProtocol } from "@vscode/debugprotocol";
 import { Backend, resolveBackendSilent, resolveCompilerPath } from "../config";
-import { PbDebugSession, PbFrame, PbVariable } from "./pbSession";
+import { PbDebugSession, PbVariable } from "./pbSession";
 
 const MAIN_THREAD_ID = 1;
 // variablesReference values for compound (structure/array/list/map)
@@ -67,8 +67,19 @@ export class PureBasicDebugSession extends DebugSession {
    * actual wire writes to `flushBreakpointsToWire()` once connected.
    */
   private pbConnected = false;
-  /** opcode-16 order (0 = outermost); cached per stop so scopes/variables can address into it. */
-  private lastFrames: PbFrame[] = [];
+  /** 1-based line the target last stopped at (StoppedEvent's `line`/`msg.f8`), used as the innermost/main frame's current line since opcode 16 never carries it. */
+  private lastStopLine = 0;
+  /**
+   * Per-stop map from DAP frameId to what that frame actually is: a procedure
+   * frame (addressable by its opcode-17 index) or the synthetic module/main
+   * frame. Rebuilt every stackTraceRequest. Opcode 16 only ever reports
+   * *procedure* frames — and none at all when the target is stopped at module
+   * scope — so the adapter synthesizes a main frame beneath them; without it a
+   * top-level stop would hand VS Code zero frames, and with zero frames the
+   * client can't request scopes/variables at all (they hang off a frameId), so
+   * nothing would be inspectable.
+   */
+  private frameHandles = new Map<number, { kind: "main" } | { kind: "proc"; pbIndex: number }>();
   /** Guards against sending TerminatedEvent twice — the wire session's `close` and the child's `exit` both fire on every teardown. */
   private terminated = false;
   /** Structure/array/list/map handles for the current stop, keyed by a variablesReference >= COMPOUND_REF_BASE. Rebuilt on every stop. */
@@ -102,9 +113,13 @@ export class PureBasicDebugSession extends DebugSession {
     this.configurationDone = new Promise((resolve) => {
       this.resolveConfigurationDone = resolve;
     });
-    this.pb.on("stopped", ({ reason }: { line: number; reason: number }) => {
-      this.lastFrames = [];
+    this.pb.on("stopped", ({ line, reason }: { line: number; reason: number }) => {
+      // Capture the stop line before the stepInProgress early-return below, so
+      // it stays current through step()'s internal run/stop loop too — by the
+      // time step() sends its own StoppedEvent, this holds the final line.
+      this.lastStopLine = line;
       this.compoundHandles.clear();
+      this.frameHandles.clear();
       this.nextCompoundRef = COMPOUND_REF_BASE;
       // While step() is driving its own run/stop loop (via the temporary
       // all-line breakpoints below), every intermediate stop is internal
@@ -148,7 +163,9 @@ export class PureBasicDebugSession extends DebugSession {
     // The wire protocol has no dedicated step opcode (PLAN.md M5: all
     // Control sub-command values live-tested and ruled out) — next/stepIn/
     // stepOut are emulated in step() via temporary all-line breakpoints
-    // instead. supportsStepInTargetsRequest is a separate, unimplemented
+    // instead. Note stepIn can't actually descend into a call (see step()'s
+    // doc comment: the wire runs a whole call-line atomically), so it degrades
+    // to a line step. supportsStepInTargetsRequest is a separate, unimplemented
     // feature (picking which call on a line to step into).
     response.body.supportsStepInTargetsRequest = false;
     response.body.supportsEvaluateForHovers = true;
@@ -357,14 +374,25 @@ export class PureBasicDebugSession extends DebugSession {
    * which are left alone throughout), then continues. Because
    * `GetExecutableLine` snaps each requested line to the nearest real
    * statement (PLAN.md M5's opcode-3 decode notes), lines with no statement
-   * of their own are harmless no-ops — the target is guaranteed to stop at
-   * the very next line that actually executes.
+   * of their own are harmless no-ops — the target stops at the very next line
+   * that actually executes *within the current continue*.
    *
-   * "over"/"out" additionally compare stack depth (frame count from opcode
-   * 16) against the depth at the moment step() was called, auto-continuing
-   * through any stop that's still deeper than that baseline (i.e. still
-   * inside a call step should skip over/out of) rather than surfacing it to
-   * VS Code.
+   * Important protocol limitation, confirmed live end-to-end (PLAN.md M6):
+   * continuing from a stop runs the *entire current source line to completion*
+   * — including any procedure it calls — before honoring breakpoints again, so
+   * a breakpoint on a callee's body never fires on the continue that enters it
+   * from the call site. That makes true **step-into impossible** here: "in"
+   * therefore behaves as a line step (identical to "over" at a call site —
+   * it advances past the call rather than descending into it). Stepping *within*
+   * a procedure and *out* of one both work, since those stops aren't on a
+   * call-site's own line.
+   *
+   * "over"/"out" compare stack depth (procedure-frame count from opcode 16,
+   * which excludes the synthesized main frame — so main scope is depth 0)
+   * against the depth when step() began, auto-continuing through any stop still
+   * deeper than that baseline instead of surfacing it. "out" additionally
+   * requires a strictly shallower depth, so it runs until the current procedure
+   * returns.
    */
   private async step(mode: "in" | "over" | "out"): Promise<void> {
     if (this.stepInProgress) return;
@@ -441,17 +469,36 @@ export class PureBasicDebugSession extends DebugSession {
     response: DebugProtocol.StackTraceResponse,
     _args: DebugProtocol.StackTraceArguments,
   ): Promise<void> {
-    this.lastFrames = await this.pb.stackTrace();
-    // opcode 16 returns outermost-first; DAP wants innermost (current) frame first.
-    const innermostFirst = [...this.lastFrames].reverse();
+    const pbFrames = await this.pb.stackTrace(); // opcode 16: procedure frames only, outermost-first
+    this.frameHandles.clear();
     const source = new Source(path.basename(this.sourcePath), this.sourcePath);
-    response.body = {
-      stackFrames: innermostFirst.map((frame, i) => {
-        const dapId = innermostFirst.length - 1 - i; // matches examineFrame's pb-order index
-        return new StackFrame(dapId, frame.display, source, frame.callSiteLine0 + 1);
-      }),
-      totalFrames: innermostFirst.length,
-    };
+    const procInnermostFirst = [...pbFrames].reverse();
+    const frames: StackFrame[] = [];
+    let id = 0;
+    // Per-frame current line: the innermost procedure is at the actual stop
+    // line; each outer frame is at the call site *inside* it that invoked the
+    // next-inner frame — which opcode 16 reports as that inner frame's
+    // callSiteLine0 (its return address in the caller), not the inner frame's
+    // own line. The old code used each frame's own callSiteLine0 as its line,
+    // which put the arrow on the caller's call site instead of the frame's
+    // current line, and dropped the stop line entirely.
+    let line = this.lastStopLine || 1;
+    for (let j = 0; j < procInnermostFirst.length; j++) {
+      const frame = procInnermostFirst[j];
+      const pbIndex = pbFrames.length - 1 - j; // opcode-17 frame index (0 = outermost)
+      this.frameHandles.set(id, { kind: "proc", pbIndex });
+      frames.push(new StackFrame(id, frame.display, source, line));
+      id++;
+      line = frame.callSiteLine0 + 1;
+    }
+    // Synthetic module/main frame beneath every procedure frame — the only
+    // frame when stopped at module scope (opcode 16 empty), and the missing
+    // bottom of the stack when stopped inside a procedure (opcode 16 never
+    // includes it). Its locals come from opcode 9 + evaluate (see variablesRequest).
+    this.frameHandles.set(id, { kind: "main" });
+    frames.push(new StackFrame(id, `${path.basename(this.sourcePath)} (main)`, source, line));
+
+    response.body = { stackFrames: frames, totalFrames: frames.length };
     this.sendResponse(response);
   }
 
@@ -459,8 +506,10 @@ export class PureBasicDebugSession extends DebugSession {
     response: DebugProtocol.ScopesResponse,
     args: DebugProtocol.ScopesArguments,
   ): void {
-    // variablesReference encodes the pb-order frame index (0 = outermost),
-    // offset by 1 so 0 stays reserved for "no children".
+    // variablesReference encodes frameId (the synthetic DAP-order id
+    // stackTraceRequest assigned — 0 = innermost, resolved back to a real
+    // frame via frameHandles), offset by 1 so 0 stays reserved for "no
+    // children".
     response.body = { scopes: [new Scope("Locals", args.frameId + 1, false)] };
     this.sendResponse(response);
   }
@@ -529,40 +578,85 @@ export class PureBasicDebugSession extends DebugSession {
       return;
     }
 
-    const frameIndex = ref - 1;
-    const vars = await this.pb.examineFrame(frameIndex);
-    const variables: Variable[] = vars.map((v) => this.toDapVariable(v));
-
+    const frameId = ref - 1;
+    const handle = this.frameHandles.get(frameId);
     // Arrays/lists/maps (opcodes 12-14) only have a confirmed way to target
     // the current/topmost frame (PLAN.md M5) — there's no opcode-17-style
-    // explicit frame index for them, so they're only attached when this
-    // scope's frame actually is the topmost one, rather than silently
-    // showing the wrong frame's containers under an outer frame.
-    const isTopmostFrame = this.lastFrames.length === 0 || frameIndex === this.lastFrames.length - 1;
-    if (isTopmostFrame) {
+    // explicit frame index for them, so they attach only to the innermost
+    // (topmost) DAP frame, which is frameId 0 whether that's a procedure or,
+    // at a module-scope stop, the synthetic main frame.
+    const isInnermost = frameId === 0;
+
+    // Enumerate containers only for the innermost frame — the only frame they
+    // can be rendered on (opcodes 12-14 target the current/topmost frame) and
+    // the only place their names are needed to filter the main frame's scalar
+    // list (evaluating a bare array/list/map name is rejected by the target's
+    // evaluator). Best-effort — a scalars-only view is still useful if
+    // enumeration fails. (Expanding an *outer* main frame while stopped inside
+    // a procedure therefore skips this; a module-level container would then
+    // show as an evaluate error row rather than being filtered out — a rare
+    // edge not worth three extra wire round-trips on every such expansion.)
+    let arrays: Awaited<ReturnType<PbDebugSession["examineArrays"]>> = [];
+    let lists: Awaited<ReturnType<PbDebugSession["examineLists"]>> = [];
+    let maps: Awaited<ReturnType<PbDebugSession["examineMaps"]>> = [];
+    if (isInnermost) {
       try {
-        const [arrays, lists, maps] = await Promise.all([
+        [arrays, lists, maps] = await Promise.all([
           this.pb.examineArrays(),
           this.pb.examineLists(),
           this.pb.examineMaps(),
         ]);
-        for (const a of arrays) {
-          variables.push(new Variable(a.name, "Array", this.registerCompound({ kind: "array", expression: `${a.name}()` })));
-        }
-        for (const l of lists) {
-          variables.push(
-            new Variable(l.name, `LinkedList[${l.count}]`, this.registerCompound({ kind: "list", expression: `${l.name}()` })),
-          );
-        }
-        for (const m of maps) {
-          variables.push(
-            new Variable(m.name, `Map[${m.size}]`, this.registerCompound({ kind: "map", expression: `${m.name}()` })),
-          );
-        }
       } catch (err) {
-        // Best-effort: a scalars-only view is still useful if the
-        // container enumeration itself fails for some reason.
         this.logError(err);
+      }
+    }
+
+    let variables: Variable[];
+    if (handle?.kind === "proc") {
+      variables = (await this.pb.examineFrame(handle.pbIndex)).map((v) => this.toDapVariable(v));
+    } else {
+      // Main/module scope (also the fallback for an unknown/stale ref). Opcode
+      // 9 lists the names; each scalar's value is read via evaluate (opcode
+      // 33), which — unlike opcode 11/16 — returns module-scope values from any
+      // stop context. Container names are excluded here and rendered below.
+      const containerNames = new Set<string>([
+        ...arrays.map((a) => a.name),
+        ...lists.map((l) => l.name),
+        ...maps.map((m) => m.name),
+      ]);
+      variables = [];
+      const decls = await this.pb.examineModuleScope();
+      for (const d of decls) {
+        if (containerNames.has(d.name)) continue;
+        // evaluate() always runs against the currently-stopped line
+        // (frameContext -1, the only mode PLAN.md's spike live-tested — see
+        // evaluateRequest's doc comment) rather than a mode scoped to this
+        // synthetic main frame specifically. Stopped deep inside a
+        // procedure whose local shadows a same-named Global, this resolves
+        // to the local, not the global — a known display-correctness gap,
+        // not fixable without a confirmed frame-scoped evaluate mode.
+        const result = await this.pb.evaluate(d.name);
+        // result.value is set for kinds 1-4 (numeric/string); every other
+        // kind (0 = error, 5 = structure/unsupported) carries its message in
+        // result.error instead, so check value's presence rather than kind
+        // to avoid silently rendering a blank row for kind 5.
+        variables.push(new Variable(d.name, result.value ?? result.error ?? "<unavailable>"));
+      }
+    }
+
+    if (isInnermost) {
+      for (const a of arrays) {
+        variables.push(new Variable(a.name, "Array", this.registerCompound({ kind: "array", expression: `${a.name}()` })));
+      }
+      for (const l of lists) {
+        variables.push(
+          new Variable(l.name, `LinkedList[${l.count}]`, this.registerCompound({ kind: "list", expression: `${l.name}()` })),
+        );
+      }
+      for (const m of maps) {
+        variables.push(
+          new Variable(m.name, `Map[${m.size}]`, this.registerCompound({ kind: "map", expression: `${m.name}()` })),
+        );
       }
     }
 

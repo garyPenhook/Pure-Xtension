@@ -3,11 +3,13 @@
 .gitignore
 .vscodeignore
 esbuild.mjs
+esbuild.adapter.mjs
 tsconfig.json
 tsconfig.test.json
 test/**
 out-test/**
 PLAN.md
+purebasic.asm
 *.png
 *.vsix
 src/**
