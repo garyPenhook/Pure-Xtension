@@ -30,6 +30,7 @@ import { invalidateIncludeGraphCache, resolveIncludeGraphSymbols, ResolvedSymbol
 import { StructureField } from "./dumpParsers";
 import { HelpIndex, getHelpUrl, loadOrFetchHelpIndex } from "./onlineHelpIndex";
 import { getKeywordHelpUrl } from "./keywordHelp";
+import { RetryableLoader } from "./retryableLoader";
 
 interface InitializationOptions {
   compilerPath?: string;
@@ -45,20 +46,21 @@ let compilerPath = "";
 let cacheDir = "";
 const structureFieldsCache = new Map<string, StructureField[]>();
 let helpIndex: HelpIndex | undefined;
-let helpIndexPromise: Promise<HelpIndex | undefined> | undefined;
+const helpIndexLoader = new RetryableLoader<HelpIndex>(async (forceRefresh) => {
+  try {
+    const index = await loadOrFetchHelpIndex(cacheDir, forceRefresh);
+    helpIndex = index;
+    return index;
+  } catch (error) {
+    connection.console.warn(`Pure Xtension: help index fetch failed: ${String(error)}`);
+    return undefined;
+  }
+});
 
 /** Fetches (or loads the cached) purebasic.com command index in the background;
  *  never blocks a caller — hover/help-url lookups just get no link until it resolves. */
 function ensureHelpIndex(forceRefresh = false): Promise<HelpIndex | undefined> {
-  if (!helpIndexPromise) {
-    helpIndexPromise = loadOrFetchHelpIndex(cacheDir, forceRefresh)
-      .then((index) => (helpIndex = index))
-      .catch((error) => {
-        connection.console.warn(`Pure Xtension: help index fetch failed: ${String(error)}`);
-        return undefined;
-      });
-  }
-  return helpIndexPromise;
+  return helpIndexLoader.get(forceRefresh);
 }
 
 /** Memoizes on the in-flight promise (not just the resolved index) so concurrent
@@ -318,8 +320,6 @@ connection.onRequest("pureXtension/rebuildSymbolCache", async () => {
 });
 
 connection.onRequest("pureXtension/rebuildHelpIndex", async () => {
-  helpIndex = undefined;
-  helpIndexPromise = undefined;
   await ensureHelpIndex(true);
 });
 
@@ -380,6 +380,13 @@ connection.onCompletion(async (params): Promise<CompletionItem[]> => {
   }
 
   const items: CompletionItem[] = [];
+
+  // Initialization starts this in the background so first completion is not
+  // held behind a network timeout. Re-kick it here without awaiting it: if the
+  // initial fetch happened while offline, a later completion can self-heal and
+  // builtinCompletionItems() will invalidate its no-help cache when the index
+  // arrives.
+  void ensureHelpIndex();
 
   const index = await ensureBuiltinIndex();
   if (index) {
