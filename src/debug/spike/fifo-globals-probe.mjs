@@ -10,12 +10,19 @@ const compiler = path.join(HOME, "compilers", "pbcompiler");
 const dir = fs.mkdtempSync(path.join(os.tmpdir(), "rawprobe2-"));
 const src = path.join(dir, "fixture.pb");
 const LINES = [
-  "Global gg.i = 7",             // 1
-  "Define alpha.i = 11",         // 2
-  "Define bb.s = \"hi\"",        // 3
-  "Define c3.q = 22",            // 4
-  "Define z.f = 1.5",            // 5
-  "Debug alpha + c3",            // 6
+  "Structure ProbePoint",        // 1
+  "  x.i",                        // 2
+  "  label.s",                    // 3
+  "EndStructure",                 // 4
+  "Global gg.i = 7",             // 5
+  "Global point.ProbePoint",      // 6
+  "Define alpha.i = 11",         // 7
+  "Define bb.s = \"hi\"",        // 8
+  "Define c3.q = 22",            // 9
+  "Define z.f = 1.5",            // 10
+  "point\\x = 42",                // 11
+  "point\\label = \"probe\"",     // 12
+  "Debug alpha + c3",            // 13
   "",
 ];
 fs.writeFileSync(src, LINES.join("\n"));
@@ -36,7 +43,7 @@ function rex(n) { const b = Buffer.alloc(n); let o = 0; while (o < n) { const r 
 function rm() { const h = rex(20); const len = h.readInt32LE(4); return { type: h.readInt32LE(0), len, f8: h.readInt32LE(8), f12: h.readInt32LE(12), payload: len ? rex(len) : Buffer.alloc(0) }; }
 
 rm(); rm(); // hello, announce
-send(3, 3, -1); send(3, 1, 6); send(2, 0); // clear, break line 6, continue
+send(3, 3, -1); send(3, 1, 13); send(2, 0); // clear, break line 13, continue
 for (let i = 0; i < 40; i++) { const m = rm(); if (m.type === 3) break; }
 send(9);
 const m = rm();

@@ -6,6 +6,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
+  PbDebugSession,
   parseArrayDecls,
   parseArrayElements,
   parseEvaluateReply,
@@ -18,6 +19,31 @@ import {
   parseVariables,
   type PbMessage,
 } from "../src/debug/pbSession";
+
+test("a timed-out message wait does not consume the next request's reply", async () => {
+  const session = new PbDebugSession();
+  const internals = session as unknown as {
+    nextMessageWithTimeout(timeoutMs: number, description: string): Promise<PbMessage>;
+    dispatch(message: PbMessage): void;
+  };
+
+  await assert.rejects(
+    internals.nextMessageWithTimeout(5, "a test message"),
+    /timed out after 5ms waiting for a test message/,
+  );
+
+  const reply = internals.nextMessageWithTimeout(100, "the next reply");
+  const expected: PbMessage = {
+    type: 16,
+    len: 0,
+    f8: 7,
+    f12: 0,
+    f16: 0,
+    payload: Buffer.alloc(0),
+  };
+  internals.dispatch(expected);
+  assert.equal(await reply, expected);
+});
 
 function nulString(s: string): Buffer {
   return Buffer.concat([Buffer.from(s, "latin1"), Buffer.from([0])]);
@@ -121,6 +147,33 @@ test("parseGlobalDecls decodes name-only records (7-byte header + name + 1 pad b
 
 test("parseGlobalDecls returns an empty list for an empty (no module variables) payload", () => {
   assert.deepEqual(parseGlobalDecls(Buffer.alloc(0)), []);
+});
+
+test("parseGlobalDecls groups live-format module structure fields under their header", () => {
+  const rec = (type: number, kind: number, nested: boolean, name: string) =>
+    Buffer.concat([
+      Buffer.from([type, 0, kind, nested ? 1 : 0, 0, 0, 0]),
+      nulString(name),
+      Buffer.from([0]),
+    ]);
+  const payload = Buffer.concat([
+    rec(0x07, 1, false, "point.ProbePoint"),
+    rec(0x15, 1, true, "x"),
+    rec(0x08, 1, true, "label"),
+    rec(0x15, 1, false, "after"),
+  ]);
+  assert.deepEqual(parseGlobalDecls(payload), [
+    {
+      name: "point.ProbePoint",
+      type: 0x07,
+      kind: 1,
+      children: [
+        { name: "x", type: 0x15, kind: 1 },
+        { name: "label", type: 0x08, kind: 1 },
+      ],
+    },
+    { name: "after", type: 0x15, kind: 1 },
+  ]);
 });
 
 test("parseArrayDecls extracts the bare name up to the dimension parens", () => {

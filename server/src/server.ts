@@ -49,9 +49,9 @@ let helpIndexPromise: Promise<HelpIndex | undefined> | undefined;
 
 /** Fetches (or loads the cached) purebasic.com command index in the background;
  *  never blocks a caller — hover/help-url lookups just get no link until it resolves. */
-function ensureHelpIndex(): Promise<HelpIndex | undefined> {
+function ensureHelpIndex(forceRefresh = false): Promise<HelpIndex | undefined> {
   if (!helpIndexPromise) {
-    helpIndexPromise = loadOrFetchHelpIndex(cacheDir)
+    helpIndexPromise = loadOrFetchHelpIndex(cacheDir, forceRefresh)
       .then((index) => (helpIndex = index))
       .catch((error) => {
         connection.console.warn(`Pure Xtension: help index fetch failed: ${String(error)}`);
@@ -64,11 +64,11 @@ function ensureHelpIndex(): Promise<HelpIndex | undefined> {
 /** Memoizes on the in-flight promise (not just the resolved index) so concurrent
  *  completion/hover/signatureHelp calls on activation share one compiler build
  *  instead of each spawning pbcompiler and racing to write the same cache file. */
-function ensureBuiltinIndex(): Promise<BuiltinIndex | undefined> {
+function ensureBuiltinIndex(forceRebuild = false): Promise<BuiltinIndex | undefined> {
   if (builtinIndex) return Promise.resolve(builtinIndex);
   if (!compilerPath) return Promise.resolve(undefined);
   if (!builtinIndexPromise) {
-    builtinIndexPromise = loadOrBuildBuiltinIndex(compilerPath, cacheDir)
+    builtinIndexPromise = loadOrBuildBuiltinIndex(compilerPath, cacheDir, forceRebuild)
       .then((index) => (builtinIndex = index))
       .catch((error) => {
         connection.console.error(`Pure Xtension: failed to build symbol index: ${String(error)}`);
@@ -314,13 +314,13 @@ connection.onRequest("pureXtension/rebuildSymbolCache", async () => {
   builtinIndex = undefined;
   builtinIndexPromise = undefined;
   structureFieldsCache.clear();
-  await ensureBuiltinIndex();
+  await ensureBuiltinIndex(true);
 });
 
 connection.onRequest("pureXtension/rebuildHelpIndex", async () => {
   helpIndex = undefined;
   helpIndexPromise = undefined;
-  await ensureHelpIndex();
+  await ensureHelpIndex(true);
 });
 
 connection.onRequest(

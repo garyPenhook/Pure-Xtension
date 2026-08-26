@@ -92,6 +92,9 @@ export class PureBasicDebugSession extends DebugSession {
   private activeBreakpoints = new Set<number>();
   /** True while step() owns the run/stop cycle — the persistent "stopped" listener must stay silent (no StoppedEvent) until step() itself decides it's done. */
   private stepInProgress = false;
+  /** True while stopOnEntry is advancing from the debugger runtime's
+   * line-less startup wait to the first executable source statement. */
+  private entryDiscoveryInProgress = false;
   /**
    * Lines step() has temporarily breakpointed beyond `activeBreakpoints`,
    * live on the wire only while `stepInProgress` is true. Instance-level
@@ -114,6 +117,10 @@ export class PureBasicDebugSession extends DebugSession {
       this.resolveConfigurationDone = resolve;
     });
     this.pb.on("stopped", ({ line, reason }: { line: number; reason: number }) => {
+      // The target protocol reports its compiled-line index (0-based); DAP
+      // source lines are 1-based. Breakpoint requests use the same inverse
+      // conversion at every add/remove call below.
+      line += 1;
       // Capture the stop line before the stepInProgress early-return below, so
       // it stays current through step()'s internal run/stop loop too — by the
       // time step() sends its own StoppedEvent, this holds the final line.
@@ -125,15 +132,30 @@ export class PureBasicDebugSession extends DebugSession {
       // all-line breakpoints below), every intermediate stop is internal
       // bookkeeping, not a real user-visible stop — step() sends the one
       // StoppedEvent that actually matters once it's done deciding.
-      if (this.stepInProgress) return;
+      if (this.stepInProgress || this.entryDiscoveryInProgress) return;
       this.sendEvent(new StoppedEvent(reason === 7 ? "breakpoint" : "pause", MAIN_THREAD_ID));
     });
+    this.pb.on("terminated", () => this.notifyTerminated());
     this.pb.on("close", () => this.notifyTerminated());
     this.pb.on("error", (err) => this.logError(err));
   }
 
   private logError(err: unknown): void {
     this.sendEvent(new OutputEvent(`Pure Xtension debugger: ${String(err)}\n`, "stderr"));
+  }
+
+  /** Completes a DAP request with an actionable error when its asynchronous
+   * wire operation fails. DebugSession's dispatcher does not await async
+   * handlers, so an uncaught rejection would otherwise leave the client
+   * waiting forever for a response. */
+  private sendAsyncRequestError(
+    response: DebugProtocol.Response,
+    operation: string,
+    err: unknown,
+  ): void {
+    const detail = err instanceof Error ? err.message : String(err);
+    this.logError(err);
+    this.sendErrorResponse(response, 1090, `Pure Xtension: ${operation} failed: ${detail}`);
   }
 
   private notifyTerminated(): void {
@@ -186,6 +208,8 @@ export class PureBasicDebugSession extends DebugSession {
     response: DebugProtocol.LaunchResponse,
     args: LaunchArgs,
   ): Promise<void> {
+    let responseSent = false;
+    try {
     this.sourcePath = args.program;
     const backend = args.backend ?? resolveBackendSilent() ?? "asm";
     const compiler = resolveCompilerPath(backend);
@@ -269,17 +293,32 @@ export class PureBasicDebugSession extends DebugSession {
     this.flushBreakpointsToWire();
 
     this.sendResponse(response);
+    responseSent = true;
 
     if (args.stopOnEntry) {
-      // The target is already implicitly stopped-on-entry (PLAN.md M5:
-      // PB_DEBUGGER_Start blocks until a continue clears its stop flag) —
-      // no extra command needed to "arrive" at entry.
-      this.sendEvent(new StoppedEvent("entry", MAIN_THREAD_ID));
+      // PB_DEBUGGER_Start's implicit startup wait happens before the target
+      // has selected a source line, and it emits no stopped notification.
+      // Advance under temporary all-line breakpoint coverage so the first
+      // real executable statement supplies an exact line before we expose
+      // the DAP entry stop. See discoverEntryLine().
+      await this.configurationDone;
+      const foundEntry = await this.discoverEntryLine();
+      if (foundEntry) this.sendEvent(new StoppedEvent("entry", MAIN_THREAD_ID));
     } else {
       // Wait for configurationDone (fired once setBreakpoints has landed)
       // before releasing the target, so first-run breakpoints actually bind.
       await this.configurationDone;
       this.pb.continue();
+    }
+    } catch (err) {
+      this.pb.close();
+      this.child?.kill("SIGKILL");
+      this.cleanupTempDirs();
+      if (responseSent) {
+        this.logError(err);
+      } else {
+        this.sendAsyncRequestError(response, "debug launch", err);
+      }
     }
   }
 
@@ -287,6 +326,7 @@ export class PureBasicDebugSession extends DebugSession {
     response: DebugProtocol.SetBreakpointsResponse,
     args: DebugProtocol.SetBreakpointsArguments,
   ): Promise<void> {
+    try {
     const lines = args.breakpoints?.map((b) => b.line) ?? args.lines ?? [];
 
     // This adapter only ever compiles/debugs one module (args.program from
@@ -314,13 +354,16 @@ export class PureBasicDebugSession extends DebugSession {
       breakpoints: lines.map((line) => new Breakpoint(true, line)),
     };
     this.sendResponse(response);
+    } catch (err) {
+      this.sendAsyncRequestError(response, "setting breakpoints", err);
+    }
   }
 
   /** Replays `activeBreakpoints` (and, if a step is mid-flight, its temporary full-line coverage) onto the wire. Only safe to call once `pbConnected` is true. */
   private flushBreakpointsToWire(): void {
     this.pb.clearAllLineBreakpoints();
-    for (const line of this.activeBreakpoints) this.pb.addLineBreakpoint(line);
-    if (this.stepInProgress) {
+    for (const line of this.activeBreakpoints) this.pb.addLineBreakpoint(line - 1);
+    if (this.stepInProgress || this.entryDiscoveryInProgress) {
       // The clearAllLineBreakpoints() above just wiped step()'s full-line
       // temporary coverage too (it's target-wide, not scoped to "real"
       // breakpoints) — re-lay it now so the in-flight step still stops at
@@ -329,11 +372,69 @@ export class PureBasicDebugSession extends DebugSession {
       this.stepTempLines.clear();
       for (let line = 1; line <= this.totalLines; line++) {
         if (!this.activeBreakpoints.has(line)) {
-          this.pb.addLineBreakpoint(line);
+          this.pb.addLineBreakpoint(line - 1);
           this.stepTempLines.add(line);
         }
       }
     }
+  }
+
+  /**
+   * Resolves PureBasic's real entry line without trying to parse source text.
+   * The debugger runtime initially waits inside PB_DEBUGGER_Start, before any
+   * source line is current and without sending a stopped message. Breakpoint
+   * opcode 3 accepts every requested source line and snaps non-executable
+   * lines to real statements, so covering the whole compiled module and
+   * continuing once stops at the first statement before it executes. The
+   * normal stopped listener records that exact line in lastStopLine while
+   * entryDiscoveryInProgress suppresses its internal breakpoint event.
+   */
+  private async discoverEntryLine(): Promise<boolean> {
+    this.entryDiscoveryInProgress = true;
+    try {
+      this.stepTempLines.clear();
+      for (let line = 1; line <= this.totalLines; line++) {
+        if (!this.activeBreakpoints.has(line)) {
+          this.pb.addLineBreakpoint(line - 1);
+          this.stepTempLines.add(line);
+        }
+      }
+      return (await this.continueUntilStopOrClose()) === "stopped";
+    } finally {
+      // A breakpoint edit during this internal run can promote a temporary
+      // line to a real breakpoint, so activeBreakpoints remains authoritative.
+      for (const line of this.stepTempLines) {
+        if (!this.activeBreakpoints.has(line)) this.pb.removeLineBreakpoint(line - 1);
+      }
+      this.stepTempLines.clear();
+      this.entryDiscoveryInProgress = false;
+    }
+  }
+
+  /** Continue once, resolving on either the next stop or any session-ending
+   * event. Listeners are installed first so even an immediate stop is safe. */
+  private continueUntilStopOrClose(): Promise<"stopped" | "closed"> {
+    return new Promise((resolve) => {
+      const cleanup = () => {
+        this.pb.off("stopped", onStopped);
+        this.pb.off("terminated", onClosed);
+        this.pb.off("close", onClosed);
+        this.pb.off("error", onClosed);
+      };
+      const onStopped = () => {
+        cleanup();
+        resolve("stopped");
+      };
+      const onClosed = () => {
+        cleanup();
+        resolve("closed");
+      };
+      this.pb.once("stopped", onStopped);
+      this.pb.once("terminated", onClosed);
+      this.pb.once("close", onClosed);
+      this.pb.once("error", onClosed);
+      this.pb.continue();
+    });
   }
 
   protected continueRequest(
@@ -354,17 +455,17 @@ export class PureBasicDebugSession extends DebugSession {
 
   protected nextRequest(response: DebugProtocol.NextResponse, _args: DebugProtocol.NextArguments): void {
     this.sendResponse(response);
-    void this.step("over");
+    void this.step("over").catch((err) => this.logError(err));
   }
 
   protected stepInRequest(response: DebugProtocol.StepInResponse, _args: DebugProtocol.StepInArguments): void {
     this.sendResponse(response);
-    void this.step("in");
+    void this.step("in").catch((err) => this.logError(err));
   }
 
   protected stepOutRequest(response: DebugProtocol.StepOutResponse, _args: DebugProtocol.StepOutArguments): void {
     this.sendResponse(response);
-    void this.step("out");
+    void this.step("out").catch((err) => this.logError(err));
   }
 
   /**
@@ -403,16 +504,15 @@ export class PureBasicDebugSession extends DebugSession {
       this.stepTempLines.clear();
       for (let line = 1; line <= this.totalLines; line++) {
         if (!this.activeBreakpoints.has(line)) {
-          this.pb.addLineBreakpoint(line);
+          this.pb.addLineBreakpoint(line - 1);
           this.stepTempLines.add(line);
         }
       }
 
       for (;;) {
-        // Races the next real stop against the connection dying mid-step
-        // (target crash, FIFO read error, or the user hitting Stop) — the
-        // wire protocol only ever emits "stopped", never a dedicated
-        // give-up signal, so without this a step that never reaches another
+        // Races the next real stop against the run ending mid-step (normal
+        // termination, target crash, FIFO read error, or the user hitting
+        // Stop). Without this, a step that never reaches another
         // executable line (target killed, connection dropped) would leave
         // this promise — and stepInProgress — pending forever. Listeners
         // must be attached before continue() fires, not after; each side
@@ -420,25 +520,7 @@ export class PureBasicDebugSession extends DebugSession {
         // iterations of this loop) doesn't accumulate dangling `once`
         // listeners on `this.pb` and eventually hit Node's max-listeners
         // warning.
-        const outcome = await new Promise<"stopped" | "closed">((resolve) => {
-          const cleanup = () => {
-            this.pb.off("stopped", onStopped);
-            this.pb.off("close", onClosed);
-            this.pb.off("error", onClosed);
-          };
-          const onStopped = () => {
-            cleanup();
-            resolve("stopped");
-          };
-          const onClosed = () => {
-            cleanup();
-            resolve("closed");
-          };
-          this.pb.once("stopped", onStopped);
-          this.pb.once("close", onClosed);
-          this.pb.once("error", onClosed);
-          this.pb.continue();
-        });
+        const outcome = await this.continueUntilStopOrClose();
         if (outcome === "closed") return;
         if (mode === "in") break;
         const depth = (await this.pb.stackTrace()).length;
@@ -452,7 +534,7 @@ export class PureBasicDebugSession extends DebugSession {
       // breakpoint — either way activeBreakpoints is the source of truth
       // for what should survive.
       for (const line of this.stepTempLines) {
-        if (!this.activeBreakpoints.has(line)) this.pb.removeLineBreakpoint(line);
+        if (!this.activeBreakpoints.has(line)) this.pb.removeLineBreakpoint(line - 1);
       }
       this.stepTempLines.clear();
       this.stepInProgress = false;
@@ -469,6 +551,7 @@ export class PureBasicDebugSession extends DebugSession {
     response: DebugProtocol.StackTraceResponse,
     _args: DebugProtocol.StackTraceArguments,
   ): Promise<void> {
+    try {
     const pbFrames = await this.pb.stackTrace(); // opcode 16: procedure frames only, outermost-first
     this.frameHandles.clear();
     const source = new Source(path.basename(this.sourcePath), this.sourcePath);
@@ -500,6 +583,9 @@ export class PureBasicDebugSession extends DebugSession {
 
     response.body = { stackFrames: frames, totalFrames: frames.length };
     this.sendResponse(response);
+    } catch (err) {
+      this.sendAsyncRequestError(response, "reading the stack trace", err);
+    }
   }
 
   protected scopesRequest(
@@ -533,6 +619,7 @@ export class PureBasicDebugSession extends DebugSession {
     response: DebugProtocol.VariablesResponse,
     args: DebugProtocol.VariablesArguments,
   ): Promise<void> {
+    try {
     const ref = args.variablesReference;
 
     if (ref >= COMPOUND_REF_BASE) {
@@ -628,6 +715,23 @@ export class PureBasicDebugSession extends DebugSession {
       const decls = await this.pb.examineModuleScope();
       for (const d of decls) {
         if (containerNames.has(d.name)) continue;
+        if (d.children) {
+          const expression = d.name.split(".", 1)[0];
+          const children: PbVariable[] = [];
+          for (const field of d.children) {
+            const result = await this.pb.evaluate(`${expression}\\${field.name}`);
+            children.push({
+              type: field.type,
+              kind: field.kind,
+              name: field.name,
+              value: result.value ?? result.error ?? "<unavailable>",
+            });
+          }
+          variables.push(
+            new Variable(d.name, "{...}", this.registerCompound({ kind: "struct", children })),
+          );
+          continue;
+        }
         // evaluate() always runs against the currently-stopped line
         // (frameContext -1, the only mode PLAN.md's spike live-tested — see
         // evaluateRequest's doc comment) rather than a mode scoped to this
@@ -662,12 +766,16 @@ export class PureBasicDebugSession extends DebugSession {
 
     response.body = { variables };
     this.sendResponse(response);
+    } catch (err) {
+      this.sendAsyncRequestError(response, "reading variables", err);
+    }
   }
 
   protected async evaluateRequest(
     response: DebugProtocol.EvaluateResponse,
     args: DebugProtocol.EvaluateArguments,
   ): Promise<void> {
+    try {
     // frameId isn't threaded through here yet — every evaluate runs against
     // the currently-stopped line (frameContext -1), the only case PLAN.md's
     // M5 spike live-tested. Evaluating in an outer frame's context is an
@@ -680,12 +788,16 @@ export class PureBasicDebugSession extends DebugSession {
     }
     response.body = { result: result.value ?? "", variablesReference: 0 };
     this.sendResponse(response);
+    } catch (err) {
+      this.sendAsyncRequestError(response, "evaluating the expression", err);
+    }
   }
 
   protected async setVariableRequest(
     response: DebugProtocol.SetVariableResponse,
     args: DebugProtocol.SetVariableArguments,
   ): Promise<void> {
+    try {
     // Same frame-context caveat as evaluateRequest: only the currently-
     // stopped line's scope is wired up, since that's the only case PLAN.md's
     // M5 spike live-tested for opcode 35.
@@ -696,6 +808,9 @@ export class PureBasicDebugSession extends DebugSession {
     }
     response.body = { value: result.value ?? "" };
     this.sendResponse(response);
+    } catch (err) {
+      this.sendAsyncRequestError(response, "setting the variable", err);
+    }
   }
 
   protected disconnectRequest(

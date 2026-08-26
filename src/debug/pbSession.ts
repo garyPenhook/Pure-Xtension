@@ -53,6 +53,11 @@ export const BP_BULK_CLEAR_ALL = -1;
 
 // Message types seen on the wire (unsolicited unless noted).
 export const MSG_HELLO = 0;
+// PB_DEBUGGER_EndExternal sends this header-only message immediately before
+// tearing down the external-debugger transport (live-confirmed; see PLAN.md
+// M6). It is unsolicited, just like MSG_STOPPED, and must not be mistaken for
+// the reply to an in-flight request.
+export const MSG_TERMINATED = 1;
 export const MSG_STOPPED = 3; // f8 = 1-based line, f12 = stop-reason code
 
 export interface PbMessage {
@@ -106,6 +111,8 @@ export interface PbGlobalDecl {
   type: number;
   /** 0 = module-scope `Define`, 1 = `Global` (the record's scope-flag byte). */
   kind: number;
+  /** Nested declarations following a structure header (opcode 9's nonzero reserved/nesting field). */
+  children?: PbGlobalDecl[];
 }
 
 export interface PbArrayElement {
@@ -260,21 +267,28 @@ export function parseVariables(payload: Buffer): PbVariable[] {
 // module-scope names from any stop context (live-confirmed from inside a
 // procedure too).
 //
-// NOT YET LIVE-TESTED: a module-scope *structure* variable. parseVariables'
-// structure records (STRUCT_TYPE_TAG, no value, "reserved" field reused as a
-// nesting flag — see its own comment above) were only confirmed for opcode
-// 11/17's frame-scoped stream; if opcode 9 uses a different/no pad byte for
-// a structure header, this loop's fixed "+1 pad byte" would desync every
-// record after it. Flagged, not guessed at — same policy as the LinkedList
-// element gap (PLAN.md M5).
+// Module-scope structures were live-confirmed against fifo-globals-probe.mjs:
+// their header and nested field records use the same trailing pad byte as
+// scalars, and the reserved/nesting flag has the same meaning as opcode
+// 11/17. Group those fields under their structure instead of exposing them as
+// unrelated module variables.
 export function parseGlobalDecls(payload: Buffer): PbGlobalDecl[] {
-  const decls: PbGlobalDecl[] = [];
+  const flat: Array<PbGlobalDecl & { nested: boolean }> = [];
   let off = 0;
   for (;;) {
     const header = readHeaderAndName(payload, off);
     if (!header) break;
     off = header.next + 1; // past the name's NUL terminator + 1 trailing pad byte (0x00 in every observed record)
-    decls.push({ name: header.name, type: header.type, kind: header.kind });
+    flat.push({ name: header.name, type: header.type, kind: header.kind, nested: header.nested });
+  }
+  const decls: PbGlobalDecl[] = [];
+  for (const { nested, ...decl } of flat) {
+    const parent = decls[decls.length - 1];
+    if (nested && parent?.type === STRUCT_TYPE_TAG) {
+      (parent.children ??= []).push(decl);
+    } else {
+      decls.push(decl);
+    }
   }
   return decls;
 }
@@ -484,14 +498,7 @@ export class PbDebugSession extends EventEmitter {
       this.emit("error", err);
     });
 
-    const hello = this.nextMessage();
-    const timeout = new Promise<PbMessage>((_, reject) => {
-      setTimeout(
-        () => reject(new Error(`timed out after ${timeoutMs}ms waiting for the debugger to connect`)),
-        timeoutMs,
-      ).unref();
-    });
-    return Promise.race([hello, timeout]);
+    return this.nextMessageWithTimeout(timeoutMs, "the debugger to connect");
   }
 
   private drainMessages(): void {
@@ -524,6 +531,10 @@ export class PbDebugSession extends EventEmitter {
   }
 
   private dispatch(msg: PbMessage): void {
+    if (msg.type === MSG_TERMINATED) {
+      this.emit("terminated");
+      return;
+    }
     if (msg.type === MSG_STOPPED) {
       this.emit("stopped", { line: msg.f8, reason: msg.f12 });
       return;
@@ -540,6 +551,34 @@ export class PbDebugSession extends EventEmitter {
     const buffered = this.unclaimed.shift();
     if (buffered) return Promise.resolve(buffered);
     return new Promise((resolve, reject) => this.pending.push({ resolve, reject }));
+  }
+
+  /** Waits for one message without leaving an abandoned waiter behind when
+   * the deadline expires. A stale waiter would consume the next real wire
+   * message and permanently shift request/reply matching. */
+  private nextMessageWithTimeout(timeoutMs: number, description: string): Promise<PbMessage> {
+    const buffered = this.unclaimed.shift();
+    if (buffered) return Promise.resolve(buffered);
+
+    return new Promise((resolve, reject) => {
+      const waiter = {
+        resolve: (msg: PbMessage) => {
+          clearTimeout(timer);
+          resolve(msg);
+        },
+        reject: (err: Error) => {
+          clearTimeout(timer);
+          reject(err);
+        },
+      };
+      const timer = setTimeout(() => {
+        const index = this.pending.indexOf(waiter);
+        if (index !== -1) this.pending.splice(index, 1);
+        reject(new Error(`timed out after ${timeoutMs}ms waiting for ${description}`));
+      }, timeoutMs);
+      timer.unref();
+      this.pending.push(waiter);
+    });
   }
 
   /** Drains and rejects every outstanding request so a dead connection can't hang a caller forever. */
@@ -573,28 +612,25 @@ export class PbDebugSession extends EventEmitter {
   }
 
   private write(opcode: number, f8 = 0, f12 = 0, f16 = 0, payload?: Buffer, len = 0): void {
+    const stream = this.writeStream;
+    if (!stream) {
+      throw new Error("debugger session closed");
+    }
     const buf = Buffer.alloc(HEADER_SIZE);
     buf.writeInt32LE(opcode, 0);
     buf.writeInt32LE(len, 4);
     buf.writeInt32LE(f8, 8);
     buf.writeInt32LE(f12, 12);
     buf.writeInt32LE(f16, 16);
-    this.writeStream!.write(buf);
-    if (payload) this.writeStream!.write(payload);
+    stream.write(buf);
+    if (payload) stream.write(payload);
   }
 
   /** Drain the unconditional startup announcement sent right after `hello`. Bounded the same way
    *  {@link connect} is — an unconditional await here would otherwise hang launchRequest forever
    *  if the target sent hello but never followed up with the announcement. */
   drainStartupAnnouncement(timeoutMs = 10000): Promise<PbMessage> {
-    const message = this.nextMessage();
-    const timeout = new Promise<PbMessage>((_, reject) => {
-      setTimeout(
-        () => reject(new Error(`timed out after ${timeoutMs}ms waiting for the debugger's startup announcement`)),
-        timeoutMs,
-      ).unref();
-    });
-    return Promise.race([message, timeout]);
+    return this.nextMessageWithTimeout(timeoutMs, "the debugger's startup announcement");
   }
 
   /** Opcode 2: unconditionally clears the target's stop flag and lets it run. */
@@ -602,10 +638,12 @@ export class PbDebugSession extends EventEmitter {
     this.write(OP_CONTINUE, 0);
   }
 
+  /** Adds a breakpoint by the wire protocol's 0-based compiled-line index. */
   addLineBreakpoint(line: number, moduleId = 0): void {
     this.write(OP_BREAKPOINTS, BP_ADD_LINE, (moduleId << 20) | line);
   }
 
+  /** Removes a breakpoint by the wire protocol's 0-based compiled-line index. */
   removeLineBreakpoint(line: number, moduleId = 0): void {
     this.write(OP_BREAKPOINTS, BP_REMOVE_LINE, (moduleId << 20) | line);
   }

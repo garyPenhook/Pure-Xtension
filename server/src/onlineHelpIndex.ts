@@ -53,9 +53,12 @@ async function readCache(cacheDir: string): Promise<HelpIndex | undefined> {
 
 /** Loads a fresh-enough disk cache, otherwise re-fetches from purebasic.com and
  *  persists the result. Falls back to a stale cache (or undefined) if offline. */
-export async function loadOrFetchHelpIndex(cacheDir: string): Promise<HelpIndex | undefined> {
+export async function loadOrFetchHelpIndex(
+  cacheDir: string,
+  forceRefresh = false,
+): Promise<HelpIndex | undefined> {
   const cached = await readCache(cacheDir);
-  if (cached && Date.now() - cached.fetchedAt < CACHE_TTL_MS) return cached;
+  if (!forceRefresh && cached && Date.now() - cached.fetchedAt < CACHE_TTL_MS) return cached;
 
   try {
     const fresh = await fetchHelpIndex();

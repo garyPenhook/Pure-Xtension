@@ -10,7 +10,6 @@ test/**
 out-test/**
 PLAN.md
 purebasic.asm
-*.png
 *.vsix
 src/**
 server/**

@@ -104,15 +104,18 @@ function cacheFile(cacheDir: string, version: string): string {
 export async function loadOrBuildBuiltinIndex(
   compilerPath: string,
   cacheDir: string,
+  forceRebuild = false,
 ): Promise<BuiltinIndex> {
   const version = await detectVersion(compilerPath);
   const file = cacheFile(cacheDir, version);
 
-  try {
-    const cached = JSON.parse(await readFile(file, "utf8")) as BuiltinIndex;
-    if (cached.compilerVersion === version) return cached;
-  } catch {
-    // no cache yet, or unreadable — fall through and rebuild.
+  if (!forceRebuild) {
+    try {
+      const cached = JSON.parse(await readFile(file, "utf8")) as BuiltinIndex;
+      if (cached.compilerVersion === version) return cached;
+    } catch {
+      // no cache yet, or unreadable — fall through and rebuild.
+    }
   }
 
   const index = await buildBuiltinIndex(compilerPath, version);

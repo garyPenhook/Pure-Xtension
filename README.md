@@ -59,7 +59,10 @@ configuration:
   back to a variable.
 - One known limitation: a `List<String>` can't show every element's text
   individually (a limitation of PureBasic's own debugger, not this
-  extension) — its current element is shown instead.
+  extension) — its current element is shown instead. To inspect every string,
+  temporarily iterate the list inside the PureBasic program with `ForEach`
+  and `Debug`, or evaluate a watch expression while the program itself moves
+  the list cursor. The external debugger cannot move that cursor for you.
 
 ## Requirements
 

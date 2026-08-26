@@ -4,6 +4,7 @@
   "description": "PureBasic language support for VS Code: syntax highlighting, IntelliSense, build tasks, deep help integration, and debugging.",
   "version": "0.1.4",
   "publisher": "local",
+  "icon": "images/icon.png",
   "private": true,
   "license": "MIT",
   "repository": {
