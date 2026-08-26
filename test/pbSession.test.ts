@@ -9,6 +9,7 @@ import {
   PbDebugSession,
   parseArrayDecls,
   parseArrayElements,
+  parseDebugOutputText,
   parseEvaluateReply,
   parseFrames,
   parseGlobalDecls,
@@ -43,6 +44,44 @@ test("a timed-out message wait does not consume the next request's reply", async
   };
   internals.dispatch(expected);
   assert.equal(await reply, expected);
+});
+
+function capturedControlHeader(send: (session: PbDebugSession) => void): Buffer {
+  const session = new PbDebugSession();
+  const writes: Buffer[] = [];
+  // These tests exercise the public control methods without needing a FIFO.
+  // `write()` only requires a stream-like object with `write(Buffer)`.
+  (session as unknown as { writeStream: { write(chunk: Buffer): boolean } }).writeStream = {
+    write(chunk: Buffer): boolean {
+      writes.push(Buffer.from(chunk));
+      return true;
+    },
+  };
+  send(session);
+  assert.equal(writes.length, 1, "a header-only control command should write exactly one buffer");
+  return writes[0];
+}
+
+test("native execution-control methods encode the M9 opcode/value pairs", () => {
+  const pause = capturedControlHeader((s) => s.pause());
+  assert.deepEqual([pause.readInt32LE(0), pause.readInt32LE(4), pause.readInt32LE(8)], [0, 0, 0]);
+
+  const into = capturedControlHeader((s) => s.stepInto(3));
+  assert.deepEqual([into.readInt32LE(0), into.readInt32LE(4), into.readInt32LE(8)], [1, 0, 3]);
+
+  const over = capturedControlHeader((s) => s.stepOver());
+  assert.deepEqual([over.readInt32LE(0), over.readInt32LE(4), over.readInt32LE(8)], [1, 0, -1]);
+
+  const out = capturedControlHeader((s) => s.stepOut());
+  assert.deepEqual([out.readInt32LE(0), out.readInt32LE(4), out.readInt32LE(8)], [1, 0, -2]);
+
+  const run = capturedControlHeader((s) => s.continue());
+  assert.deepEqual([run.readInt32LE(0), run.readInt32LE(4), run.readInt32LE(8)], [2, 0, 1]);
+});
+
+test("stepInto rejects invalid wire counts before writing", () => {
+  assert.throws(() => capturedControlHeader((s) => s.stepInto(0)), /positive int32/);
+  assert.throws(() => capturedControlHeader((s) => s.stepInto(0x80000000)), /positive int32/);
 });
 
 function nulString(s: string): Buffer {
@@ -274,6 +313,24 @@ test("parseEvaluateReply decodes a numeric reply (kind 1-3) as a raw LE int64", 
 test("parseEvaluateReply decodes a string reply (kind 4)", () => {
   const result = parseEvaluateReply(fakeMessage(4, nulString("beta")));
   assert.deepEqual(result, { kind: 4, value: "beta" });
+});
+
+test("parseDebugOutputText decodes a NUL-terminated string, ignoring anything after the NUL", () => {
+  assert.equal(parseDebugOutputText(nulString("line4")), "line4");
+});
+
+test("parseDebugOutputText decodes a live-confirmed truncated payload (first half of the real text, zero-padded)", () => {
+  // Real capture: `Debug "line4 c=" + Str(c)` (9 chars + NUL = 10 bytes
+  // intended) arrives as only "line4" (5 bytes) plus 5 zero-padding bytes --
+  // PureBasic's own debugger.a runtime bug, not a parser bug (see
+  // parseDebugOutputText's doc comment). The parser's job is just to decode
+  // whatever arrived, truncated or not.
+  const payload = Buffer.from("6c696e65340000000000", "hex");
+  assert.equal(parseDebugOutputText(payload), "line4");
+});
+
+test("parseDebugOutputText returns the whole payload verbatim if it never finds a NUL", () => {
+  assert.equal(parseDebugOutputText(Buffer.from("no-nul-here", "latin1")), "no-nul-here");
 });
 
 test("parseEvaluateReply surfaces an unrecognized kind (e.g. 5, structure) as unsupported", () => {

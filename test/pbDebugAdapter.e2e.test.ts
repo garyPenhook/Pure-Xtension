@@ -12,7 +12,8 @@
 // display": the adapter is a stdio DAP server, so it never needed a display —
 // only a harness that speaks DAP to it. No VS Code, no Xvfb. Standing this up
 // is what surfaced (and let us fix) the module-scope stack-frame bug and pin
-// down the real limits of the step emulation — see PLAN.md M6.
+// down earlier adapter edge cases. Native step controls are separately
+// verified below against the real target (PLAN.md M9).
 //
 // It self-skips when no PureBasic compiler is installed (e.g. GitHub CI), so it
 // stays green there while still running locally wherever the toolchain exists.
@@ -180,6 +181,26 @@ test("module-scope stop: synthesizes a main frame, reads module locals, and step
     // PB_DEBUGGER_EndExternal emits wire message type 1 before it tears down
     // the transport. The adapter must surface that as DAP termination without
     // requiring the user to press Stop.
+    await Promise.all([
+      dc.continueRequest({ threadId: MAIN_THREAD_ID }),
+      dc.waitForEvent("terminated"),
+    ]);
+  } finally {
+    await dc.stop();
+  }
+});
+
+test("native step-in descends into a called procedure", { skip }, async () => {
+  const dc = await launchToBreakpoint(MODULE_BP);
+  try {
+    // M9 established that command 1/value1=1 is the target's real step-into
+    // operation. The old all-line-breakpoint reconstruction could only step
+    // over this call line; this must now land with Add as the innermost frame.
+    await Promise.all([dc.stepInRequest({ threadId: MAIN_THREAD_ID }), dc.assertStoppedLocation("step", {})]);
+    const after = await frames(dc);
+    assert.equal(after.length, 2, "step in should add the Add procedure frame above main");
+    assert.match(after[0].name, /Add/, "native step in should be stopped inside Add");
+
     await Promise.all([
       dc.continueRequest({ threadId: MAIN_THREAD_ID }),
       dc.waitForEvent("terminated"),

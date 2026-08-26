@@ -12,9 +12,13 @@ const HEADER_SIZE = 20;
 // real payloads (variable/array/list dumps) are a few KB at most.
 const MAX_MESSAGE_LEN = 16 * 1024 * 1024;
 
-// Opcodes confirmed live (PLAN.md M5).
-export const OP_CONTROL = 0; // sub-commands via f8; only "continue" (below) is used here
-export const OP_CONTINUE = 2; // Control, unconditionally clears the stop flag
+// Execution-control opcodes, captured from the real PureBasic 6.41 standalone
+// debugger (PLAN.md M9). These are independent top-level commands; command 2
+// is run/continue only, not a step sub-command as the older M5 experiments
+// incorrectly inferred.
+export const OP_PAUSE = 0; // cooperative: stops at the next PB_DEBUGGER_Check
+export const OP_STEP = 1; // f8: positive count, -1 over, -2 out
+export const OP_CONTINUE = 2; // f8=1 also requests MSG_CONTINUED acknowledgement
 export const OP_BREAKPOINTS = 3; // 7-way sub-dispatch on f8
 export const OP_EXAMINE_GLOBALS = 9; // ExamineVariables(-1)
 export const OP_EXAMINE_CONTINUE = 10;
@@ -58,7 +62,30 @@ export const MSG_HELLO = 0;
 // M6). It is unsolicited, just like MSG_STOPPED, and must not be mistaken for
 // the reply to an in-flight request.
 export const MSG_TERMINATED = 1;
-export const MSG_STOPPED = 3; // f8 = 1-based line, f12 = stop-reason code
+// PB_DEBUGGER_Start's own unconditional second startup announcement, sent
+// once right after MSG_HELLO regardless of anything the client does (PLAN.md
+// M5, "type=2, f12=0x20002"). Unsolicited, not a reply to any request.
+export const MSG_STARTUP_ANNOUNCEMENT = 2;
+export const MSG_STOPPED = 3; // f8 = 0-based compiled-line index (matches addLineBreakpoint's convention), f12 = stop-reason code
+// Sent in response to OP_CONTINUE with f8=1. It is an acknowledgement, not a
+// request/reply payload, so dispatch it as an event rather than allowing it to
+// accumulate in the unmatched-message queue.
+export const MSG_CONTINUED = 4;
+// Debug-statement output notification (`Debug "..."`), confirmed live: fires
+// as a side effect of a `Debug` statement executing, independent of the
+// stdout capture pbDebugAdapter.ts already uses for the Debug Console.
+// Unsolicited -- was previously unhandled by dispatch() and could be
+// silently consumed as if it were the reply to an unrelated request issued
+// shortly after a `continue` that runs past a `Debug` line (confirmed by
+// live repro: evaluate() returned a bogus kind-0 "error" whose message was
+// literally the executed line's Debug string).
+export const MSG_DEBUG_OUTPUT = 5;
+// ExternalDebugger_Expression's reply tag for both the read side (opcode 33)
+// and, per PLAN.md M5, the write side (opcode 35, "shares opcode 33/34's
+// layout") -- confirmed empirically here (not previously documented with a
+// numeric value in PLAN.md): a live evaluate("a") request's matching reply
+// arrived tagged type 36.
+export const MSG_EVALUATE_REPLY = 36;
 
 export interface PbMessage {
   type: number;
@@ -167,6 +194,39 @@ export function parseEvaluateReply(msg: PbMessage): PbEvaluateResult {
     return { kind: 4, value };
   }
   return { kind: msg.f12, error: `unsupported evaluate result kind ${msg.f12} (structure results are not decoded yet)` };
+}
+
+/**
+ * MSG_DEBUG_OUTPUT (type 5): a `Debug` statement's formatted text, sent
+ * instead of (not in addition to) the target's stdout once an external
+ * debugger is attached — a plain `-d` run with no debugger connected prints
+ * `[Debugger] <text>` to stdout via a completely different code path
+ * (`PB_DEBUGGER_xfprint_string`, confirmed by disassembly: `PB_DEBUGGER_
+ * PrintString` branches on whether an external debugger is connected before
+ * choosing stdout vs. this wire message, never both).
+ *
+ * **Confirmed truncation bug in PureBasic's own `debugger.a` runtime, not
+ * fixable here.** `PB_DEBUGGER_PrintString` converts the statement's already
+ * -UTF-16 text (confirmed live via gdb: the argument register points at a
+ * proper 2-byte-per-character string right before the call) down to the
+ * wire's single-byte encoding before sending. That conversion reliably
+ * delivers only the first `floor(fullLength / 2)` bytes of the intended
+ * text — confirmed across four independent live samples with a minimal
+ * fixture compiled fresh for this: `"line4 c=3"` (10 bytes incl. NUL) → 5
+ * real bytes then zero-padding; `"helloworld"` (11 bytes) → 5; `"a b c d e f
+ * g"` (14 bytes) → 7; `"hi"` (3 bytes) → 1 — every case losing exactly the
+ * back half, not a fixed byte count. The missing half is never transmitted
+ * at all (confirmed: the wire message's own declared length still matches
+ * the *full* intended size, only the payload content is short), so there is
+ * no way to recover it from this side of the connection — this is a sender
+ * -side bug, not a decode gap. Surfacing the surviving (correct, just
+ * incomplete) prefix is still real diagnostic value, so this parser exposes
+ * it plainly rather than discarding the message; callers should treat any
+ * text from here as potentially truncated, not authoritative.
+ */
+export function parseDebugOutputText(payload: Buffer): string {
+  const nul = payload.indexOf(0);
+  return nul === -1 ? payload.toString("latin1") : payload.toString("latin1", 0, nul);
 }
 
 export function parseFrames(payload: Buffer): PbFrame[] {
@@ -452,19 +512,28 @@ export function parseListElements(payload: Buffer, elementCount: number): { name
   return { name, elements };
 }
 
+interface PendingWaiter {
+  resolve: (msg: PbMessage) => void;
+  reject: (err: Error) => void;
+  /** Which reply type(s) this waiter is allowed to accept; `undefined` accepts any. */
+  expectedType?: number | number[];
+}
+
 /**
  * Live connection to a PureBasic `-d` build's embedded external debugger,
  * over the FIFO transport (`PB_DEBUGGER_Communication=FifoFiles;<out>;<in>`).
- * Emits `stopped` ({ line, reason }) for unsolicited stop notifications;
- * every other request/response pair is a simple send-then-await-next-message,
- * which is what PLAN.md's live spikes verified is safe while the target is
- * either stopped or the adapter isn't racing a `continue` against a poll.
+ * Emits `stopped` ({ line, reason }) for unsolicited stop notifications and
+ * `debugOutput` (string, possibly truncated — see {@link parseDebugOutputText})
+ * for `Debug` statement text; every other request/response pair is a simple
+ * send-then-await-next-message, which is what PLAN.md's live spikes verified
+ * is safe while the target is either stopped or the adapter isn't racing a
+ * `continue` against a poll.
  */
 export class PbDebugSession extends EventEmitter {
   private writeStream?: fs.WriteStream;
   private readStream?: fs.ReadStream;
   private recvBuffer = Buffer.alloc(0);
-  private pending: { resolve: (msg: PbMessage) => void; reject: (err: Error) => void }[] = [];
+  private pending: PendingWaiter[] = [];
   private unclaimed: PbMessage[] = [];
 
   /**
@@ -498,7 +567,7 @@ export class PbDebugSession extends EventEmitter {
       this.emit("error", err);
     });
 
-    return this.nextMessageWithTimeout(timeoutMs, "the debugger to connect");
+    return this.nextMessageWithTimeout(timeoutMs, "the debugger to connect", MSG_HELLO);
   }
 
   private drainMessages(): void {
@@ -530,6 +599,16 @@ export class PbDebugSession extends EventEmitter {
     }
   }
 
+  /** True if `msg.type` satisfies `expectedType` — `undefined` accepts any type
+   * (used only where the confirmed reply type isn't fully known, e.g. an
+   * expression-evaluator error reply's tag was never pinned down; see
+   * {@link examineExpression}). */
+  private static matchesType(msg: PbMessage, expectedType: PendingWaiter["expectedType"]): boolean {
+    if (expectedType === undefined) return true;
+    if (Array.isArray(expectedType)) return expectedType.includes(msg.type);
+    return msg.type === expectedType;
+  }
+
   private dispatch(msg: PbMessage): void {
     if (msg.type === MSG_TERMINATED) {
       this.emit("terminated");
@@ -539,29 +618,46 @@ export class PbDebugSession extends EventEmitter {
       this.emit("stopped", { line: msg.f8, reason: msg.f12 });
       return;
     }
-    const pending = this.pending.shift();
-    if (pending) {
-      pending.resolve(msg);
+    if (msg.type === MSG_CONTINUED) {
+      this.emit("continued");
+      return;
+    }
+    if (msg.type === MSG_DEBUG_OUTPUT) {
+      this.emit("debugOutput", parseDebugOutputText(msg.payload));
+      return;
+    }
+    // Only ever one request in flight at a time (see serialize()), so the
+    // front of the queue is the only waiter that could possibly be for this
+    // message. Matching by type — not just "whichever waiter is next" — is
+    // what stops an unsolicited notification (MSG_DEBUG_OUTPUT, or any other
+    // spontaneous message the target sends between requests, confirmed live
+    // in PLAN.md's M5 spike notes) from being silently handed to an unrelated
+    // pending request as if it were that request's real reply.
+    const front = this.pending[0];
+    if (front && PbDebugSession.matchesType(msg, front.expectedType)) {
+      this.pending.shift();
+      front.resolve(msg);
     } else {
       this.unclaimed.push(msg);
     }
   }
 
-  private nextMessage(): Promise<PbMessage> {
-    const buffered = this.unclaimed.shift();
-    if (buffered) return Promise.resolve(buffered);
-    return new Promise((resolve, reject) => this.pending.push({ resolve, reject }));
+  private nextMessage(expectedType?: number | number[]): Promise<PbMessage> {
+    const index = this.unclaimed.findIndex((msg) => PbDebugSession.matchesType(msg, expectedType));
+    if (index !== -1) return Promise.resolve(this.unclaimed.splice(index, 1)[0]);
+    return new Promise((resolve, reject) => this.pending.push({ resolve, reject, expectedType }));
   }
 
   /** Waits for one message without leaving an abandoned waiter behind when
    * the deadline expires. A stale waiter would consume the next real wire
    * message and permanently shift request/reply matching. */
-  private nextMessageWithTimeout(timeoutMs: number, description: string): Promise<PbMessage> {
-    const buffered = this.unclaimed.shift();
-    if (buffered) return Promise.resolve(buffered);
+  private nextMessageWithTimeout(timeoutMs: number, description: string, expectedType?: number | number[]): Promise<PbMessage> {
+    const index = this.unclaimed.findIndex((msg) => PbDebugSession.matchesType(msg, expectedType));
+    if (index !== -1) return Promise.resolve(this.unclaimed.splice(index, 1)[0]);
 
     return new Promise((resolve, reject) => {
-      const waiter = {
+      const waiter: PendingWaiter = {
+        expectedType,
         resolve: (msg: PbMessage) => {
           clearTimeout(timer);
           resolve(msg);
@@ -584,8 +680,8 @@ export class PbDebugSession extends EventEmitter {
       // alive) while passing locally, where other live e2e tests in the
       // same run happen to keep the loop busy and mask it.
       const timer = setTimeout(() => {
-        const index = this.pending.indexOf(waiter);
-        if (index !== -1) this.pending.splice(index, 1);
+        const idx = this.pending.indexOf(waiter);
+        if (idx !== -1) this.pending.splice(idx, 1);
         reject(new Error(`timed out after ${timeoutMs}ms waiting for ${description}`));
       }, timeoutMs);
       this.pending.push(waiter);
@@ -641,12 +737,40 @@ export class PbDebugSession extends EventEmitter {
    *  {@link connect} is — an unconditional await here would otherwise hang launchRequest forever
    *  if the target sent hello but never followed up with the announcement. */
   drainStartupAnnouncement(timeoutMs = 10000): Promise<PbMessage> {
-    return this.nextMessageWithTimeout(timeoutMs, "the debugger's startup announcement");
+    return this.nextMessageWithTimeout(timeoutMs, "the debugger's startup announcement", MSG_STARTUP_ANNOUNCEMENT);
   }
 
-  /** Opcode 2: unconditionally clears the target's stop flag and lets it run. */
-  continue(): void {
-    this.write(OP_CONTINUE, 0);
+  /** Opcode 0: request a cooperative pause at the next PureBasic statement check. */
+  pause(): void {
+    this.write(OP_PAUSE);
+  }
+
+  /** Opcode 1: execute a positive number of PureBasic statement steps. */
+  stepInto(count = 1): void {
+    if (!Number.isInteger(count) || count <= 0 || count > 0x7fffffff) {
+      throw new Error("stepInto count must be a positive int32");
+    }
+    this.write(OP_STEP, count);
+  }
+
+  /** Opcode 1/f8=-1: step over the current PureBasic statement. */
+  stepOver(): void {
+    this.write(OP_STEP, -1);
+  }
+
+  /** Opcode 1/f8=-2: step out of the current PureBasic procedure. */
+  stepOut(): void {
+    this.write(OP_STEP, -2);
+  }
+
+  /**
+   * Opcode 2: clear the target's stop flag and let it run. `acknowledge`
+   * mirrors the standalone debugger's f8=1 mode, which produces an
+   * unsolicited MSG_CONTINUED acknowledgement; f8=0 remains available for
+   * callers that do not need it.
+   */
+  continue(acknowledge = true): void {
+    this.write(OP_CONTINUE, acknowledge ? 1 : 0);
   }
 
   /** Adds a breakpoint by the wire protocol's 0-based compiled-line index. */
@@ -666,7 +790,7 @@ export class PbDebugSession extends EventEmitter {
   async stackTrace(): Promise<PbFrame[]> {
     return this.serialize(async () => {
       this.write(OP_STACK_TRACE);
-      const msg = await this.nextMessage();
+      const msg = await this.nextMessage(0x16);
       return parseFrames(msg.payload);
     });
   }
@@ -682,7 +806,7 @@ export class PbDebugSession extends EventEmitter {
   async examineModuleScope(): Promise<PbGlobalDecl[]> {
     return this.serialize(async () => {
       this.write(OP_EXAMINE_GLOBALS);
-      const msg = await this.nextMessage();
+      const msg = await this.nextMessage(0xd);
       return parseGlobalDecls(msg.payload);
     });
   }
@@ -690,7 +814,7 @@ export class PbDebugSession extends EventEmitter {
   async examineCurrentFrame(): Promise<PbVariable[]> {
     return this.serialize(async () => {
       this.write(OP_EXAMINE_CURRENT_FRAME);
-      const msg = await this.nextMessage();
+      const msg = await this.nextMessage(0xf);
       return parseVariables(msg.payload);
     });
   }
@@ -699,7 +823,7 @@ export class PbDebugSession extends EventEmitter {
   async examineFrame(frameIndex: number): Promise<PbVariable[]> {
     return this.serialize(async () => {
       this.write(OP_EXAMINE_FRAME, frameIndex);
-      const msg = await this.nextMessage();
+      const msg = await this.nextMessage(0x17);
       return parseVariables(msg.payload);
     });
   }
@@ -715,7 +839,7 @@ export class PbDebugSession extends EventEmitter {
   async examineArrays(global = false): Promise<PbArrayDecl[]> {
     return this.serialize(async () => {
       this.write(OP_EXAMINE_ARRAYS, global ? 1 : 0);
-      const msg = await this.nextMessage();
+      const msg = await this.nextMessage(0x10);
       return parseArrayDecls(msg.payload);
     });
   }
@@ -724,7 +848,7 @@ export class PbDebugSession extends EventEmitter {
   async examineLists(global = false): Promise<PbListDecl[]> {
     return this.serialize(async () => {
       this.write(OP_EXAMINE_LISTS, global ? 1 : 0);
-      const msg = await this.nextMessage();
+      const msg = await this.nextMessage(0x12);
       return parseListDecls(msg.payload);
     });
   }
@@ -733,7 +857,7 @@ export class PbDebugSession extends EventEmitter {
   async examineMaps(global = false): Promise<PbMapDecl[]> {
     return this.serialize(async () => {
       this.write(OP_EXAMINE_MAPS, global ? 1 : 0);
-      const msg = await this.nextMessage();
+      const msg = await this.nextMessage(0x14);
       return parseMapDecls(msg.payload);
     });
   }
@@ -751,6 +875,15 @@ export class PbDebugSession extends EventEmitter {
    * disambiguated here by checking whether the payload's echoed name
    * matches the expression actually sent; a real reply always echoes it
    * verbatim, an error message never does.
+   *
+   * Unlike the other request methods, this one's {@link nextMessage} call
+   * deliberately accepts *any* reply type: the error path's own type tag was
+   * never confirmed (PLAN.md M5 only pinned down the three success tags
+   * above), so type-filtering here would make a genuine error reply time out
+   * instead of surfacing, trading one bug for a worse one. This method keeps
+   * its pre-existing best-effort behavior; it remains exposed to the same
+   * unsolicited-message class of bug the other methods were just fixed
+   * against, but no worse than before.
    */
   async examineExpression(
     expression: string,
@@ -808,7 +941,7 @@ export class PbDebugSession extends EventEmitter {
       // *next* request's header framing — only surfaces across two
       // sequential requests on one connection, not a single one-off call.
       this.write(OP_EVALUATE, 0, frameContext, 0, payload, payload.length);
-      const msg = await this.nextMessage();
+      const msg = await this.nextMessage(MSG_EVALUATE_REPLY);
       return parseEvaluateReply(msg);
     });
   }
@@ -831,7 +964,7 @@ export class PbDebugSession extends EventEmitter {
         [target, value].map((s) => Buffer.concat([Buffer.from(s, "latin1"), Buffer.from([0])])),
       );
       this.write(OP_MODIFY, 0, -1, 0, payload, payload.length);
-      const msg = await this.nextMessage();
+      const msg = await this.nextMessage(MSG_EVALUATE_REPLY);
       return parseEvaluateReply(msg);
     });
   }

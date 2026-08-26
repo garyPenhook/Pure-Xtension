@@ -41,12 +41,11 @@ interface LaunchArgs extends DebugProtocol.LaunchRequestArguments {
 }
 
 /**
- * Launch, line breakpoints, continue, stepping (emulated — see step()),
- * stack trace, locals (including array/list/map/structure expansion), and
- * evaluate/setVariable — the surface PLAN.md's M5 spike confirmed live
- * against the wire protocol, plus step()'s breakpoint-driven emulation for
- * the one piece (single-instruction stepping) the protocol itself doesn't
- * expose.
+ * Launch, line breakpoints, pause/continue, native PureBasic stepping, stack
+ * trace, locals (including array/list/map/structure expansion), and
+ * evaluate/setVariable. The execution controls are captured from PureBasic
+ * 6.41's standalone debugger (PLAN.md M9), not reconstructed from line
+ * breakpoints.
  */
 export class PureBasicDebugSession extends DebugSession {
   private pb = new PbDebugSession();
@@ -88,25 +87,19 @@ export class PureBasicDebugSession extends DebugSession {
   /** Resolves once VS Code sends configurationDone (i.e. setBreakpoints has landed), so the initial continue() can't race ahead of it. */
   private configurationDone: Promise<void>;
   private resolveConfigurationDone!: () => void;
-  /** The real (user-set) line breakpoints currently active on the wire, mirrored here so step() can restore them after removing its temporary ones. */
+  /** The real (user-set) line breakpoints currently active on the wire. */
   private activeBreakpoints = new Set<number>();
-  /** True while step() owns the run/stop cycle — the persistent "stopped" listener must stay silent (no StoppedEvent) until step() itself decides it's done. */
+  /** True from a native step command until its matching stopped notification. */
   private stepInProgress = false;
   /** True while stopOnEntry is advancing from the debugger runtime's
    * line-less startup wait to the first executable source statement. */
   private entryDiscoveryInProgress = false;
   /**
-   * Lines step() has temporarily breakpointed beyond `activeBreakpoints`,
-   * live on the wire only while `stepInProgress` is true. Instance-level
-   * (not local to step()) so setBreakPointsRequest — which VS Code can send
-   * while the target is running, e.g. the user toggling a breakpoint mid-step
-   * — can detect an in-flight step and re-establish full line coverage after
-   * its own clearAllLineBreakpoints() wipes these out, instead of silently
-   * leaving the step under-covered until it happens to land on a real
-   * breakpoint or the program ends.
+   * Temporary all-line breakpoints used only to discover the exact entry
+   * source line. Native stepping never uses this coverage.
    */
-  private stepTempLines = new Set<number>();
-  /** Source line count at the moment the debug build was compiled, cached once so step()'s coverage matches the binary actually running even if the file is edited (but not recompiled) mid-session. */
+  private entryTempLines = new Set<number>();
+  /** Source line count at debug-build time, used only by entry-line discovery. */
   private totalLines = 0;
 
   constructor() {
@@ -121,23 +114,35 @@ export class PureBasicDebugSession extends DebugSession {
       // source lines are 1-based. Breakpoint requests use the same inverse
       // conversion at every add/remove call below.
       line += 1;
-      // Capture the stop line before the stepInProgress early-return below, so
-      // it stays current through step()'s internal run/stop loop too — by the
-      // time step() sends its own StoppedEvent, this holds the final line.
+      // Capture the stop line before the state checks below so it is available
+      // to the stack trace requested immediately after the stop event.
       this.lastStopLine = line;
       this.compoundHandles.clear();
       this.frameHandles.clear();
       this.nextCompoundRef = COMPOUND_REF_BASE;
-      // While step() is driving its own run/stop loop (via the temporary
-      // all-line breakpoints below), every intermediate stop is internal
-      // bookkeeping, not a real user-visible stop — step() sends the one
-      // StoppedEvent that actually matters once it's done deciding.
-      if (this.stepInProgress || this.entryDiscoveryInProgress) return;
+      if (this.stepInProgress) {
+        this.stepInProgress = false;
+        this.sendEvent(new StoppedEvent("step", MAIN_THREAD_ID));
+        return;
+      }
+      if (this.entryDiscoveryInProgress) return;
       this.sendEvent(new StoppedEvent(reason === 7 ? "breakpoint" : "pause", MAIN_THREAD_ID));
     });
     this.pb.on("terminated", () => this.notifyTerminated());
     this.pb.on("close", () => this.notifyTerminated());
     this.pb.on("error", (err) => this.logError(err));
+    // `Debug` statement text is sent over the wire (this event) instead of
+    // the target's stdout once an external debugger is attached (confirmed
+    // by disassembly: PB_DEBUGGER_PrintString picks one path or the other,
+    // never both) -- child.stdout below never sees it. Surfacing it here is
+    // the only way it reaches the Debug Console at all. The text itself is
+    // confirmed truncated by a bug in PureBasic's own debugger.a runtime
+    // (see parseDebugOutputText's doc comment for the live-tested evidence)
+    // -- there is no way to recover the missing half from this side of the
+    // connection, so the marker below is honest, not a hedge.
+    this.pb.on("debugOutput", (text: string) => {
+      this.sendEvent(new OutputEvent(`${text} [Debug output — may be truncated]\n`, "console"));
+    });
   }
 
   private logError(err: unknown): void {
@@ -182,13 +187,9 @@ export class PureBasicDebugSession extends DebugSession {
   ): void {
     response.body = response.body ?? {};
     response.body.supportsConfigurationDoneRequest = true;
-    // The wire protocol has no dedicated step opcode (PLAN.md M5: all
-    // Control sub-command values live-tested and ruled out) — next/stepIn/
-    // stepOut are emulated in step() via temporary all-line breakpoints
-    // instead. Note stepIn can't actually descend into a call (see step()'s
-    // doc comment: the wire runs a whole call-line atomically), so it degrades
-    // to a line step. supportsStepInTargetsRequest is a separate, unimplemented
-    // feature (picking which call on a line to step into).
+    // Native PureBasic 6.41 command 1 supports step into, over, and out. DAP
+    // step-in targets (choosing among several calls on one line) are separate
+    // and are not provided by the target protocol.
     response.body.supportsStepInTargetsRequest = false;
     response.body.supportsEvaluateForHovers = true;
     response.body.supportsSetVariable = true;
@@ -359,21 +360,18 @@ export class PureBasicDebugSession extends DebugSession {
     }
   }
 
-  /** Replays `activeBreakpoints` (and, if a step is mid-flight, its temporary full-line coverage) onto the wire. Only safe to call once `pbConnected` is true. */
+  /** Replays active user breakpoints and any entry-discovery coverage onto the wire. Only safe once `pbConnected` is true. */
   private flushBreakpointsToWire(): void {
     this.pb.clearAllLineBreakpoints();
     for (const line of this.activeBreakpoints) this.pb.addLineBreakpoint(line - 1);
-    if (this.stepInProgress || this.entryDiscoveryInProgress) {
-      // The clearAllLineBreakpoints() above just wiped step()'s full-line
-      // temporary coverage too (it's target-wide, not scoped to "real"
-      // breakpoints) — re-lay it now so the in-flight step still stops at
-      // the very next line instead of silently running past it to wherever
-      // the next *real* breakpoint (or program end) happens to be.
-      this.stepTempLines.clear();
+    if (this.entryDiscoveryInProgress) {
+      // A breakpoint edit clears target-wide state, so restore the temporary
+      // coverage that stopOnEntry uses to find the first executable line.
+      this.entryTempLines.clear();
       for (let line = 1; line <= this.totalLines; line++) {
         if (!this.activeBreakpoints.has(line)) {
           this.pb.addLineBreakpoint(line - 1);
-          this.stepTempLines.add(line);
+          this.entryTempLines.add(line);
         }
       }
     }
@@ -392,21 +390,21 @@ export class PureBasicDebugSession extends DebugSession {
   private async discoverEntryLine(): Promise<boolean> {
     this.entryDiscoveryInProgress = true;
     try {
-      this.stepTempLines.clear();
+      this.entryTempLines.clear();
       for (let line = 1; line <= this.totalLines; line++) {
         if (!this.activeBreakpoints.has(line)) {
           this.pb.addLineBreakpoint(line - 1);
-          this.stepTempLines.add(line);
+          this.entryTempLines.add(line);
         }
       }
       return (await this.continueUntilStopOrClose()) === "stopped";
     } finally {
       // A breakpoint edit during this internal run can promote a temporary
       // line to a real breakpoint, so activeBreakpoints remains authoritative.
-      for (const line of this.stepTempLines) {
+      for (const line of this.entryTempLines) {
         if (!this.activeBreakpoints.has(line)) this.pb.removeLineBreakpoint(line - 1);
       }
-      this.stepTempLines.clear();
+      this.entryTempLines.clear();
       this.entryDiscoveryInProgress = false;
     }
   }
@@ -441,10 +439,8 @@ export class PureBasicDebugSession extends DebugSession {
     response: DebugProtocol.ContinueResponse,
     _args: DebugProtocol.ContinueArguments,
   ): void {
-    // A compliant DAP client (VS Code) won't normally send this while a
-    // next/stepIn/stepOut is still in flight, but if it did, an extra
-    // continue() here would race step()'s own continue()/await-stop cycle
-    // against the target's actual run state — just no-op instead.
+    // A client should not normally continue while a native step is pending.
+    // Do not turn that into a second competing execution-control command.
     if (this.stepInProgress) {
       this.sendResponse(response);
       return;
@@ -453,93 +449,49 @@ export class PureBasicDebugSession extends DebugSession {
     this.sendResponse(response);
   }
 
+  protected pauseRequest(response: DebugProtocol.PauseResponse, _args: DebugProtocol.PauseArguments): void {
+    try {
+      this.pb.pause();
+      this.sendResponse(response);
+    } catch (err) {
+      this.sendAsyncRequestError(response, "pausing execution", err);
+    }
+  }
+
   protected nextRequest(response: DebugProtocol.NextResponse, _args: DebugProtocol.NextArguments): void {
-    this.sendResponse(response);
-    void this.step("over").catch((err) => this.logError(err));
+    this.sendNativeStep(response, "over");
   }
 
   protected stepInRequest(response: DebugProtocol.StepInResponse, _args: DebugProtocol.StepInArguments): void {
-    this.sendResponse(response);
-    void this.step("in").catch((err) => this.logError(err));
+    this.sendNativeStep(response, "in");
   }
 
   protected stepOutRequest(response: DebugProtocol.StepOutResponse, _args: DebugProtocol.StepOutArguments): void {
-    this.sendResponse(response);
-    void this.step("out").catch((err) => this.logError(err));
+    this.sendNativeStep(response, "out");
   }
 
   /**
-   * Emulates stepping over the wire protocol's confirmed absence of a step
-   * opcode (PLAN.md M5): temporarily breakpoints every line of the single
-   * module this adapter debugs (in addition to the user's real breakpoints,
-   * which are left alone throughout), then continues. Because
-   * `GetExecutableLine` snaps each requested line to the nearest real
-   * statement (PLAN.md M5's opcode-3 decode notes), lines with no statement
-   * of their own are harmless no-ops — the target stops at the very next line
-   * that actually executes *within the current continue*.
-   *
-   * Important protocol limitation, confirmed live end-to-end (PLAN.md M6):
-   * continuing from a stop runs the *entire current source line to completion*
-   * — including any procedure it calls — before honoring breakpoints again, so
-   * a breakpoint on a callee's body never fires on the continue that enters it
-   * from the call site. That makes true **step-into impossible** here: "in"
-   * therefore behaves as a line step (identical to "over" at a call site —
-   * it advances past the call rather than descending into it). Stepping *within*
-   * a procedure and *out* of one both work, since those stops aren't on a
-   * call-site's own line.
-   *
-   * "over"/"out" compare stack depth (procedure-frame count from opcode 16,
-   * which excludes the synthesized main frame — so main scope is depth 0)
-   * against the depth when step() began, auto-continuing through any stop still
-   * deeper than that baseline instead of surfacing it. "out" additionally
-   * requires a strictly shallower depth, so it runs until the current procedure
-   * returns.
+   * Dispatches a native opcode-1 PureBasic step. The target emits a normal
+   * MSG_STOPPED (reason 8) when the operation completes; the persistent
+   * listener above turns it into the DAP `step` stop event. No temporary line
+   * breakpoints or stack-depth reconstruction are involved, so step-in can
+   * genuinely enter a called procedure.
    */
-  private async step(mode: "in" | "over" | "out"): Promise<void> {
-    if (this.stepInProgress) return;
+  private sendNativeStep(response: DebugProtocol.Response, mode: "in" | "over" | "out"): void {
+    if (this.stepInProgress) {
+      this.sendResponse(response);
+      return;
+    }
     this.stepInProgress = true;
     try {
-      const startDepth = (await this.pb.stackTrace()).length;
-
-      this.stepTempLines.clear();
-      for (let line = 1; line <= this.totalLines; line++) {
-        if (!this.activeBreakpoints.has(line)) {
-          this.pb.addLineBreakpoint(line - 1);
-          this.stepTempLines.add(line);
-        }
-      }
-
-      for (;;) {
-        // Races the next real stop against the run ending mid-step (normal
-        // termination, target crash, FIFO read error, or the user hitting
-        // Stop). Without this, a step that never reaches another
-        // executable line (target killed, connection dropped) would leave
-        // this promise — and stepInProgress — pending forever. Listeners
-        // must be attached before continue() fires, not after; each side
-        // explicitly detaches the other so a long step-over/out (many
-        // iterations of this loop) doesn't accumulate dangling `once`
-        // listeners on `this.pb` and eventually hit Node's max-listeners
-        // warning.
-        const outcome = await this.continueUntilStopOrClose();
-        if (outcome === "closed") return;
-        if (mode === "in") break;
-        const depth = (await this.pb.stackTrace()).length;
-        if (mode === "over" && depth <= startDepth) break;
-        if (mode === "out" && depth < startDepth) break;
-      }
-    } finally {
-      // Only remove lines that are still ours: setBreakPointsRequest may
-      // have re-laid this exact set (see its stepInProgress branch above)
-      // after a concurrent edit, or promoted one of them into a real
-      // breakpoint — either way activeBreakpoints is the source of truth
-      // for what should survive.
-      for (const line of this.stepTempLines) {
-        if (!this.activeBreakpoints.has(line)) this.pb.removeLineBreakpoint(line - 1);
-      }
-      this.stepTempLines.clear();
+      if (mode === "in") this.pb.stepInto();
+      else if (mode === "over") this.pb.stepOver();
+      else this.pb.stepOut();
+      this.sendResponse(response);
+    } catch (err) {
       this.stepInProgress = false;
+      this.sendAsyncRequestError(response, "stepping execution", err);
     }
-    this.sendEvent(new StoppedEvent("step", MAIN_THREAD_ID));
   }
 
   protected threadsRequest(response: DebugProtocol.ThreadsResponse): void {
