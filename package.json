@@ -2,7 +2,7 @@
   "name": "pure-xtension",
   "displayName": "Pure Xtension",
   "description": "PureBasic language support for VS Code: syntax highlighting, IntelliSense, build tasks, deep help integration, and debugging.",
-  "version": "0.1.3",
+  "version": "0.1.4",
   "publisher": "local",
   "private": true,
   "license": "MIT",
@@ -19,9 +19,6 @@
     "Snippets"
   ],
   "main": "./dist/extension.js",
-  "activationEvents": [
-    "onLanguage:purebasic"
-  ],
   "contributes": {
     "languages": [
       {
