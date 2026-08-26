@@ -78,7 +78,11 @@ function resultError(record: MiResultRecord): Error {
 }
 
 function parseAddress(text: string): number {
-  const match = /(?:^|,)value="(0x[0-9a-fA-F]+|\d+)"/.exec(text);
+  // GDB appends a symbol annotation when one resolves at the address (e.g.
+  // `value="0x7fd63cb12cb2 <__internal_syscall_cancel+130>"`, live-confirmed
+  // via `attach()` against a symbol-bearing libc) -- the numeric token can be
+  // followed by whitespace, not just the closing quote.
+  const match = /(?:^|,)value="(0x[0-9a-fA-F]+|\d+)(?:[\s"]|$)/.exec(text);
   if (!match) throw new Error(`GDB did not return an address: ${text}`);
   return Number(match[1]);
 }
@@ -223,6 +227,46 @@ export class GdbMiPtraceEngine extends EventEmitter implements PtraceEngine {
       await this.dispose();
       throw err;
     }
+  }
+
+  /**
+   * Attaches to an already-running process instead of launching a fresh one
+   * (used for a lazy "Force Pause" fallback — see pbDebugAdapter.ts — rather
+   * than launching every target under GDB from the start). Live-confirmed:
+   * `-target-attach` in non-stop mode immediately ptrace-stops every thread
+   * of the target and emits a `*stopped` record shortly after its own
+   * `^done`, independent of whatever the target was doing (including inside
+   * a blocking syscall) — this is the actual capability wire-only pause
+   * lacks. Returns the stopped PC.
+   */
+  async attach(pid: number): Promise<number> {
+    if (!gdbEngineAvailable()) throw new Error("GDB/MI is unavailable (expected GNU gdb on Linux)");
+    await this.startGdb(process.cwd());
+    try {
+      const stopped = this.waitForStop();
+      await this.command(`-target-attach ${pid}`);
+      await stopped.promise;
+      return this.readRip();
+    } catch (err) {
+      await this.dispose();
+      throw err;
+    }
+  }
+
+  /**
+   * Detaches and resumes the attached process normally — required before
+   * disposing this engine's GDB process for a clean handoff, not just
+   * cleanup. Live-confirmed on this machine: after `-target-detach`, the
+   * target is still running (`TracerPid: 0`, state unchanged). Also
+   * confirmed as a fallback fact (not relied on as the primary path): even
+   * an unclean SIGKILL of GDB with no explicit detach leaves the tracee
+   * alive and un-traced — the kernel detaches a ptrace tracee automatically
+   * when its tracer dies, since GDB does not set PTRACE_O_EXITKILL for a
+   * process it merely attached to (as opposed to one it launched).
+   */
+  async detach(): Promise<void> {
+    if (!this.gdb || this.closed) return;
+    await this.command("-target-detach");
   }
 
   async setBreakpoint(addr: number): Promise<void> {

@@ -23,6 +23,7 @@ import * as fs from "fs";
 import * as os from "os";
 import * as path from "path";
 import { DebugClient } from "@vscode/debugadapter-testsupport";
+import { gdbEngineAvailable } from "../src/debug/ptraceEngine";
 
 const MAIN_THREAD_ID = 1;
 const ADAPTER = path.join(__dirname, "..", "adapter.cjs");
@@ -76,12 +77,26 @@ const MODULE_BP = 20;
 const PROC_BP = 12;
 const ENTRY_LINE = 7;
 
+// Fixture for the Force Pause test below: a single statement blocked in
+// Delay(2000) with nothing before it but one Debug, so the target is
+// reliably inside the blocking call well before the test's bounded pause
+// fallback fires. Mirrors src/debug/spike/ptrace_blocking.pb's shape.
+const BLOCKING_FIXTURE_LINES = [
+  'Debug "start"', // 1
+  "Delay(2000)", // 2
+  'Debug "after delay"', // 3
+  "End", // 4
+];
+
 let fixtureDir: string | undefined;
 let program = "";
+let blockingProgram = "";
 if (compiler) {
   fixtureDir = fs.mkdtempSync(path.join(os.tmpdir(), "pure-xtension-e2e-"));
   program = path.join(fixtureDir, "fixture.pb");
   fs.writeFileSync(program, FIXTURE_LINES.join("\n") + "\n");
+  blockingProgram = path.join(fixtureDir, "blocking.pb");
+  fs.writeFileSync(blockingProgram, BLOCKING_FIXTURE_LINES.join("\n") + "\n");
 }
 
 after(() => {
@@ -261,3 +276,98 @@ test("a wire request after disconnect receives an error response instead of hang
     await dc.stop();
   }
 });
+
+test(
+  "Force Pause: GDB attach interrupts a target blocked in Delay(), and Continue actually resumes it",
+  { skip: skip || !gdbEngineAvailable(), timeout: 30000 },
+  async () => {
+    const dc = new DebugClient("node", ADAPTER, "purebasic");
+    dc.defaultTimeout = 30000;
+    await dc.start();
+    try {
+      await Promise.all([
+        dc.waitForEvent("initialized").then(() => dc.configurationDoneRequest()),
+        dc.launch({ program: blockingProgram, backend: "asm", stopOnEntry: false }),
+      ]);
+
+      // By the time launch's response arrives, pb.continue() has already
+      // been sent (launchRequest awaits configurationDone then calls it).
+      // Give the target a moment to actually reach Delay(2000) -- the only
+      // statement before it is one Debug -- well before pausing.
+      await new Promise((resolve) => setTimeout(resolve, 300));
+
+      const stoppedPromise = dc.waitForEvent("stopped");
+      const pauseSentAt = Date.now();
+      await dc.pauseRequest({ threadId: MAIN_THREAD_ID });
+
+      // Plain cooperative pause (opcode 0) cannot interrupt a target inside
+      // Delay() -- PB_DEBUGGER_Check never runs mid-call. This asserts the
+      // GDB fallback, not some pre-existing cooperative behavior, produced
+      // the stop, landing well before the 2000ms Delay would return on its
+      // own (a natural return would also make pauseRequest's cooperative
+      // pause fire, making this assertion meaningless without the timing
+      // bounds below).
+      const stoppedEvent = await stoppedPromise;
+      const elapsed = Date.now() - pauseSentAt;
+      assert.equal(stoppedEvent.body.reason, "pause");
+      assert.ok(elapsed >= 600, `forced pause fired suspiciously early (${elapsed}ms) -- did a cooperative stop happen instead?`);
+      assert.ok(elapsed < 1800, `forced pause should land well before Delay(2000) returns on its own (took ${elapsed}ms)`);
+
+      // A stack trace request must not hang while force-paused (the main
+      // thread cannot answer wire requests here -- see stackTraceRequest).
+      const st = await frames(dc);
+      assert.equal(st.length, 1, "force-paused stop should report exactly one synthetic frame");
+      assert.match(st[0].name, /native code \(paused\)/);
+
+      // Continue must actually resume the target rather than have it
+      // immediately re-stop at the next line (the still-armed cooperative
+      // pause flag, if left uncleared) -- run it to real completion.
+      await Promise.all([dc.continueRequest({ threadId: MAIN_THREAD_ID }), dc.waitForEvent("terminated")]);
+    } finally {
+      await dc.stop();
+    }
+  },
+);
+
+test(
+  "Force Pause: a quick Continue after Pause cancels the still-pending fallback timer",
+  { skip: skip || !gdbEngineAvailable(), timeout: 30000 },
+  async () => {
+    // Regression test: armForcePauseFallback()'s timer used to only be
+    // invalidated by an already-*active* force pause or a cooperative wire
+    // stop -- continueRequest/step didn't cancel a timer that was still
+    // pending (armed but not yet fired). Pausing and then immediately
+    // continuing, well inside the fallback window, used to leave that stale
+    // timer to fire later and force-attach GDB to a target that was already
+    // running normally again.
+    const dc = new DebugClient("node", ADAPTER, "purebasic");
+    dc.defaultTimeout = 30000;
+    await dc.start();
+    try {
+      await Promise.all([
+        dc.waitForEvent("initialized").then(() => dc.configurationDoneRequest()),
+        dc.launch({ program: blockingProgram, backend: "asm", stopOnEntry: false }),
+      ]);
+      await new Promise((resolve) => setTimeout(resolve, 300));
+
+      await dc.pauseRequest({ threadId: MAIN_THREAD_ID });
+      await dc.continueRequest({ threadId: MAIN_THREAD_ID });
+
+      let sawStoppedEvent: unknown;
+      const stoppedListener = (event: { body?: unknown }) => {
+        sawStoppedEvent = event.body;
+      };
+      dc.on("stopped", stoppedListener);
+      try {
+        // Watch through (and past) FORCE_PAUSE_FALLBACK_MS's window for a
+        // stray forced-pause stop, then let the target finish normally.
+        await Promise.race([dc.waitForEvent("terminated"), new Promise((resolve) => setTimeout(resolve, 2500))]);
+      } finally {
+        dc.removeListener("stopped", stoppedListener);
+      }
+      assert.equal(sawStoppedEvent, undefined, `no stopped event should fire after Continue cancelled the pause, got: ${JSON.stringify(sawStoppedEvent)}`);
+    } finally {
+      await dc.stop();
+    }
+  },
+);

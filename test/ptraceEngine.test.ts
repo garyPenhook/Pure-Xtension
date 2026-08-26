@@ -1,5 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import * as cp from "child_process";
 import {
   GdbMiPtraceEngine,
   gdbEngineAvailable,
@@ -44,6 +45,26 @@ test(
       assert.ok(pid > 0, "GDB should report the inferior pid in =thread-group-started");
     } finally {
       await engine.dispose();
+    }
+  },
+);
+
+test(
+  "GdbMiPtraceEngine attach/detach stops then resumes an already-running process",
+  { skip: gdbEngineAvailable() ? false : "GNU gdb is unavailable on this Linux host", timeout: 10000 },
+  async () => {
+    const sleeper = cp.spawn("sleep", ["30"]);
+    await new Promise((resolve) => sleeper.once("spawn", resolve));
+    const engine = new GdbMiPtraceEngine();
+    try {
+      const pc = await engine.attach(sleeper.pid!);
+      assert.ok(pc > 0, "attach should resolve a stopped program counter");
+      await engine.detach();
+      // A detached ptrace tracee keeps running; signal 0 just probes liveness.
+      assert.doesNotThrow(() => process.kill(sleeper.pid!, 0), "sleep should still be running after detach");
+    } finally {
+      await engine.dispose();
+      sleeper.kill("SIGKILL");
     }
   },
 );

@@ -18,8 +18,16 @@ import {
 import { DebugProtocol } from "@vscode/debugprotocol";
 import { Backend, resolveBackendSilent, resolveCompilerPath } from "../config";
 import { PbDebugSession, PbVariable } from "./pbSession";
+import { GdbMiPtraceEngine, gdbEngineAvailable } from "./ptraceEngine";
 
 const MAIN_THREAD_ID = 1;
+/** Bounded wait for the cooperative wire pause (opcode 0) before falling back
+ * to a GDB attach (see armForcePauseFallback()). The launch/dispose and
+ * attach/detach regression tests in test/ptraceEngine.test.ts complete in
+ * ~200-280ms with no compile step involved, so this has real headroom over
+ * ordinary latency; test/pbDebugAdapter.e2e.test.ts's forced-pause case
+ * confirms it in practice against a real blocked target. */
+const FORCE_PAUSE_FALLBACK_MS = 750;
 // variablesReference values for compound (structure/array/list/map)
 // children live in a disjoint range above the small 1..N frame-scope refs
 // scopesRequest hands out (N = frame count, always small), so the two
@@ -101,6 +109,29 @@ export class PureBasicDebugSession extends DebugSession {
   private entryTempLines = new Set<number>();
   /** Source line count at debug-build time, used only by entry-line discovery. */
   private totalLines = 0;
+  /**
+   * GDB "Force Pause" fallback state (see armForcePauseFallback()/forcePause()).
+   * Wire pause/breakpoints are cooperative -- they only take effect when the
+   * target's main thread reaches PB_DEBUGGER_Check between statements, which
+   * never happens for a target blocked in an unbounded native call (e.g.
+   * WaitWindowEvent() with no timeout). GDB's ptrace attach can stop such a
+   * target regardless of what it's doing, at the cost of landing outside the
+   * wire's wait loop, where wire requests hang (live-confirmed,
+   * src/debug/spike/spike3.mjs) -- so this state deliberately does not
+   * attempt to bridge into full PB variable introspection; see
+   * stackTraceRequest/variablesRequest below.
+   */
+  private forcePauseEngine?: GdbMiPtraceEngine;
+  private forcePauseActive = false;
+  /** GDB-read PC at the moment forcePause() attached, used only to label the synthetic frame stackTraceRequest returns while forcePauseActive. */
+  private forcePauseNativeAddress = 0;
+  /** True from pauseRequest until either a cooperative wire stop or the forced-pause fallback resolves. */
+  private pausePending = false;
+  /** Invalidates an in-flight forcePause() attempt/timer when superseded by a real event (a cooperative stop, a second pause, continue, disconnect). */
+  private pauseGeneration = 0;
+  private forcePauseTimer?: ReturnType<typeof setTimeout>;
+  /** Memoizes gdbEngineAvailable() per session -- it synchronously spawns `gdb --version` (spawnSync), which would otherwise block the extension host's event loop on every single Pause click, not just once. */
+  private gdbAvailableCache?: boolean;
 
   constructor() {
     super();
@@ -110,6 +141,10 @@ export class PureBasicDebugSession extends DebugSession {
       this.resolveConfigurationDone = resolve;
     });
     this.pb.on("stopped", ({ line, reason }: { line: number; reason: number }) => {
+      // A genuine cooperative wire stop always supersedes any in-flight
+      // Force Pause attempt/timer -- it arrived, so the fallback (which
+      // would only yield a degraded GDB-only stop) must not also fire.
+      this.cancelForcePauseFallback();
       // The target protocol reports its compiled-line index (0-based); DAP
       // source lines are 1-based. Breakpoint requests use the same inverse
       // conversion at every add/remove call below.
@@ -166,6 +201,11 @@ export class PureBasicDebugSession extends DebugSession {
   private notifyTerminated(): void {
     if (this.terminated) return;
     this.terminated = true;
+    // A pending (not yet fired) Force Pause timer captured this.child's pid
+    // by reading it fresh only when it fires, not at arm time -- without
+    // this, a target that exits while the timer is still pending would leave
+    // it to fire later against a dead (or, worse, OS-reused) pid.
+    this.cancelForcePauseFallback();
     this.sendEvent(new TerminatedEvent());
   }
 
@@ -435,39 +475,163 @@ export class PureBasicDebugSession extends DebugSession {
     });
   }
 
-  protected continueRequest(
+  protected async continueRequest(
     response: DebugProtocol.ContinueResponse,
     _args: DebugProtocol.ContinueArguments,
-  ): void {
+  ): Promise<void> {
+    // Invalidate a Force Pause timer that's still pending (armed by an
+    // earlier pauseRequest but not yet fired) unconditionally, not just an
+    // already-active one (resumeFromForcePauseIfActive only handles that
+    // case): without this, pausing and then continuing within
+    // FORCE_PAUSE_FALLBACK_MS would leave the old timer to fire later and
+    // freeze the target well after the user already resumed it.
+    this.cancelForcePauseFallback();
     // A client should not normally continue while a native step is pending.
     // Do not turn that into a second competing execution-control command.
     if (this.stepInProgress) {
       this.sendResponse(response);
       return;
     }
-    this.pb.continue();
-    this.sendResponse(response);
+    try {
+      if (this.forcePauseActive) await this.resumeFromForcePauseIfActive();
+      else this.pb.continue();
+      this.sendResponse(response);
+    } catch (err) {
+      this.sendAsyncRequestError(response, "continuing execution", err);
+    }
   }
 
   protected pauseRequest(response: DebugProtocol.PauseResponse, _args: DebugProtocol.PauseArguments): void {
     try {
+      // Opcode 0 is cooperative -- it only takes effect once the target's
+      // main thread reaches PB_DEBUGGER_Check between statements, so this
+      // alone can never interrupt a target blocked in an unbounded native
+      // call (e.g. WaitWindowEvent() with no timeout). armForcePauseFallback
+      // covers that gap; see the class-level Force Pause doc comment.
       this.pb.pause();
       this.sendResponse(response);
+      this.armForcePauseFallback();
     } catch (err) {
       this.sendAsyncRequestError(response, "pausing execution", err);
     }
   }
 
-  protected nextRequest(response: DebugProtocol.NextResponse, _args: DebugProtocol.NextArguments): void {
-    this.sendNativeStep(response, "over");
+  private isGdbAvailable(): boolean {
+    if (this.gdbAvailableCache === undefined) this.gdbAvailableCache = gdbEngineAvailable();
+    return this.gdbAvailableCache;
   }
 
-  protected stepInRequest(response: DebugProtocol.StepInResponse, _args: DebugProtocol.StepInArguments): void {
-    this.sendNativeStep(response, "in");
+  /** Starts (or restarts) the bounded wait after a cooperative pause request, after which forcePause() takes over if no wire stop arrived. */
+  private armForcePauseFallback(): void {
+    if (!this.isGdbAvailable() || process.platform !== "linux" || !this.child?.pid) return;
+    this.pausePending = true;
+    if (this.forcePauseTimer) clearTimeout(this.forcePauseTimer);
+    const generation = this.pauseGeneration;
+    this.forcePauseTimer = setTimeout(() => {
+      this.forcePauseTimer = undefined;
+      void this.forcePause(generation);
+    }, FORCE_PAUSE_FALLBACK_MS);
   }
 
-  protected stepOutRequest(response: DebugProtocol.StepOutResponse, _args: DebugProtocol.StepOutArguments): void {
-    this.sendNativeStep(response, "out");
+  /** Cancels any pending Force Pause timer/attempt without touching an already-active one (see resumeFromForcePauseIfActive for that). Called whenever a cooperative wire stop arrives -- which can only happen for a target that was never actually GDB-frozen, since a frozen target cannot run far enough to send one. */
+  private cancelForcePauseFallback(): void {
+    this.pausePending = false;
+    this.pauseGeneration++;
+    if (this.forcePauseTimer) {
+      clearTimeout(this.forcePauseTimer);
+      this.forcePauseTimer = undefined;
+    }
+  }
+
+  /**
+   * Attaches GDB to the already-running target and reports a degraded stop.
+   * Live-confirmed (src/debug/spike/spike3.mjs) that a raw ptrace stop lands
+   * the target outside its wire wait loop, where wire requests simply hang
+   * -- so this deliberately does not attempt PB-level introspection; see
+   * stackTraceRequest/variablesRequest.
+   */
+  private async forcePause(generation: number): Promise<void> {
+    if (generation !== this.pauseGeneration || !this.pausePending) return;
+    const pid = this.child?.pid;
+    if (!pid) return;
+    const engine = new GdbMiPtraceEngine();
+    let pc: number;
+    try {
+      pc = await engine.attach(pid);
+    } catch (err) {
+      this.logError(err);
+      return;
+    }
+    if (generation !== this.pauseGeneration) {
+      // A cooperative stop (or a newer pause/continue/disconnect) won the
+      // race while attaching -- undo the attach rather than surface a stale
+      // forced stop on top of (or instead of) the real one.
+      try {
+        await engine.detach();
+      } catch (err) {
+        this.logError(err);
+      } finally {
+        await engine.dispose();
+      }
+      return;
+    }
+    this.pausePending = false;
+    this.forcePauseActive = true;
+    this.forcePauseEngine = engine;
+    this.forcePauseNativeAddress = pc;
+    this.compoundHandles.clear();
+    this.frameHandles.clear();
+    this.nextCompoundRef = COMPOUND_REF_BASE;
+    this.sendEvent(
+      new OutputEvent(
+        `Pure Xtension: forced pause via GDB -- the target was not at a PureBasic statement boundary ` +
+          `(e.g. blocked in a native call), so PureBasic locals/stack are unavailable until Continue. ` +
+          `Stopped at native address 0x${pc.toString(16)}.\n`,
+      ),
+    );
+    this.sendEvent(new StoppedEvent("pause", MAIN_THREAD_ID));
+  }
+
+  /** Detaches/disposes an active Force Pause engine and clears the wire's cooperative pause flag (opcode 2), if one is active; a no-op otherwise. Every resume path (continue/step/disconnect) must go through this before touching `this.pb` again. */
+  private async resumeFromForcePauseIfActive(): Promise<void> {
+    if (!this.forcePauseActive) return;
+    this.pauseGeneration++;
+    this.forcePauseActive = false;
+    const engine = this.forcePauseEngine;
+    this.forcePauseEngine = undefined;
+    // pauseRequest's wire pause() (opcode 0) left the target's cooperative
+    // stop flag armed; continue()/opcode 2 is what clears it (see
+    // pbSession.ts's continue() doc comment). This must happen BEFORE
+    // detach() below, not after: the FIFO comms thread can keep accepting
+    // writes independently of whatever GDB has ptrace-stopped, so sending it
+    // first guarantees the flag is already clear by the time the main
+    // thread can next reach PB_DEBUGGER_Check. Detaching first would leave a
+    // window where the target could resume, immediately reach its next
+    // statement check with the old pause flag still armed, and cooperatively
+    // re-stop on its own — an extra, spurious wire `stopped` event racing
+    // against this same resume.
+    this.pb.continue();
+    if (engine) {
+      try {
+        await engine.detach();
+      } catch (err) {
+        this.logError(err);
+      } finally {
+        await engine.dispose();
+      }
+    }
+  }
+
+  protected nextRequest(response: DebugProtocol.NextResponse, _args: DebugProtocol.NextArguments): Promise<void> {
+    return this.sendNativeStep(response, "over");
+  }
+
+  protected stepInRequest(response: DebugProtocol.StepInResponse, _args: DebugProtocol.StepInArguments): Promise<void> {
+    return this.sendNativeStep(response, "in");
+  }
+
+  protected stepOutRequest(response: DebugProtocol.StepOutResponse, _args: DebugProtocol.StepOutArguments): Promise<void> {
+    return this.sendNativeStep(response, "out");
   }
 
   /**
@@ -477,9 +641,25 @@ export class PureBasicDebugSession extends DebugSession {
    * breakpoints or stack-depth reconstruction are involved, so step-in can
    * genuinely enter a called procedure.
    */
-  private sendNativeStep(response: DebugProtocol.Response, mode: "in" | "over" | "out"): void {
+  private async sendNativeStep(response: DebugProtocol.Response, mode: "in" | "over" | "out"): Promise<void> {
+    // Same reasoning as continueRequest: invalidate a still-pending Force
+    // Pause timer unconditionally, not just an already-active one.
+    this.cancelForcePauseFallback();
     if (this.stepInProgress) {
       this.sendResponse(response);
+      return;
+    }
+    if (this.forcePauseActive) {
+      // There is no wire statement-boundary context at a forced pause (see
+      // the class-level Force Pause doc comment), so a native step isn't
+      // meaningful here -- resume instead, same as continueRequest.
+      try {
+        await this.resumeFromForcePauseIfActive();
+        this.sendEvent(new OutputEvent("Pure Xtension: stepping isn't available from a forced pause; resuming instead.\n"));
+        this.sendResponse(response);
+      } catch (err) {
+        this.sendAsyncRequestError(response, "resuming from a forced pause", err);
+      }
       return;
     }
     this.stepInProgress = true;
@@ -503,6 +683,19 @@ export class PureBasicDebugSession extends DebugSession {
     response: DebugProtocol.StackTraceResponse,
     _args: DebugProtocol.StackTraceArguments,
   ): Promise<void> {
+    if (this.forcePauseActive) {
+      // this.pb.stackTrace() would hang here -- the main thread is
+      // GDB-frozen outside its wire wait loop and cannot answer (live-
+      // confirmed, src/debug/spike/spike3.mjs). Report a single synthetic
+      // frame from the GDB-read PC instead of blocking the client forever.
+      const source = new Source(path.basename(this.sourcePath), this.sourcePath);
+      this.frameHandles.clear();
+      this.frameHandles.set(0, { kind: "main" });
+      const frame = new StackFrame(0, `native code (paused) — 0x${this.forcePauseNativeAddress.toString(16)}`, source, this.lastStopLine || 1);
+      response.body = { stackFrames: [frame], totalFrames: 1 };
+      this.sendResponse(response);
+      return;
+    }
     try {
     const pbFrames = await this.pb.stackTrace(); // opcode 16: procedure frames only, outermost-first
     this.frameHandles.clear();
@@ -571,6 +764,12 @@ export class PureBasicDebugSession extends DebugSession {
     response: DebugProtocol.VariablesResponse,
     args: DebugProtocol.VariablesArguments,
   ): Promise<void> {
+    if (this.forcePauseActive) {
+      // Any this.pb call would hang here for the same reason noted in
+      // stackTraceRequest -- fail fast with an explanatory error instead.
+      this.sendErrorResponse(response, 1091, "Pure Xtension: locals are unavailable during a forced pause (target is not at a PureBasic statement boundary). Continue to resume.");
+      return;
+    }
     try {
     const ref = args.variablesReference;
 
@@ -727,6 +926,10 @@ export class PureBasicDebugSession extends DebugSession {
     response: DebugProtocol.EvaluateResponse,
     args: DebugProtocol.EvaluateArguments,
   ): Promise<void> {
+    if (this.forcePauseActive) {
+      this.sendErrorResponse(response, 1092, "Pure Xtension: evaluate is unavailable during a forced pause (target is not at a PureBasic statement boundary). Continue to resume.");
+      return;
+    }
     try {
     // frameId isn't threaded through here yet — every evaluate runs against
     // the currently-stopped line (frameContext -1), the only case PLAN.md's
@@ -749,6 +952,10 @@ export class PureBasicDebugSession extends DebugSession {
     response: DebugProtocol.SetVariableResponse,
     args: DebugProtocol.SetVariableArguments,
   ): Promise<void> {
+    if (this.forcePauseActive) {
+      this.sendErrorResponse(response, 1093, "Pure Xtension: setVariable is unavailable during a forced pause (target is not at a PureBasic statement boundary). Continue to resume.");
+      return;
+    }
     try {
     // Same frame-context caveat as evaluateRequest: only the currently-
     // stopped line's scope is wired up, since that's the only case PLAN.md's
@@ -765,10 +972,27 @@ export class PureBasicDebugSession extends DebugSession {
     }
   }
 
-  protected disconnectRequest(
+  protected async disconnectRequest(
     response: DebugProtocol.DisconnectResponse,
     _args: DebugProtocol.DisconnectArguments,
-  ): void {
+  ): Promise<void> {
+    this.cancelForcePauseFallback();
+    if (this.forcePauseEngine) {
+      // SIGKILLing the target below works fine even while GDB still has it
+      // ptrace-attached (SIGKILL cannot be intercepted or deferred by a
+      // tracer), but detach first anyway for a clean handoff and to avoid
+      // leaving an orphaned GDB process behind on an early return above.
+      const engine = this.forcePauseEngine;
+      this.forcePauseEngine = undefined;
+      this.forcePauseActive = false;
+      try {
+        await engine.detach();
+      } catch (err) {
+        this.logError(err);
+      } finally {
+        await engine.dispose();
+      }
+    }
     // No clean-disconnect opcode exists (PLAN.md M5: confirmed by decoding
     // ExternalDebugger_CommunicationsThread's read-error path — any FIFO
     // read failure other than EAGAIN unconditionally calls exit(1) in the
