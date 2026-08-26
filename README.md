@@ -2,10 +2,17 @@
 
 [![CI](https://github.com/garyPenhook/Pure-Xtension/actions/workflows/ci.yml/badge.svg)](https://github.com/garyPenhook/Pure-Xtension/actions/workflows/ci.yml)
 
-A VS Code extension that turns VS Code into a PureBasic IDE on Linux: syntax
+A VS Code extension that turns VS Code into a PureBasic IDE: syntax
 highlighting, IntelliSense backed by the real compiler, build/run tasks with
 inline diagnostics, deep links into PureBasic's live online documentation,
 and a debugger.
+
+Language support, IntelliSense, build/diagnostics, and help all work on
+Windows, macOS, and Linux (the extension auto-detects a PureBasic install on
+each). **Debugging is Linux-only for now** — it's built on POSIX FIFOs and a
+GDB/ptrace-backed Force Pause, neither of which the Windows/macOS ports
+implement yet; launching a debug session on another platform fails with a
+clear error instead of silently misbehaving.
 
 ## Features
 
@@ -45,7 +52,7 @@ and a debugger.
 - Completion items carry full documentation (description + doc link) pulled
   from the same live index.
 
-### Debugging
+### Debugging — ⚠️ Linux only (not yet supported on Windows or macOS)
 Standard VS Code debugging for PureBasic programs, via a `purebasic` launch
 configuration:
 - Launch, line breakpoints, continue, step-over/into/out, and a real
@@ -57,8 +64,10 @@ configuration:
 
 ## Requirements
 
-- A PureBasic install (tested against v6.41 on Linux x64). The extension
-  auto-detects `purebasic*` installs under common locations, or you can set
+- A PureBasic install (tested against v6.41 on Linux x64; Windows/macOS
+  install-detection is implemented but not yet verified against a real
+  install on those platforms). The extension auto-detects `purebasic*`
+  installs under common locations, or you can set
   `pureXtension.purebasicHome` explicitly.
 - The C backend additionally requires a system C toolchain (gcc/clang) if
   you choose it over the self-contained ASM backend.
@@ -82,6 +91,8 @@ configuration:
 - **Pure Xtension: Search Help**
 
 ## Debugging a program
+
+**Linux only** — see the platform note above.
 
 Add a launch configuration to your workspace's `.vscode/launch.json`:
 
