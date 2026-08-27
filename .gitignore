@@ -7,4 +7,5 @@ dist/
 src/debug/spike/*.bin
 purebasic.asm
 PLAN.md
+DEBUGGER_REVERSE_ENGINEERING.md
 .vscode-test/
