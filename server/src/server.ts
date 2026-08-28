@@ -379,7 +379,9 @@ connection.onHover(async (params): Promise<Hover | undefined> => {
   const word = wordAt(doc.getText(), offset);
   if (!word) return undefined;
 
-  const fn = builtinIndex?.functions.find((f) => f.name.toLowerCase() === word.toLowerCase());
+  const index = await ensureBuiltinIndex();
+
+  const fn = index?.functions.find((f) => f.name.toLowerCase() === word.toLowerCase());
   if (fn) {
     const url = getHelpUrl(helpIndex, fn.name);
     const link = url ? `\n\n[Open documentation](${url})` : "";
@@ -408,8 +410,8 @@ connection.onHover(async (params): Promise<Hover | undefined> => {
     };
   }
 
-  const builtinStructureOrInterface = builtinIndex?.structures
-    .concat(builtinIndex.interfaces)
+  const builtinStructureOrInterface = index?.structures
+    .concat(index.interfaces)
     .find((name) => name.toLowerCase() === word.toLowerCase());
   if (builtinStructureOrInterface) {
     const url = getHelpUrl(helpIndex, builtinStructureOrInterface);

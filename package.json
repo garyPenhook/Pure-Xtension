@@ -320,7 +320,7 @@
   "scripts": {
     "compile": "tsc --noEmit -p ./ && tsc --noEmit -p ./server && node esbuild.mjs",
     "watch": "node esbuild.mjs --watch",
-    "test": "tsc -p tsconfig.test.json && node esbuild.adapter.mjs && node --test out-test/test/*.test.js",
+    "test": "tsc -p tsconfig.test.json && node esbuild.adapter.mjs && node esbuild.mjs && node --test out-test/test/*.test.js",
     "test:vscode": "tsc -p tsconfig.test.json && mkdir -p out-test/test/vscodeIntegration/fixture && cp test/vscodeIntegration/fixture/*.pb out-test/test/vscodeIntegration/fixture/ && node out-test/test/vscodeIntegration/runTest.js",
     "package": "vsce package",
     "vscode:prepublish": "node esbuild.mjs --production"
