@@ -4,7 +4,7 @@
 
 import { StructureField } from "./dumpParsers";
 
-export type WorkspaceSymbolKind = "procedure" | "structure" | "interface" | "constant" | "macro";
+export type WorkspaceSymbolKind = "procedure" | "structure" | "interface" | "constant" | "macro" | "variable" | "module";
 
 export interface InterfaceMethod {
   name: string;
@@ -27,9 +27,20 @@ export interface WorkspaceSymbol {
   methods?: InterfaceMethod[];
   /** Populated for `interface` symbols with an `Extends <name>` clause. */
   extends?: string;
+  /**
+   * Populated for `variable` symbols declared `Protected`/`Define`/`Static`/
+   * `Dim`/`NewList`/`NewMap` inside a procedure, or as that procedure's own
+   * parameter: the 0-based line of the enclosing `EndProcedure`. A rename
+   * (or any other consumer that cares about visibility) must not touch text
+   * outside `[line, scopeEndLine]` -- two different procedures are free to
+   * each declare their own same-named local without colliding. Absent for
+   * `Global` variables (and everything else), which have no such bound.
+   */
+  scopeEndLine?: number;
 }
 
 const PROCEDURE_LINE = /^\s*Procedure(?:C|DLL|CDLL)?(?:\.\w+)?\s+(\w+)\s*\(([^)]*)\)/i;
+const END_PROCEDURE_LINE = /^\s*EndProcedure\b/i;
 const STRUCTURE_LINE = /^\s*Structure\s+(\w+)/i;
 const END_STRUCTURE_LINE = /^\s*EndStructure\b/i;
 const STRUCTURE_FIELD_LINE = /^(\*?)([A-Za-z_]\w*)\.([A-Za-z_]\w*)(\[(\d+)\])?/;
@@ -38,15 +49,74 @@ const END_INTERFACE_LINE = /^\s*EndInterface\b/i;
 const INTERFACE_METHOD_LINE = /^([A-Za-z_]\w*)(?:\.([A-Za-z_]\w*))?\s*\(([^)]*)\)/;
 const MACRO_LINE = /^\s*Macro\s+(\w+)/i;
 const CONSTANT_LINE = /^\s*#(\w+)(?:\.\w+)?\s*=\s*(.*)$/;
+// `Module`/`EndModule` is the implementation body of a `DeclareModule`/
+// `EndDeclareModule` pair (usually declared twice for the same name, once
+// each way) -- both spellings resolve to the same "module" symbol kind,
+// deduplicated by name below since they'd otherwise register as two
+// separate declarations of the same identifier.
+const MODULE_LINE = /^\s*(?:Declare)?Module\s+(\w+)/i;
+// A `.Type` suffix, when present, attaches to each declared *name*
+// (`counter.i`), never to the keyword itself -- extractVarNames strips it
+// per-segment, so these only need to capture the rest of the line.
+const GLOBAL_LINE = /^\s*Global\b(.*)$/i;
+const LOCAL_VAR_LINE = /^\s*(?:Protected|Define|Static|Dim|NewList|NewMap)\b(.*)$/i;
+const VAR_NAME_IN_SEGMENT = /^\s*\*?([A-Za-z_]\w*\$?)/;
+
+/** Depth-aware comma split so `Dim a(10, 20), b(5)`'s array-dimension commas
+ *  don't get mistaken for the declaration-list separators. */
+function splitTopLevelCommas(s: string): string[] {
+  const parts: string[] = [];
+  let depth = 0;
+  let current = "";
+  for (const ch of s) {
+    if (ch === "(") depth++;
+    else if (ch === ")") depth--;
+    if (ch === "," && depth === 0) {
+      parts.push(current);
+      current = "";
+    } else {
+      current += ch;
+    }
+  }
+  if (current.trim()) parts.push(current);
+  return parts;
+}
+
+/** Extracts each declared variable's bare name from a `Global`/`Protected`/.../
+ *  parameter-list segment list -- tolerates a leading `*` (pointer), a
+ *  trailing `.Type`/array-dims/`= initializer` on each segment (all ignored),
+ *  and a `$` string-type suffix (kept, since it's part of the identifier). */
+function extractVarNames(declList: string): string[] {
+  const names: string[] = [];
+  for (const segment of splitTopLevelCommas(declList)) {
+    const match = VAR_NAME_IN_SEGMENT.exec(segment);
+    if (match) names.push(match[1]);
+  }
+  return names;
+}
 
 export function extractWorkspaceSymbols(text: string): WorkspaceSymbol[] {
   const symbols: WorkspaceSymbol[] = [];
   const lines = text.split(/\r?\n/);
   let currentStructure: WorkspaceSymbol | undefined;
   let currentInterface: WorkspaceSymbol | undefined;
+  // Parameters and Protected/Define/Static/Dim/NewList/NewMap locals
+  // declared while this is set get their scopeEndLine backfilled once the
+  // matching EndProcedure is found -- PureBasic doesn't nest Procedure
+  // blocks, so a flat single-level tracker is enough.
+  let currentProcedureVars: WorkspaceSymbol[] | undefined;
+  // `DeclareModule Name`/`Module Name` normally both appear for the same
+  // module (public declaration + implementation) -- keep only the first
+  // sighting of each name so it isn't registered twice.
+  const seenModules = new Set<string>();
 
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i];
+
+    if (currentProcedureVars && END_PROCEDURE_LINE.test(line)) {
+      for (const v of currentProcedureVars) v.scopeEndLine = i;
+      currentProcedureVars = undefined;
+    }
 
     if (currentStructure) {
       if (END_STRUCTURE_LINE.test(line)) {
@@ -98,6 +168,12 @@ export function extractWorkspaceSymbols(text: string): WorkspaceSymbol[] {
     const proc = PROCEDURE_LINE.exec(line);
     if (proc) {
       symbols.push({ kind: "procedure", name: proc[1], line: i, detail: `(${proc[2].trim()})` });
+      currentProcedureVars = [];
+      for (const name of extractVarNames(proc[2])) {
+        const param: WorkspaceSymbol = { kind: "variable", name, line: i, detail: "Parameter" };
+        symbols.push(param);
+        currentProcedureVars.push(param);
+      }
       continue;
     }
 
@@ -144,6 +220,38 @@ export function extractWorkspaceSymbols(text: string): WorkspaceSymbol[] {
         line: i,
         detail: constant[2].trim(),
       });
+      continue;
+    }
+
+    const module = MODULE_LINE.exec(line);
+    if (module) {
+      const key = module[1].toLowerCase();
+      if (!seenModules.has(key)) {
+        seenModules.add(key);
+        symbols.push({ kind: "module", name: module[1], line: i, detail: "Module" });
+      }
+      continue;
+    }
+
+    const global = GLOBAL_LINE.exec(line);
+    if (global) {
+      for (const name of extractVarNames(global[1])) {
+        // No scopeEndLine -- Global is visible everywhere, unlike a
+        // procedure's own Protected/Define/Static/parameters below.
+        symbols.push({ kind: "variable", name, line: i, detail: "Global" });
+      }
+      continue;
+    }
+
+    const localVar = LOCAL_VAR_LINE.exec(line);
+    if (localVar) {
+      for (const name of extractVarNames(localVar[1])) {
+        const symbol: WorkspaceSymbol = { kind: "variable", name, line: i, detail: "Variable" };
+        symbols.push(symbol);
+        // Declared outside any procedure (unusual, but not invalid PB) --
+        // fall back to unbounded scope rather than dropping it.
+        currentProcedureVars?.push(symbol);
+      }
     }
   }
 

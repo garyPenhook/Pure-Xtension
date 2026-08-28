@@ -106,3 +106,8 @@ export function getKeywordHelpUrl(word: string): string | undefined {
   const topic = KEYWORD_TOPICS[word.toLowerCase()];
   return topic ? `${REF_BASE}${topic}.html` : undefined;
 }
+
+/** True for any reserved PureBasic language keyword (If, Procedure, EndIf, ...) -- reused by rename to reject both the target of a rename and any proposed replacement name that collides with one. */
+export function isKeyword(word: string): boolean {
+  return word.toLowerCase() in KEYWORD_TOPICS;
+}

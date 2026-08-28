@@ -22,6 +22,8 @@ import {
   PrepareRenameParams,
   WorkspaceEdit,
   TextEdit,
+  ResponseError,
+  ErrorCodes,
 } from "vscode-languageserver/node";
 import { TextDocument } from "vscode-languageserver-textdocument";
 import { BuiltinIndex, loadOrBuildBuiltinIndex, queryStructureFields } from "./builtinIndex";
@@ -29,8 +31,10 @@ import { WorkspaceSymbol } from "./workspaceSymbols";
 import { invalidateIncludeGraphCache, resolveIncludeGraphSymbols, ResolvedSymbol } from "./includeGraph";
 import { StructureField } from "./dumpParsers";
 import { HelpIndex, getHelpUrl, loadOrFetchHelpIndex } from "./onlineHelpIndex";
-import { getKeywordHelpUrl } from "./keywordHelp";
+import { getKeywordHelpUrl, isKeyword } from "./keywordHelp";
 import { RetryableLoader } from "./retryableLoader";
+import { isWordChar, maskStringsAndComments, wordAt } from "./textUtils";
+import { findRenameRanges, IDENTIFIER_RE, RenameTarget, resolveRenameTargetFromSymbols } from "./rename";
 
 interface InitializationOptions {
   compilerPath?: string;
@@ -103,62 +107,6 @@ async function getBuiltinStructureFields(name: string): Promise<StructureField[]
   }
 }
 
-// \w is ASCII-only; PB identifiers can carry the `$` string-type suffix
-// (e.g. "Name$") and, in practice, Unicode letters — \p{L} covers those too.
-const WORD_CHAR = /[\w#$]|\p{L}/u;
-
-function isWordChar(ch: string): boolean {
-  return WORD_CHAR.test(ch);
-}
-
-function wordAt(text: string, offset: number): string | undefined {
-  let start = offset;
-  let end = offset;
-  while (start > 0 && isWordChar(text[start - 1])) start--;
-  while (end < text.length && isWordChar(text[end])) end++;
-  if (start === end) return undefined;
-  return text.slice(start, end);
-}
-
-function wordRangeAt(text: string, offset: number): { start: number; end: number } | undefined {
-  let start = offset;
-  let end = offset;
-  while (start > 0 && isWordChar(text[start - 1])) start--;
-  while (end < text.length && isWordChar(text[end])) end++;
-  if (start === end) return undefined;
-  return { start, end };
-}
-
-/** Blanks out `;`-comment and `"`-string contents (preserving offsets/newlines)
- *  so a word-boundary scan run over the result can't match inside them. */
-function maskStringsAndComments(text: string): string {
-  const out = text.split("");
-  let inString = false;
-  for (let i = 0; i < out.length; i++) {
-    const ch = out[i];
-    if (inString) {
-      if (ch === '"') {
-        inString = false;
-      } else if (ch !== "\n") {
-        out[i] = " ";
-      }
-      continue;
-    }
-    if (ch === '"') {
-      inString = true;
-      continue;
-    }
-    if (ch === ";") {
-      let j = i;
-      while (j < out.length && out[j] !== "\n") {
-        out[j] = " ";
-        j++;
-      }
-      i = j - 1;
-    }
-  }
-  return out.join("");
-}
 
 function findWordRanges(doc: TextDocument, word: string): Range[] {
   const text = maskStringsAndComments(doc.getText());
@@ -192,6 +140,10 @@ function workspaceSymbolKindToLsp(kind: WorkspaceSymbol["kind"]): SymbolKind {
       return SymbolKind.Method;
     case "constant":
       return SymbolKind.Constant;
+    case "variable":
+      return SymbolKind.Variable;
+    case "module":
+      return SymbolKind.Module;
   }
 }
 
@@ -403,7 +355,15 @@ connection.onCompletion(async (params): Promise<CompletionItem[]> => {
             ? CompletionItemKind.Struct
             : symbol.kind === "constant"
               ? CompletionItemKind.Constant
-              : CompletionItemKind.Reference,
+              : symbol.kind === "interface"
+                ? CompletionItemKind.Interface
+                : symbol.kind === "macro"
+                  ? CompletionItemKind.Method
+                  : symbol.kind === "variable"
+                    ? CompletionItemKind.Variable
+                    : symbol.kind === "module"
+                      ? CompletionItemKind.Module
+                      : CompletionItemKind.Reference,
       detail: symbol.detail,
     });
   }
@@ -577,26 +537,52 @@ connection.onReferences((params: ReferenceParams): Location[] => {
   return findWordRanges(doc, word).map((range) => Location.create(doc.uri, range));
 });
 
-connection.onPrepareRename((params: PrepareRenameParams): Range | undefined => {
+async function resolveRenameTarget(doc: TextDocument, offset: number): Promise<RenameTarget | undefined> {
+  const symbols = await resolveIncludeGraphSymbols(doc.uri, documents);
+  return resolveRenameTargetFromSymbols(doc.getText(), offset, symbols);
+}
+
+connection.onPrepareRename(
+  async (
+    params: PrepareRenameParams,
+  ): Promise<Range | { range: Range; placeholder: string } | undefined> => {
+    const doc = documents.get(params.textDocument.uri);
+    if (!doc) return undefined;
+
+    const target = await resolveRenameTarget(doc, doc.offsetAt(params.position));
+    if (!target) return undefined;
+
+    return {
+      range: Range.create(doc.positionAt(target.range.start), doc.positionAt(target.range.end)),
+      placeholder: target.bareName,
+    };
+  },
+);
+
+connection.onRenameRequest(async (params: RenameParams): Promise<WorkspaceEdit | undefined> => {
   const doc = documents.get(params.textDocument.uri);
   if (!doc) return undefined;
 
-  const offset = doc.offsetAt(params.position);
-  const range = wordRangeAt(doc.getText(), offset);
-  if (!range) return undefined;
+  const target = await resolveRenameTarget(doc, doc.offsetAt(params.position));
+  if (!target) return undefined;
 
-  return Range.create(doc.positionAt(range.start), doc.positionAt(range.end));
-});
+  // A user typing into the rename box may retype the `#` prefix out of
+  // habit even though the editable range never included it -- strip one
+  // back off instead of rejecting it outright.
+  const newBareName = target.sigil && params.newName.startsWith("#") ? params.newName.slice(1) : params.newName;
+  if (!IDENTIFIER_RE.test(newBareName)) {
+    throw new ResponseError(ErrorCodes.InvalidParams, `"${params.newName}" is not a valid PureBasic identifier.`);
+  }
+  if (isKeyword(newBareName)) {
+    throw new ResponseError(
+      ErrorCodes.InvalidParams,
+      `"${newBareName}" is a reserved PureBasic keyword and can't be used as an identifier.`,
+    );
+  }
 
-connection.onRenameRequest((params: RenameParams): WorkspaceEdit | undefined => {
-  const doc = documents.get(params.textDocument.uri);
-  if (!doc) return undefined;
-
-  const offset = doc.offsetAt(params.position);
-  const word = wordAt(doc.getText(), offset);
-  if (!word) return undefined;
-
-  const edits: TextEdit[] = findWordRanges(doc, word).map((range) => TextEdit.replace(range, params.newName));
+  const edits: TextEdit[] = findRenameRanges(doc, target.bareName, target.sigil, target.scope).map((range) =>
+    TextEdit.replace(range, newBareName),
+  );
   return { changes: { [doc.uri]: edits } };
 });
 
