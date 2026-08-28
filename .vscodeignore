@@ -9,6 +9,7 @@ tsconfig.test.json
 test/**
 out-test/**
 PLAN.md
+DEBUGGER_REVERSE_ENGINEERING.md
 purebasic.asm
 *.vsix
 src/**
