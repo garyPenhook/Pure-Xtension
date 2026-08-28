@@ -280,6 +280,26 @@ test("procedure-scope stop: reports the procedure frame plus the synthesized mai
   }
 });
 
+test("evaluate on an unresolvable expression is quiet for hover/watch but a real error for the console", { skip }, async () => {
+  const dc = await launchToBreakpoint(MODULE_BP);
+  try {
+    // A stale Watch entry (or a hover over an out-of-scope identifier) is
+    // routine, not actionable -- must not surface as an error response
+    // (which VS Code turns into a notification toast), just an inline result.
+    const hover = await dc.evaluateRequest({ expression: "notAVariable", context: "hover" });
+    assert.match(hover.body.result, /not found/i, "hover should report the failure text as a plain result");
+
+    const watch = await dc.evaluateRequest({ expression: "notAVariable", context: "watch" });
+    assert.match(watch.body.result, /not found/i, "watch should report the failure text as a plain result");
+
+    // A user deliberately typing an expression into the Debug Console
+    // still gets a real error response.
+    await assert.rejects(dc.evaluateRequest({ expression: "notAVariable", context: "repl" }), /not found/i);
+  } finally {
+    await dc.stop();
+  }
+});
+
 test("a wire request after disconnect receives an error response instead of hanging", { skip }, async () => {
   const dc = await launchToBreakpoint(MODULE_BP);
   try {

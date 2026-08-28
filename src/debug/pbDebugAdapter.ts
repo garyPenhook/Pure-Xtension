@@ -1180,6 +1180,21 @@ export class PureBasicDebugSession extends DebugSession {
     // if it were.
     const result = await this.pb.evaluate(args.expression);
     if (result.kind === 0) {
+      // Hover and Watch fire automatically -- a hover over an identifier
+      // that's momentarily out of scope, or a stale Watch entry left over
+      // from an unrelated debug session (VS Code re-evaluates every Watch
+      // expression against any new session regardless of language), is
+      // routine, not an actionable error. An error *response* here makes
+      // VS Code pop a notification toast instead of just rendering the
+      // message inline in the Watch/hover UI the way other kinds of
+      // "unavailable" values already do -- respond successfully with the
+      // message as the result instead. A Debug Console (repl) evaluate is
+      // a deliberate user action, so it keeps the real error response.
+      if (args.context === "hover" || args.context === "watch") {
+        response.body = { result: result.error ?? "not available", variablesReference: 0 };
+        this.sendResponse(response);
+        return;
+      }
       this.sendErrorResponse(response, 1004, result.error ?? "evaluate failed");
       return;
     }
