@@ -25,6 +25,14 @@ interface TaskSpec {
   runAfter: boolean;
 }
 
+/** Every contributed task invokes the compiler, so all compiler output must
+ * be routed through the same matcher regardless of whether it also runs the
+ * resulting executable. Kept as a function to make the task-mode contract
+ * directly testable without executing a compiler. */
+export function problemMatchersForTask(_mode: NonNullable<PureBasicTaskDefinition["mode"]>): string[] {
+  return [PROBLEM_MATCHER_NAME];
+}
+
 const TASK_SPECS: TaskSpec[] = [
   { mode: "build", label: "Build", extraArgs: [], runAfter: false },
   { mode: "buildRun", label: "Build and Run", extraArgs: [], runAfter: true },
@@ -130,7 +138,7 @@ async function buildTask(spec: TaskSpec, backend?: Backend, file?: string): Prom
     new vscode.CustomExecution(
       async () => new CompileExecution(compilerPath, sourceFile, spec, cwd),
     ),
-    spec.mode === "check" ? PROBLEM_MATCHER_NAME : [],
+    problemMatchersForTask(spec.mode),
   );
   task.group = spec.mode === "build" || spec.mode === "buildRun" ? vscode.TaskGroup.Build : undefined;
   return task;

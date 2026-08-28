@@ -115,10 +115,11 @@ Created from the full Linux code review on 2026-08-28. Check an item only after 
   - Relevant code: [src/build/diagnostics.ts](src/build/diagnostics.ts).
   - **Fixed 2026-08-28:** Diagnostics are now retained as per-main-document contributions and merged at publish time, so closing or recompiling one main file removes only its own entries and cannot erase a shared include's diagnostics owned by another main file. A generation is rechecked after every awaited included-document load and immediately before publication; a close also cancels a pending debounce timer. Unit coverage verifies shared-include ownership, replacement/removal, and rapid edit/close/reopen invalidation.
 
-- [ ] **M7 — Publish compiler problems for every task mode.**
+- [x] **M7 — Publish compiler problems for every task mode.**
   - Attach the PureBasic problem matcher to build, build-and-run, debug, console, and syntax-check tasks where compiler output is available.
   - Verify each task mode populates and clears VS Code Problems correctly.
   - Relevant code: [src/build/taskProvider.ts](src/build/taskProvider.ts), [src/build/problemMatcher.ts](src/build/problemMatcher.ts).
+  - **Fixed 2026-08-28:** Every task mode now receives the contributed `$purebasic` matcher: build, build-and-run, debug build, console build, and syntax check. The matcher is attached to the compiler task itself, so VS Code owns compiler diagnostics and clears them on the task's next clean output. A bundled task-provider regression test verifies every mode's matcher assignment without requiring an extension host.
 
 - [ ] **M8 — Make real Linux debugger coverage a release gate.**
   - Stop allowing the PureBasic compiler/GDB integration suite to silently self-skip in the only required CI job.

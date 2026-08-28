@@ -21,3 +21,16 @@ await esbuild.build({
   outfile: path.join(here, "out-test/adapter.cjs"),
   alias: { vscode: path.join(here, "test/support/vscode-stub.js") },
 });
+
+// Task-provider unit tests use the same lightweight VS Code stand-in. This
+// keeps the production extension bundle external to VS Code while allowing
+// task construction policy to be tested in Node.
+await esbuild.build({
+  entryPoints: [path.join(here, "src/build/taskProvider.ts")],
+  bundle: true,
+  format: "cjs",
+  platform: "node",
+  target: "node18",
+  outfile: path.join(here, "out-test/taskProvider.cjs"),
+  alias: { vscode: path.join(here, "test/support/vscode-stub.js") },
+});
