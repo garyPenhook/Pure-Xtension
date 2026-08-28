@@ -1,0 +1,137 @@
+# Code Review TODO
+
+Created from the full Linux code review on 2026-08-28. Check an item only after the implementation, regression tests, and any affected documentation are complete.
+
+## High priority
+
+- [x] **H1 — Make TCP debugger startup reliable.**
+  - Retry expected transient connection failures such as `ECONNREFUSED` while the newly spawned PureBasic target starts listening.
+  - Use one bounded startup deadline and close every failed socket before retrying.
+  - Make the real TCP launch case in [test/pbDebugAdapter.e2e.test.ts](test/pbDebugAdapter.e2e.test.ts) pass consistently, including repeated launches.
+  - Relevant code: [src/debug/pbSession.ts](src/debug/pbSession.ts), [src/debug/pbDebugAdapter.ts](src/debug/pbDebugAdapter.ts).
+
+- [x] **H2 — Do not enable the TCP debugger on Windows until it is validated there.**
+  - Gate the experimental transport to platforms with a completed integration pass.
+  - Align the runtime gate, contribution/configuration text, and [README.md](README.md).
+  - Before enabling Windows, run compile, launch, breakpoint, stepping, variable, evaluate, termination, and cleanup tests on a real Windows host.
+
+- [x] **H3 — Handle target process spawn failures.**
+  - Add an `error` listener to the target returned by `child_process.spawn()`.
+  - Report invalid working directories, missing executables, and permission failures as clean DAP errors instead of unhandled process events.
+  - Ensure the launch request completes exactly once and all partial resources are cleaned up.
+  - Add regression tests in [test/pbSession.test.ts](test/pbSession.test.ts).
+
+- [x] **H4 — Remove synchronous compiler execution from the extension host.**
+  - Replace `spawnSync()` in the debug compile path with asynchronous execution.
+  - Add cancellation, a finite timeout, and bounded stdout/stderr collection.
+  - Confirm an indefinitely stalled compiler cannot freeze the VS Code extension host.
+  - Relevant code: [src/debug/pbSession.ts](src/debug/pbSession.ts).
+
+- [x] **H5 — Make LSP rename symbol-aware and syntax-safe.**
+  - Restrict prepare/rename to supported user-defined symbols instead of any word under the cursor.
+  - Preserve PureBasic sigils such as `#` and validate replacement identifiers.
+  - Reject keywords, built-ins, comments, strings, invalid names, and unsupported symbol kinds.
+  - Add coverage for constants, procedures, variables, structures, modules, keywords such as `If`, and invalid replacements.
+  - Relevant code: [server/src/server.ts](server/src/server.ts).
+
+- [x] **H6 — Decode debugger values according to their PureBasic types.**
+  - Stop treating every non-structure variable and evaluate result as a signed 64-bit integer.
+  - Establish the exact wire layout for integer widths, floats, doubles, strings, pointers, structures, arrays, lists, and maps before decoding them.
+  - Display `.f` and `.d` values numerically and handle string/local layouts correctly.
+  - Offer data breakpoints only for types and storage locations that can be watched correctly.
+  - Add protocol fixtures and live integration coverage for each supported type; return an explicit unsupported result for unknown layouts.
+  - Relevant code: [src/debug/pbDebugAdapter.ts](src/debug/pbDebugAdapter.ts), [test/pbDebugAdapter.e2e.test.ts](test/pbDebugAdapter.e2e.test.ts).
+
+## Medium priority
+
+- [ ] **M1 — Accept valid variable-originated data-breakpoint requests.**
+  - Do not reject a request solely because VS Code supplies `variablesReference` for the containing scope.
+  - Accept eligible scalar variables and continue rejecting compound children or values without a stable address.
+  - Test the real VS Code Variables-view flow, not only name-only synthetic requests.
+  - Relevant code: [src/debug/pbSession.ts](src/debug/pbSession.ts), [test/vscodeIntegration/suite/debugSession.test.ts](test/vscodeIntegration/suite/debugSession.test.ts).
+
+- [ ] **M2 — Put deadlines on normal debugger protocol operations.**
+  - Bound stack, scope/variable, container, and evaluate requests rather than waiting indefinitely for the target.
+  - On timeout or cancellation, reject the active DAP request, close or resynchronize the transport safely, and leave the session in a defined state.
+  - Add stalled-target tests for each request family.
+  - Relevant code: [src/debug/pbDebugAdapter.ts](src/debug/pbDebugAdapter.ts).
+
+- [ ] **M3 — Restart the language server when `purebasicHome` changes.**
+  - Invalidate caches and restart/reinitialize the server so diagnostics, built-ins, compiler paths, and help data all use the new installation.
+  - Add a configuration-change regression test.
+  - Relevant code: [src/client.ts](src/client.ts), [src/config.ts](src/config.ts).
+
+- [ ] **M4 — Load the built-in index before answering the first built-in hover.**
+  - Await the built-in index readiness path during hover handling.
+  - Verify that the first hover in a fresh session succeeds without another request warming the cache.
+  - Relevant code: [server/src/server.ts](server/src/server.ts), [server/src/builtinIndex.ts](server/src/builtinIndex.ts).
+
+- [ ] **M5 — Expand the workspace parser to cover major PureBasic constructs.**
+  - Honor `IncludePath` when resolving later includes.
+  - Index `Declare`, `DeclareModule`, module-qualified symbols, and procedure parameters in nested containers.
+  - Parse inherited structure fields introduced through `Extends`.
+  - Include dynamic `Array`, `List`, and `Map` fields in structures.
+  - Add focused parser tests based on PureBasic 6.41 syntax and multi-file/module fixtures.
+  - Relevant code: [server/src/includeGraph.ts](server/src/includeGraph.ts), [server/src/workspaceSymbols.ts](server/src/workspaceSymbols.ts), [test/workspaceSymbols.test.ts](test/workspaceSymbols.test.ts).
+
+- [ ] **M6 — Fix included-file diagnostic ownership and stale async results.**
+  - Aggregate or reference-count diagnostics contributed by each main document so closing one main file does not erase diagnostics still owned by another.
+  - Recheck the generation/version after every awaited document load before publishing results.
+  - Test shared includes, close/reopen behavior, rapid edits, and deliberately reordered async completion.
+  - Relevant code: [src/build/diagnostics.ts](src/build/diagnostics.ts).
+
+- [ ] **M7 — Publish compiler problems for every task mode.**
+  - Attach the PureBasic problem matcher to build, build-and-run, debug, console, and syntax-check tasks where compiler output is available.
+  - Verify each task mode populates and clears VS Code Problems correctly.
+  - Relevant code: [src/build/taskProvider.ts](src/build/taskProvider.ts), [src/build/problemMatcher.ts](src/build/problemMatcher.ts).
+
+- [ ] **M8 — Make real Linux debugger coverage a release gate.**
+  - Stop allowing the PureBasic compiler/GDB integration suite to silently self-skip in the only required CI job.
+  - Add an appropriately licensed runner or a documented protocol fixture strategy that exercises the same launch and debug lifecycle.
+  - Run `npm run test:vscode` in a required workflow.
+  - Require TCP and FIFO launch coverage before release packaging.
+  - Relevant workflows: [.github/workflows/ci.yml](.github/workflows/ci.yml), [.github/workflows/release.yml](.github/workflows/release.yml).
+
+## Lower priority
+
+- [ ] **L1 — Complete a task execution only once when child startup fails.**
+  - Guard the task completion callback so an `error` event followed by `close` cannot emit duplicate exits.
+  - Add a missing-executable regression test.
+  - Relevant code: [src/build/taskProvider.ts](src/build/taskProvider.ts).
+
+- [ ] **L2 — Make editor indentation work with lowercase/mixed-case PureBasic keywords.**
+  - Update [language-configuration.json](language-configuration.json) with case-insensitive matching supported by VS Code's language-configuration regex engine.
+  - Test representative lowercase, uppercase, and mixed-case block pairs.
+
+- [ ] **L3 — Reject and safely recover from invalid online-help refreshes.**
+  - Treat an HTTP 200 response that parses to an empty or implausibly small index as a refresh failure.
+  - Keep serving the last known-good cache when fresh content is invalid.
+  - Do not cache an empty index for 30 days, and write successful cache updates atomically.
+  - Add tests for page-layout changes, empty parses, stale-cache fallback, and interrupted writes.
+  - Relevant code: [server/src/onlineHelpIndex.ts](server/src/onlineHelpIndex.ts), [test/cacheRefresh.test.ts](test/cacheRefresh.test.ts).
+
+- [ ] **L4 — Clean temporary debugger artifacts on natural termination.**
+  - Remove temporary binaries, FIFOs, sockets, and related state on normal exit as well as disconnect and error paths.
+  - Make cleanup idempotent so competing termination paths are harmless.
+  - Assert filesystem cleanup after natural termination in integration tests.
+  - Relevant code: [src/debug/pbSession.ts](src/debug/pbSession.ts), [src/debug/pbDebugAdapter.ts](src/debug/pbDebugAdapter.ts).
+
+- [ ] **L5 — Resolve or explicitly mitigate the development dependency advisories.**
+  - Review the Mocha dependency chain for `diff` (`GHSA-73rr-hh4g-fpgx`) and `serialize-javascript` (`GHSA-5c6j-r48x-rmvq`, `GHSA-qj8w-gfj5-8c6v`).
+  - Upgrade safely where possible; do not accept a forced major/downgrade without running the full test suite.
+  - Keep `npm audit --omit=dev` clean and document any temporarily accepted development-only risk.
+
+## Completion checklist
+
+Run this checklist after the fixes above are merged:
+
+- [ ] `npm run compile`
+- [ ] `npm test`, with no unexpected Linux debugger skips in the release environment
+- [ ] `npm run test:vscode`
+- [ ] Repeated real TCP and FIFO launch/debug/termination tests on Linux
+- [ ] `npm run package` and validate the produced VSIX manifest/content
+- [ ] `npm audit --omit=dev`
+- [ ] `npm audit` and review every remaining development-only advisory
+- [ ] Windows debugger validation before changing the Windows platform gate or documentation
+- [ ] `git diff --check`
+
