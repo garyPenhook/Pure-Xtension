@@ -42,6 +42,36 @@ Created from the full Linux code review on 2026-08-28. Check an item only after 
   - Add protocol fixtures and live integration coverage for each supported type; return an explicit unsupported result for unknown layouts.
   - Relevant code: [src/debug/pbDebugAdapter.ts](src/debug/pbDebugAdapter.ts), [test/pbDebugAdapter.e2e.test.ts](test/pbDebugAdapter.e2e.test.ts).
 
+- [x] **H7 — Decode array, list, and map elements using the reply's real element type.**
+  - **Added 2026-08-28T13:37:40-04:00:** `parseArrayElements()`, `parseListElements()`, and `parseMapElements()` currently assume every element value is a signed 64-bit integer; `examineExpression()` does not pass `MSG_*Data.f8` (`CommandInfo\Value1`) through as the element type. Byte/word/long/float/double/string/pointer and structure containers can therefore be misrendered or parsed at the wrong byte boundaries even though H6 is checked complete.
+  - Use the target's element type to consume the correct value width and representation, including pointer-width differences and the structure-field map that precedes structure container data.
+  - Return an explicit unsupported result for layouts that are not decoded; never reuse the integer parser for an unknown type.
+  - Add captured-wire fixtures and live tests for each supported array/list/map element type on 64-bit, with a documented 32-bit strategy.
+  - Upstream evidence: `PureBasicDebugger/VariableDebug.pb` reads `Command\Value1` as `type` for ArrayData/ListData/MapData and advances with `GetValueSize(type, ...)`; `PureBasicDebugger/Misc.pb` defines the variable widths. Reference checkout: `/home/gary/apps/purebasic-devel`.
+  - Relevant code: [src/debug/pbSession.ts](src/debug/pbSession.ts), [src/debug/pbDebugAdapter.ts](src/debug/pbDebugAdapter.ts), [test/pbSession.test.ts](test/pbSession.test.ts).
+  - **Fixed 2026-08-28T14:00:54-04:00:** opcode-15 decoding now consumes `f8`'s element type, target pointer width from ExeMode, and structure field maps; structured elements expand in DAP. Unknown/truncated layouts remain explicit unsupported results. PureBasic 6.41's target-side `List<String>` wire bug remains on the existing unsupported/current-element fallback because the text is not transmitted.
+
+- [x] **H8 — Gate debugging to validated platforms, including macOS.**
+  - **Added 2026-08-28T13:37:40-04:00:** the README says macOS debugging is not enabled, but `shouldRefuseUnvalidatedWindowsLaunch()` rejects only `win32`; its test explicitly accepts `darwin`, so a normal macOS launch proceeds into the unvalidated FIFO path.
+  - Make normal launch eligibility an allowlist of validated platforms (currently Linux), while retaining a clearly internal test override if needed.
+  - Keep the runtime error, debug contribution text, tests, and README aligned before enabling another host OS.
+  - Relevant code: [src/debug/pbSession.ts](src/debug/pbSession.ts), [src/debug/pbDebugAdapter.ts](src/debug/pbDebugAdapter.ts), [test/pbSession.test.ts](test/pbSession.test.ts), [README.md](README.md).
+  - **Fixed 2026-08-28:** normal debug launch is now explicitly Linux-only, before compiler invocation or transport setup. The undocumented `transport` hook remains a test-only override for protocol coverage. The runtime diagnostic, debugger contribution label, README, and unit coverage now agree that macOS and Windows are not enabled pending real-machine validation.
+
+- [ ] **H9 — Make rename atomic across include files and module-qualified symbols.**
+  - **Added 2026-08-28T13:37:40-04:00:** rename resolves its target from the whole include graph but emits edits only for the current document. Renaming a call whose declaration is in an included file therefore changes the call without changing its declaration and can immediately break the build.
+  - `RenameSymbol` also discards `WorkspaceSymbol.module`; a reproduced rename on `A::Run()` selected every `Run` declaration/reference in both modules A and B (six edits), despite the qualified target.
+  - Build a symbol identity that includes URI, declaration kind, module, and lexical scope; either produce a complete multi-document `WorkspaceEdit` or reject targets whose safe edit set cannot be established.
+  - Cover same-named module members, same-named locals/globals, declarations in included files, `Module::Symbol` references, and mixed open/on-disk documents.
+  - Relevant code: [server/src/server.ts](server/src/server.ts), [server/src/rename.ts](server/src/rename.ts), [server/src/includeGraph.ts](server/src/includeGraph.ts), [test/rename.test.ts](test/rename.test.ts).
+
+- [ ] **H10 — Add included-source/module mapping to the debugger.**
+  - **Added 2026-08-28T13:37:40-04:00:** `setBreakPointsRequest()` rejects every source path other than the launch file, and every stack frame is labeled with that one path. Breakpoints and frame locations are therefore unavailable or wrong for code compiled through `IncludeFile`/`XIncludeFile`.
+  - Preserve the startup `#COMMAND_Init` payload (`Value1 = NbIncludedFiles`) and request `#COMMAND_GetModules`/parse `#COMMAND_Modules`, as the official debugger does, then map DAP sources to the module id encoded with line breakpoints.
+  - Verify breakpoints, stack frames, stepping, and stop locations in nested includes and duplicate basenames.
+  - Upstream evidence: `PureBasicDebugger/Communication.pb` stores the included-file list from `#COMMAND_Init` and requests module names; `PureBasicDebugger/DebuggerCommon.pb` defines the module commands. Reference checkout: `/home/gary/apps/purebasic-devel`.
+  - Relevant code: [src/debug/pbSession.ts](src/debug/pbSession.ts), [src/debug/pbDebugAdapter.ts](src/debug/pbDebugAdapter.ts), [test/pbDebugAdapter.e2e.test.ts](test/pbDebugAdapter.e2e.test.ts).
+
 ## Medium priority
 
 - [x] **M1 — Accept valid variable-originated data-breakpoint requests.**
@@ -96,6 +126,37 @@ Created from the full Linux code review on 2026-08-28. Check an item only after 
   - **Newly discovered while verifying M1 (2026-08-28), live-confirmed, not yet fixed:** `npm run test:vscode`'s own process exit code does not reflect whether its mocha tests actually passed. VS Code's `--extensionTestsPath` machinery runs the suite in a separate extension-host process and does not reliably propagate a failed run (rejected `run()` promise, or even the extension host calling `process.exit(1)` directly) into a non-zero exit code on the outer `@vscode/test-electron` process — confirmed by deliberately breaking an assertion and observing `Exit code: 0` regardless. A same-filesystem sentinel-file side channel was attempted as a fix and also failed for reasons not root-caused (even an unconditional file write at the very start of `run()`, to an absolute hardcoded path, never happened) before the investigation was stopped as out of scope for M1. **Net effect: today, `npm run test:vscode` can never fail — it always exits 0 — so it must not be trusted as a release gate or CI check until this is actually fixed.** This makes fixing this part of M8 more urgent, not less: a suite that can't fail is worse than one that self-skips, since it gives false confidence.
   - Relevant workflows: [.github/workflows/ci.yml](.github/workflows/ci.yml), [.github/workflows/release.yml](.github/workflows/release.yml).
 
+- [ ] **M9 — Bound and cancel every GDB/MI operation.**
+  - **Added 2026-08-28T13:37:40-04:00:** MI `command()` and `waitForStop()` have no deadlines. A GDB process that starts but stops responding can hang Force Pause/attach indefinitely; disconnect cannot dispose an attaching engine because it is not assigned to `forcePauseEngine` until after attach completes.
+  - Replace the extension-host `spawnSync("gdb", ["--version"])` capability probe (up to three seconds of UI blocking on the first Pause) with an asynchronous, shared probe.
+  - Give startup, attach, command, stop-wait, detach, and dispose one cancellation-aware budget; kill the owned GDB process and leave the target/session state defined on failure.
+  - Add fake-MI tests for a silent process, missing result record, missing `*stopped`, disconnect during attach, and late records after cancellation.
+  - Relevant code: [src/debug/ptraceEngine.ts](src/debug/ptraceEngine.ts), [src/debug/pbDebugAdapter.ts](src/debug/pbDebugAdapter.ts), [test/ptraceEngine.test.ts](test/ptraceEngine.test.ts).
+
+- [ ] **M10 — Make all LSP symbol features scope- and module-aware.**
+  - **Added 2026-08-28T13:37:40-04:00:** completion publishes every parsed procedure local/parameter regardless of cursor scope; unqualified hover/definition/signature help select the first same-spelled symbol in include order; references are a spelling-only scan of the current file. Module qualification is handled only in hover/definition, not consistently across completion, signature help, references, or rename.
+  - Resolve a symbol identity at the cursor using module visibility, procedure bounds, declaration kind, and include provenance, then reuse that identity for every language feature.
+  - Ensure locals never leak into other procedures, module-private names do not leak globally, and same-named symbols do not cross-contaminate results.
+  - Include escaped strings/comments and nested-call signature-help cases in the scanner tests.
+  - Relevant code: [server/src/server.ts](server/src/server.ts), [server/src/workspaceSymbols.ts](server/src/workspaceSymbols.ts), [server/src/textUtils.ts](server/src/textUtils.ts), [server/src/rename.ts](server/src/rename.ts).
+
+- [ ] **M11 — Queue language-server restarts instead of dropping configuration changes.**
+  - **Added 2026-08-28T13:37:40-04:00:** `restartLanguageClient()` coalesces every call into the current promise. If a second compiler/home/backend change arrives after the first restart has already resolved its compiler path but before `newClient.start()` finishes, the second call schedules no follow-up and the server can remain on the superseded configuration.
+  - Track a dirty generation and run one additional restart after the active one whenever a newer configuration generation exists.
+  - Test two deliberately reordered configuration changes and assert the final server initialization options use the last values.
+  - Relevant code: [src/extension.ts](src/extension.ts), [src/client.ts](src/client.ts), [test/vscodeIntegration/suite/configRestart.test.ts](test/vscodeIntegration/suite/configRestart.test.ts).
+
+- [ ] **M12 — Parse included-file diagnostics in task problem matching.**
+  - **Added 2026-08-28T13:37:40-04:00:** the contributed `$purebasic` matcher accepts only `Error|Warning: Line ...` after the synthetic main-file marker. PureBasic's two-line `Error|Warning: in included file '...'` plus `Line ...` form is handled by background diagnostics but not by tasks, so even after M7 attaches the matcher to every mode, include-file task errors will not be owned by the correct file.
+  - Extend the contributed matcher/output normalization to cover the same formats as `parseCompilerOutput()` and verify file ownership and stale-problem clearing.
+  - Relevant code: [package.json](package.json), [src/build/problemMatcher.ts](src/build/problemMatcher.ts), [src/build/taskProvider.ts](src/build/taskProvider.ts).
+
+- [ ] **M13 — Use the configured backend-selection flow for debug launches.**
+  - **Added 2026-08-28T13:37:40-04:00:** when auto mode is ambiguous, `launchRequest()` falls back to `"asm"` (`resolveBackendSilent() ?? "asm"`) instead of prompting/persisting the user's choice like build tasks do. Debug builds can silently use a different backend than the rest of the workspace.
+  - Resolve the backend before constructing the inline adapter or pass the resolved choice in the debug configuration; cancellation must cleanly cancel launch rather than choose a backend implicitly.
+  - Add coverage for explicit ASM/C, unambiguous auto, ambiguous auto selection, and cancelled selection.
+  - Relevant code: [src/debug/pbDebugAdapter.ts](src/debug/pbDebugAdapter.ts), [src/debug/debugConfigProvider.ts](src/debug/debugConfigProvider.ts), [src/config.ts](src/config.ts).
+
 ## Lower priority
 
 - [ ] **L1 — Complete a task execution only once when child startup fails.**
@@ -125,6 +186,26 @@ Created from the full Linux code review on 2026-08-28. Check an item only after 
   - Upgrade safely where possible; do not accept a forced major/downgrade without running the full test suite.
   - Keep `npm audit --omit=dev` clean and document any temporarily accepted development-only risk.
 
+- [ ] **L6 — Avoid repeated/unsolicited backend prompts during task discovery.**
+  - **Added 2026-08-28T13:37:40-04:00:** `provideTasks()` calls interactive `resolveBackend()` once per five task specs. In ambiguous auto mode, cancelling the picker can produce five consecutive prompts, and ordinary VS Code task discovery can invoke the provider before the user explicitly runs a build.
+  - Resolve once per provider call, use a non-interactive discovery path where appropriate, and test selection and cancellation.
+  - Relevant code: [src/build/taskProvider.ts](src/build/taskProvider.ts), [src/config.ts](src/config.ts).
+
+- [ ] **L7 — Remove the include graph's silent depth truncation and use standards-based file URIs.**
+  - **Added 2026-08-28T13:37:40-04:00:** `resolveIncludeGraphSymbols()` silently stops after eight include edges even though canonical visited-file tracking already terminates cycles, so legitimate deeper include chains lose symbols without a diagnostic.
+  - The hand-built `file://` conversion uses `encodeURI()`, which leaves URI delimiters such as `#` and `?` unescaped in valid filenames and does not robustly cover UNC/platform URI rules; returned definition locations can identify the wrong resource.
+  - Use the LSP/VS Code URI implementation, remove or make the safety limit explicit/configurable, and test deep chains, spaces, `%`, `#`, `?`, non-ASCII paths, Windows drives, and UNC paths.
+  - Relevant code: [server/src/includeGraph.ts](server/src/includeGraph.ts), [test/includeGraph.test.ts](test/includeGraph.test.ts).
+
+- [ ] **L8 — Validate the built-in symbol cache before trusting it.**
+  - **Added 2026-08-28T13:37:40-04:00:** a valid-JSON cache is accepted after checking only `compilerVersion`; malformed `functions`/`structures`/`interfaces` shapes can later throw in completion/hover instead of triggering a rebuild. A forced rebuild can also race an already-running ordinary load because the server clears and replaces the shared promise without cancelling or sequencing the old load.
+  - Validate the complete cache schema, write atomically, and serialize forced refreshes after existing loads so stale results cannot overwrite the refresh.
+  - Relevant code: [server/src/builtinIndex.ts](server/src/builtinIndex.ts), [server/src/server.ts](server/src/server.ts), [test/cacheRefresh.test.ts](test/cacheRefresh.test.ts).
+
+- [ ] **L9 — Align the documented help shortcut with the contribution.**
+  - **Added 2026-08-28T13:37:40-04:00:** [README.md](README.md) says the help command is bound to `F1`, while [package.json](package.json) contributes `Shift+F1` and the implementation comments use both descriptions.
+  - Choose one binding and update the manifest, README, and code comments together.
+
 ## Completion checklist
 
 Run this checklist after the fixes above are merged:
@@ -138,4 +219,3 @@ Run this checklist after the fixes above are merged:
 - [ ] `npm audit` and review every remaining development-only advisory
 - [ ] Windows debugger validation before changing the Windows platform gate or documentation
 - [ ] `git diff --check`
-

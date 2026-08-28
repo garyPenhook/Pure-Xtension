@@ -65,7 +65,9 @@ configuration:
 - Launch, line breakpoints, continue, step-over/into/out, and a real
   multi-frame call stack.
 - Locals for the current frame, including expandable arrays, lists, maps,
-  and structures.
+  and structures. Container elements are decoded using their actual
+  PureBasic type (including floats, strings, pointers, and structure fields),
+  rather than being treated as generic integers.
 - Evaluate expressions in the Debug Console/hover/watch, including writing
   back to a variable.
 

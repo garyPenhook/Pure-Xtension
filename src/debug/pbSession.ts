@@ -101,6 +101,14 @@ const SCALAR_TYPES: Record<number, ScalarTypeInfo> = {
   0x95: { kind: "int", valueBytes: 8, signed: false, pointer: true }, // Pointer (`*var`, no `.type` suffix)
 };
 
+// The low six bits are the PureBasic base type.  The high bits carry
+// modifiers such as "pointer" and "ByRef"; a pointer's on-wire value is
+// always an address, regardless of the pointed-to base type.
+const TYPE_MASK = 0x3f;
+const TYPE_POINTER = 0x80;
+const TYPE_STRING = 0x08;
+const TYPE_FIXED_STRING = 0x0a;
+
 /** Decodes `buf`'s first `info.valueBytes` bytes per SCALAR_TYPES' confirmed
  *  layout for `info`. Pointers render as `0x`-prefixed hex (the conventional,
  *  useful way to show an address), everything else as a decimal string. */
@@ -249,16 +257,20 @@ export interface PbGlobalDecl {
 export interface PbArrayElement {
   index: string;
   value: string;
+  /** Present for a structure element; its fields are independently decoded. */
+  children?: PbVariable[];
 }
 
 export interface PbListElement {
   index: string;
   value: string;
+  children?: PbVariable[];
 }
 
 export interface PbMapElement {
   key: string;
   value: string;
+  children?: PbVariable[];
 }
 
 export interface PbEvaluateResult {
@@ -594,88 +606,220 @@ export function parseMapDecls(payload: Buffer): PbMapDecl[] {
   return decls;
 }
 
-// Opcode-15 Array-data reply (type 0x11): `<echoed expr>\0` + repeated
-// (`<decimal index string>\0` + int64 LE value). Confirmed only for a
-// numeric (.i) element type.
-export function parseArrayElements(payload: Buffer): { name: string; elements: PbArrayElement[] } {
-  const nul = payload.indexOf(0);
-  const name = nul === -1 ? payload.toString("latin1") : payload.toString("latin1", 0, nul);
-  let off = nul === -1 ? payload.length : nul + 1;
+export interface ContainerFormat {
+  pointerBytes: 4 | 8;
+}
+
+const DEFAULT_CONTAINER_FORMAT: ContainerFormat = { pointerBytes: 8 };
+
+function readExternalString(payload: Buffer, off: number, unicode: boolean): { value: string; next: number } | undefined {
+  if (!unicode) {
+    const nul = payload.indexOf(0, off);
+    if (nul === -1) return undefined;
+    return { value: payload.toString("latin1", off, nul), next: nul + 1 };
+  }
+  for (let end = off; end + 1 < payload.length; end += 2) {
+    if (payload.readUInt16LE(end) === 0) return { value: payload.toString("utf16le", off, end), next: end + 2 };
+  }
+  return undefined;
+}
+
+function readPointer(payload: Buffer, off: number, pointerBytes: 4 | 8, signed: boolean): string | undefined {
+  if (off + pointerBytes > payload.length) return undefined;
+  if (pointerBytes === 4) return (signed ? payload.readInt32LE(off) : payload.readUInt32LE(off)).toString();
+  return (signed ? payload.readBigInt64LE(off) : payload.readBigUInt64LE(off)).toString();
+}
+
+/** Decode one value exactly as the upstream debugger's GetValueSize() does.
+ * `undefined` means the payload cannot safely be advanced for this type. */
+function readContainerValue(
+  type: number,
+  payload: Buffer,
+  off: number,
+  format: ContainerFormat,
+): { value: string; next: number } | undefined {
+  if ((type & TYPE_POINTER) !== 0) {
+    const value = readPointer(payload, off, format.pointerBytes, false);
+    if (value === undefined) return undefined;
+    return { value: `0x${BigInt(value).toString(16)}`, next: off + format.pointerBytes };
+  }
+  const baseType = type & TYPE_MASK;
+  if (baseType === TYPE_STRING || baseType === TYPE_FIXED_STRING) return readExternalString(payload, off, false);
+  if (baseType === STRUCT_TYPE_TAG) return undefined; // handled through the field map below
+  const info = SCALAR_TYPES[baseType];
+  if (info) {
+    const valueBytes = baseType === 0x15 ? format.pointerBytes : info.valueBytes;
+    if (off + valueBytes > payload.length) return undefined;
+    if (baseType === 0x15) {
+      const value = readPointer(payload, off, format.pointerBytes, true);
+      return value === undefined ? undefined : { value, next: off + valueBytes };
+    }
+    return { value: decodeScalarValue(info, payload.subarray(off, off + valueBytes)), next: off + valueBytes };
+  }
+  return undefined;
+}
+
+function readStructureFields(payload: Buffer, off: number): { fields: PbVariable[]; next: number } | undefined {
+  const flat: Array<{ type: number; name: string; level: number }> = [];
+  while (off < payload.length && payload.readInt8(off) !== -1) {
+    if (off + 6 >= payload.length) return undefined;
+    const type = payload.readUInt8(off);
+    const level = payload.readInt32LE(off + 2);
+    const nameStart = off + 6;
+    const nul = payload.indexOf(0, nameStart);
+    if (nul === -1) return undefined;
+    flat.push({ type, level, name: payload.toString("latin1", nameStart, nul) });
+    off = nul + 1;
+  }
+  if (off >= payload.length) return undefined;
+  off += 1; // -1 field-map terminator
+
+  const fields: PbVariable[] = [];
+  const parents: Array<{ level: number; field: PbVariable }> = [];
+  for (const entry of flat) {
+    const field: PbVariable = { type: entry.type, kind: 0, name: entry.name };
+    while (parents.length && parents[parents.length - 1].level >= entry.level) parents.pop();
+    if (parents.length) (parents[parents.length - 1].field.children ??= []).push(field);
+    else fields.push(field);
+    if ((entry.type & TYPE_MASK) === STRUCT_TYPE_TAG && (entry.type & TYPE_POINTER) === 0) {
+      parents.push({ level: entry.level, field });
+    }
+  }
+  return { fields, next: off };
+}
+
+function decodeStructureValues(fields: PbVariable[], payload: Buffer, off: number, format: ContainerFormat): number | undefined {
+  for (const field of fields) {
+    if (field.children) {
+      const next = decodeStructureValues(field.children, payload, off, format);
+      if (next === undefined) return undefined;
+      off = next;
+      continue;
+    }
+    const decoded = readContainerValue(field.type, payload, off, format);
+    if (!decoded) return undefined;
+    field.value = decoded.value;
+    off = decoded.next;
+  }
+  return off;
+}
+
+function readContainerHeader(payload: Buffer): { name: string; next: number } | undefined {
+  const decoded = readExternalString(payload, 0, false);
+  return decoded && { name: decoded.value, next: decoded.next };
+}
+
+function cloneStructureFields(fields: PbVariable[]): PbVariable[] {
+  return fields.map((field) =>
+    field.children ? { ...field, children: cloneStructureFields(field.children) } : { ...field },
+  );
+}
+
+// Opcode-15 Array-data reply: external-format echoed name, then repeated
+// ASCII dimension indices and target-typed values. `type` is Value1/f8.
+export function parseArrayElements(
+  payload: Buffer,
+  type = 0x15,
+  format: ContainerFormat = DEFAULT_CONTAINER_FORMAT,
+): { name: string; elements: PbArrayElement[] } | undefined {
+  const header = readContainerHeader(payload);
+  if (!header) return undefined;
+  let off = header.next;
+  const structure = (type & TYPE_MASK) === STRUCT_TYPE_TAG && (type & TYPE_POINTER) === 0 ? readStructureFields(payload, off) : undefined;
+  if ((type & TYPE_MASK) === STRUCT_TYPE_TAG && !structure) return undefined;
+  if (structure) off = structure.next;
   const elements: PbArrayElement[] = [];
   while (off < payload.length) {
-    const inul = payload.indexOf(0, off);
-    if (inul === -1) break;
-    const index = payload.toString("latin1", off, inul);
-    off = inul + 1;
-    if (off + 8 > payload.length) break;
-    const value = payload.readBigInt64LE(off).toString();
-    off += 8;
-    elements.push({ index, value });
+    const index = readExternalString(payload, off, false);
+    if (!index) return undefined;
+    off = index.next;
+    if (structure) {
+      const children = cloneStructureFields(structure.fields);
+      const next = decodeStructureValues(children, payload, off, format);
+      if (next === undefined) return undefined;
+      off = next;
+      elements.push({ index: index.value, value: "{...}", children });
+    } else {
+      const decoded = readContainerValue(type, payload, off, format);
+      if (!decoded) return undefined;
+      off = decoded.next;
+      elements.push({ index: index.value, value: decoded.value });
+    }
   }
-  return { name, elements };
+  return { name: header.name, elements };
 }
 
-// Opcode-15 Map-data reply (type 0x15): `<echoed expr>\0` + repeated
-// (`<key string>\0` + int64 LE value). Confirmed for a string-keyed,
-// numeric-valued map.
-export function parseMapElements(payload: Buffer): { name: string; elements: PbMapElement[] } {
-  const nul = payload.indexOf(0);
-  const name = nul === -1 ? payload.toString("latin1") : payload.toString("latin1", 0, nul);
-  let off = nul === -1 ? payload.length : nul + 1;
+// Opcode-15 Map-data reply: external-format echoed name, then repeated
+// external-format keys and target-typed values. `type` is Value1/f8.
+export function parseMapElements(
+  payload: Buffer,
+  type = 0x15,
+  format: ContainerFormat = DEFAULT_CONTAINER_FORMAT,
+): { name: string; elements: PbMapElement[] } | undefined {
+  const header = readContainerHeader(payload);
+  if (!header) return undefined;
+  let off = header.next;
+  const structure = (type & TYPE_MASK) === STRUCT_TYPE_TAG && (type & TYPE_POINTER) === 0 ? readStructureFields(payload, off) : undefined;
+  if ((type & TYPE_MASK) === STRUCT_TYPE_TAG && !structure) return undefined;
+  if (structure) off = structure.next;
   const elements: PbMapElement[] = [];
   while (off < payload.length) {
-    const knul = payload.indexOf(0, off);
-    if (knul === -1) break;
-    const key = payload.toString("latin1", off, knul);
-    off = knul + 1;
-    if (off + 8 > payload.length) break;
-    const value = payload.readBigInt64LE(off).toString();
-    off += 8;
-    elements.push({ key, value });
+    const key = readExternalString(payload, off, false);
+    if (!key) return undefined;
+    off = key.next;
+    if (structure) {
+      const children = cloneStructureFields(structure.fields);
+      const next = decodeStructureValues(children, payload, off, format);
+      if (next === undefined) return undefined;
+      off = next;
+      elements.push({ key: key.value, value: "{...}", children });
+    } else {
+      const decoded = readContainerValue(type, payload, off, format);
+      if (!decoded) return undefined;
+      off = decoded.next;
+      elements.push({ key: key.value, value: decoded.value });
+    }
   }
-  return { name, elements };
+  return { name: header.name, elements };
 }
 
-// Opcode-15 List-data reply (type 0x13, the SAME tag SendListData uses for
-// its own generic error replies -- see the caller for the disambiguation
-// this requires): `<echoed expr>\0` + repeated (int64 LE index + int64 LE
-// value), 16 bytes/element. Confirmed ONLY for a numeric (.i) element type.
-//
-// A string-element list's reply is 9 bytes/element instead (18 bytes total
-// for 2 elements): an 8-byte LE sequence number identical in shape to the
-// numeric case's index, plus a single trailing byte that's always 0 for
-// real "alpha"/"beta" strings in a live test. Disassembling
-// ExternalDebugger_SendListData (debugger.a, ExternalDebugger.o+0x4f10)
-// confirms why: it writes that 8-byte field itself, then delegates the
-// *value* to a shared `CopyValue` helper (ExternalDebugger.o+0x960) keyed
-// off a type tag. CopyValue's String case (+0xa50) does copy real
-// characters -- but for a `NewList x.s()`'s element, whatever type tag
-// SendListData actually passes takes CopyValue's default single-byte
-// fallback path (+0x9f0: `*dest = *src as byte; return 1`) instead, so the
-// wire genuinely never carries the string text; this is not a decoding
-// gap, it's a mistagged-type bug in the target's own debugger runtime.
-// (`ExternalDebugger_Variables`'s string handling is a separate code path
-// and isn't affected -- only this list-element helper is.) Confirmed
-// workaround: `PbDebugSession.evaluate("<name>()")` (Expression opcode 33,
-// kind 4) DOES return the list's real *current* element text -- live
-// output `"beta\0names()\0"` for this exact fixture -- so a per-index dump
-// isn't recoverable this way, but the current element is.
-export function parseListElements(payload: Buffer, elementCount: number): { name: string; elements: PbListElement[] } | undefined {
-  const nul = payload.indexOf(0);
-  if (nul === -1) return undefined;
-  const name = payload.toString("latin1", 0, nul);
-  const off0 = nul + 1;
-  if (payload.length - off0 !== elementCount * 16) return undefined; // not the confirmed numeric layout
+// Opcode-15 List-data reply: external-format echoed name, followed by an
+// Integer-sized sequence number and a target-typed value for each element.
+export function parseListElements(
+  payload: Buffer,
+  elementCount: number,
+  type = 0x15,
+  format: ContainerFormat = DEFAULT_CONTAINER_FORMAT,
+): { name: string; elements: PbListElement[] } | undefined {
+  // PureBasic 6.41's external debugger sends only one NUL byte for each
+  // List<String> value (a target bug); no parser can recover text it never
+  // received. Preserve the existing explicit unsupported path for it.
+  if ((type & TYPE_MASK) === TYPE_STRING || (type & TYPE_MASK) === TYPE_FIXED_STRING) return undefined;
+  const header = readContainerHeader(payload);
+  if (!header) return undefined;
+  let off = header.next;
+  const structure = (type & TYPE_MASK) === STRUCT_TYPE_TAG && (type & TYPE_POINTER) === 0 ? readStructureFields(payload, off) : undefined;
+  if ((type & TYPE_MASK) === STRUCT_TYPE_TAG && !structure) return undefined;
+  if (structure) off = structure.next;
   const elements: PbListElement[] = [];
-  let off = off0;
   for (let i = 0; i < elementCount; i++) {
-    const index = payload.readBigInt64LE(off).toString();
-    off += 8;
-    const value = payload.readBigInt64LE(off).toString();
-    off += 8;
-    elements.push({ index, value });
+    const index = readPointer(payload, off, format.pointerBytes, true);
+    if (index === undefined) return undefined;
+    off += format.pointerBytes;
+    if (structure) {
+      const children = cloneStructureFields(structure.fields);
+      const next = decodeStructureValues(children, payload, off, format);
+      if (next === undefined) return undefined;
+      off = next;
+      elements.push({ index, value: "{...}", children });
+    } else {
+      const decoded = readContainerValue(type, payload, off, format);
+      if (!decoded) return undefined;
+      off = decoded.next;
+      elements.push({ index, value: decoded.value });
+    }
   }
-  return { name, elements };
+  return off === payload.length ? { name: header.name, elements } : undefined;
 }
 
 interface PendingWaiter {
@@ -754,17 +898,15 @@ export function parseHandshakeReply(text: string): HandshakeReply {
 }
 
 /**
- * H2: the TCP/NetworkServer transport is protocol-verified on Linux but has
- * never been run end-to-end on real Windows hardware -- so `win32` must not
- * silently get it by default. Only an explicit transport override (used by
- * the local e2e suite to exercise TCP here on Linux) may opt in; anything
- * else on `win32` is refused with a clear error instead. A pure function so
- * this gate is unit-testable without needing to fake `process.platform` for
- * a whole spawned adapter process (which would also break its compiler-path
- * resolution, which is itself platform-aware).
+ * Debugging has been validated only on Linux. A normal launch on any other
+ * platform must therefore fail before compiling or opening a transport. An
+ * explicit transport remains an internal/test-only override so protocol tests
+ * can exercise an otherwise non-native transport on Linux. This pure function
+ * keeps the gate unit-testable without faking `process.platform` for a whole
+ * spawned adapter process (which would also break compiler-path resolution).
  */
-export function shouldRefuseUnvalidatedWindowsLaunch(platform: string, transport?: "fifo" | "tcp"): boolean {
-  return platform === "win32" && transport === undefined;
+export function shouldRefuseUnvalidatedPlatformLaunch(platform: string, transport?: "fifo" | "tcp"): boolean {
+  return platform !== "linux" && transport === undefined;
 }
 
 /** Parses PureBasic's own compiler-stdout version banner (its first printed
@@ -914,6 +1056,8 @@ export class PbDebugSession extends EventEmitter {
   private recvBuffer = Buffer.alloc(0);
   private pending: PendingWaiter[] = [];
   private unclaimed: PbMessage[] = [];
+  /** Set from MSG_STARTUP_ANNOUNCEMENT / ExeMode before container requests. */
+  private containerFormat: ContainerFormat = { ...DEFAULT_CONTAINER_FORMAT };
 
   /**
    * Opens both FIFO ends and resolves once the `hello` message arrives.
@@ -1315,8 +1459,18 @@ export class PbDebugSession extends EventEmitter {
   /** Drain the unconditional startup announcement sent right after `hello`. Bounded the same way
    *  {@link connect} is — an unconditional await here would otherwise hang launchRequest forever
    *  if the target sent hello but never followed up with the announcement. */
-  drainStartupAnnouncement(timeoutMs = 10000): Promise<PbMessage> {
-    return this.nextMessageWithTimeout(timeoutMs, "the debugger's startup announcement", MSG_STARTUP_ANNOUNCEMENT);
+  async drainStartupAnnouncement(timeoutMs = 10000): Promise<PbMessage> {
+    const msg = await this.nextMessageWithTimeout(timeoutMs, "the debugger's startup announcement", MSG_STARTUP_ANNOUNCEMENT);
+    // ExeMode's Value1 (the f8 header field) advertises the target width in
+    // bit 2. Container names, map keys, and String values themselves stay
+    // single-byte external-protocol strings even when bit 0 says the target
+    // is Unicode (confirmed on a real Unicode x64 target: f8=5 and
+    // `nums()`/map keys are still NUL-terminated ASCII). Only use this
+    // announcement for the architecture-dependent fields.
+    this.containerFormat = {
+      pointerBytes: (msg.f8 & (1 << 2)) !== 0 ? 8 : 4,
+    };
+    return msg;
   }
 
   /** Opcode 0: request a cooperative pause at the next PureBasic statement check. */
@@ -1504,15 +1658,19 @@ export class PbDebugSession extends EventEmitter {
       const msg = await this.nextMessageWithTimeout(timeoutMs, "the array/list/map expression result");
       const echoesExpression = msg.payload.length >= expression.length && msg.payload.toString("latin1", 0, expression.length) === expression;
       if (msg.type === 0x11 && echoesExpression) {
-        const { name, elements } = parseArrayElements(msg.payload);
+        const result = parseArrayElements(msg.payload, msg.f8, this.containerFormat);
+        if (!result) return { kind: "unsupported", raw: msg.payload };
+        const { name, elements } = result;
         return { kind: "array", name, elements };
       }
       if (msg.type === 0x15 && echoesExpression) {
-        const { name, elements } = parseMapElements(msg.payload);
+        const result = parseMapElements(msg.payload, msg.f8, this.containerFormat);
+        if (!result) return { kind: "unsupported", raw: msg.payload };
+        const { name, elements } = result;
         return { kind: "map", name, elements };
       }
       if (msg.type === 0x13 && echoesExpression) {
-        const listResult = parseListElements(msg.payload, msg.f12);
+        const listResult = parseListElements(msg.payload, msg.f12, msg.f8, this.containerFormat);
         if (listResult) return { kind: "list", name: listResult.name, elements: listResult.elements };
         return { kind: "unsupported", raw: msg.payload };
       }

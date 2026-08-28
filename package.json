@@ -235,7 +235,7 @@
     "debuggers": [
       {
         "type": "purebasic",
-        "label": "PureBasic Debug",
+        "label": "PureBasic Debug (Linux)",
         "languages": [
           "purebasic"
         ],

@@ -35,7 +35,7 @@ import {
   parseMapDecls,
   parseMapElements,
   parseVariables,
-  shouldRefuseUnvalidatedWindowsLaunch,
+  shouldRefuseUnvalidatedPlatformLaunch,
   splitHandshakeFrame,
   unstickFifoRendezvous,
   type PbMessage,
@@ -381,6 +381,83 @@ test("parseArrayElements decodes echoed name plus index/value pairs", () => {
   });
 });
 
+test("container element decoders honor the reply type instead of assuming int64", () => {
+  const float = Buffer.alloc(4);
+  float.writeFloatLE(1.5);
+  const array = Buffer.concat([nulString("weights()"), nulString("0"), float]);
+  assert.deepEqual(parseArrayElements(array, 0x09), {
+    name: "weights()",
+    elements: [{ index: "0", value: "1.5" }],
+  });
+
+  const stringMap = Buffer.concat([nulString("labels()"), nulString("a"), nulString("hello")]);
+  assert.deepEqual(parseMapElements(stringMap, 0x08), {
+    name: "labels()",
+    elements: [{ key: "a", value: "hello" }],
+  });
+});
+
+test("container element decoders cover every fixed-width scalar layout", () => {
+  const value = (type: number, bytes: Buffer, expected: string) => {
+    const payload = Buffer.concat([nulString("values()"), nulString("0"), bytes]);
+    assert.deepEqual(parseArrayElements(payload, type), {
+      name: "values()",
+      elements: [{ index: "0", value: expected }],
+    });
+  };
+  const int16 = Buffer.alloc(2); int16.writeInt16LE(-1234);
+  const uint16 = Buffer.alloc(2); uint16.writeUInt16LE(9731);
+  const int32 = Buffer.alloc(4); int32.writeInt32LE(-100000);
+  const uint32 = Buffer.alloc(4); uint32.writeUInt32LE(66);
+  const double = Buffer.alloc(8); double.writeDoubleLE(2.5);
+  value(0x01, Buffer.from([0xf4]), "-12");
+  value(0x18, Buffer.from([0x41]), "65");
+  value(0x03, int16, "-1234");
+  value(0x19, uint16, "9731");
+  value(0x05, int32, "-100000");
+  value(0x0b, uint32, "66");
+  value(0x15, int64le(-7), "-7");
+  value(0x0d, int64le(-8), "-8");
+  value(0x0c, double, "2.5");
+});
+
+test("container element decoders use the target pointer width", () => {
+  const pointer = Buffer.alloc(4);
+  pointer.writeUInt32LE(0xfeedbeef);
+  const list = Buffer.concat([nulString("ptrs()"), int32le(3), pointer]);
+  assert.deepEqual(parseListElements(list, 1, 0x95, { pointerBytes: 4 }), {
+    name: "ptrs()",
+    elements: [{ index: "3", value: "0xfeedbeef" }],
+  });
+
+});
+
+test("container structure field maps become expandable, independently decoded children", () => {
+  // Each map entry is: type, dynamic-type, 4-byte sublevel, ASCII field name.
+  const field = (type: number, level: number, name: string) =>
+    Buffer.concat([Buffer.from([type, 0]), int32le(level), nulString(name)]);
+  const payload = Buffer.concat([
+    nulString("points()"),
+    field(0x05, 0, "x"),
+    field(0x08, 0, "label"),
+    Buffer.from([0xff]),
+    nulString("0"), int32le(-7), nulString("origin"),
+  ]);
+  assert.deepEqual(parseArrayElements(payload, 0x07), {
+    name: "points()",
+    elements: [
+      {
+        index: "0",
+        value: "{...}",
+        children: [
+          { type: 0x05, kind: 0, name: "x", value: "-7" },
+          { type: 0x08, kind: 0, name: "label", value: "origin" },
+        ],
+      },
+    ],
+  });
+});
+
 test("parseMapElements decodes echoed name plus key/value pairs", () => {
   const payload = Buffer.concat([
     nulString("scores()"),
@@ -411,7 +488,7 @@ test("parseListElements decodes the confirmed numeric 16-bytes-per-element layou
 
 test("parseListElements returns undefined when the payload doesn't match elementCount * 16 bytes (e.g. the List<String> mistagged-type case)", () => {
   const payload = Buffer.concat([nulString("names()"), int64le(0), Buffer.from([0])]); // 9 bytes/element shape, not 16
-  assert.equal(parseListElements(payload, 2), undefined);
+  assert.equal(parseListElements(payload, 2, 0x08), undefined);
 });
 
 test("parseListElements returns undefined with no NUL terminator at all", () => {
@@ -581,18 +658,18 @@ test("parseCompilerVersionBanner returns undefined for unrecognizable text, neve
   assert.equal(parseCompilerVersionBanner("some unrelated compiler output"), undefined);
 });
 
-test("shouldRefuseUnvalidatedWindowsLaunch refuses a plain win32 launch (no Windows validation pass yet)", () => {
-  assert.equal(shouldRefuseUnvalidatedWindowsLaunch("win32", undefined), true);
+test("shouldRefuseUnvalidatedPlatformLaunch allows a normal Linux launch", () => {
+  assert.equal(shouldRefuseUnvalidatedPlatformLaunch("linux", undefined), false);
 });
 
-test("shouldRefuseUnvalidatedWindowsLaunch allows win32 only with an explicit transport override", () => {
-  assert.equal(shouldRefuseUnvalidatedWindowsLaunch("win32", "tcp"), false);
-  assert.equal(shouldRefuseUnvalidatedWindowsLaunch("win32", "fifo"), false);
+test("shouldRefuseUnvalidatedPlatformLaunch refuses normal Windows and macOS launches", () => {
+  assert.equal(shouldRefuseUnvalidatedPlatformLaunch("win32", undefined), true);
+  assert.equal(shouldRefuseUnvalidatedPlatformLaunch("darwin", undefined), true);
 });
 
-test("shouldRefuseUnvalidatedWindowsLaunch never refuses non-Windows platforms", () => {
-  assert.equal(shouldRefuseUnvalidatedWindowsLaunch("linux", undefined), false);
-  assert.equal(shouldRefuseUnvalidatedWindowsLaunch("darwin", undefined), false);
+test("shouldRefuseUnvalidatedPlatformLaunch retains the internal transport override", () => {
+  assert.equal(shouldRefuseUnvalidatedPlatformLaunch("win32", "tcp"), false);
+  assert.equal(shouldRefuseUnvalidatedPlatformLaunch("darwin", "fifo"), false);
 });
 
 test("allocateFreeTcpPort returns a port that can actually be bound", async () => {

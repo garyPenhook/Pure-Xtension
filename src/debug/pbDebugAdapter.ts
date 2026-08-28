@@ -30,7 +30,7 @@ import {
   PbDebugSession,
   PbEvaluateResult,
   PbVariable,
-  shouldRefuseUnvalidatedWindowsLaunch,
+  shouldRefuseUnvalidatedPlatformLaunch,
   STOP_REASON_DATA_BREAKPOINT,
   STRING_TYPE_TAG,
   unstickFifoRendezvous,
@@ -387,6 +387,18 @@ export class PureBasicDebugSession extends DebugSession {
     let responseSent = false;
     try {
     this.sourcePath = args.program;
+    // Linux is the only platform with a complete, real-machine debugger
+    // validation pass. `transport` is deliberately an undocumented test hook
+    // (used to exercise NetworkServer on Linux); it may opt out of this gate.
+    if (shouldRefuseUnvalidatedPlatformLaunch(process.platform, args.transport)) {
+      this.sendErrorResponse(
+        response,
+        1006,
+        `Pure Xtension: debugging is currently enabled only on Linux; ${process.platform} has not been validated end-to-end yet (see README.md).`,
+      );
+      return;
+    }
+
     const backend = args.backend ?? resolveBackendSilent() ?? "asm";
     const compiler = resolveCompilerPath(backend);
     if (!compiler) {
@@ -425,28 +437,8 @@ export class PureBasicDebugSession extends DebugSession {
       this.logError(err);
     }
 
-    // FIFOs are POSIX-only, so non-Windows always uses that proven
-    // transport. The TCP/NetworkServer transport is implemented and
-    // protocol-verified (over a real NetworkServer connection on Linux),
-    // but has never been run on an actual Windows machine end-to-end
-    // (launch, breakpoints, stepping, variables, evaluate, termination,
-    // cleanup) — until that validation pass happens, Windows must not
-    // silently get an unverified debugger by default. `args.transport` is
-    // an internal-only override so the e2e suite can still exercise the
-    // TCP/NetworkServer path here on Linux.
-    if (shouldRefuseUnvalidatedWindowsLaunch(process.platform, args.transport)) {
-      this.sendErrorResponse(
-        response,
-        1006,
-        "Pure Xtension: debugging on Windows isn't enabled yet — a TCP transport is implemented and protocol-verified on Linux, but has not been validated end-to-end on real Windows hardware (see README.md).",
-      );
-      this.cleanupTempDirs();
-      return;
-    }
-    // Only an explicit "fifo" opts out of TCP -- any other (e.g. mistyped)
-    // override value must not silently fall back to FIFO on Windows, where
-    // it would fail with a raw execFileSync("mkfifo") ENOENT instead of a
-    // clear error.
+    // The transport override is internal-only. Only an explicit "fifo" opts
+    // out of TCP; any other value falls back to FIFO.
     const useTcp = args.transport === "fifo" ? false : args.transport === "tcp";
 
     let transportEnv: Record<string, string>;
@@ -1192,9 +1184,25 @@ export class PureBasicDebugSession extends DebugSession {
       const result = await this.pb.examineExpression(handle.expression);
       let variables: Variable[];
       if (result.kind === "array" || result.kind === "list") {
-        variables = result.elements.map((e) => new Variable(`[${e.index}]`, e.value));
+        variables = result.elements.map((e) =>
+          e.children
+            ? new Variable(
+                `[${e.index}]`,
+                e.value,
+                this.registerCompound({ kind: "struct", children: e.children, expression: handle.expression }),
+              )
+            : new Variable(`[${e.index}]`, e.value),
+        );
       } else if (result.kind === "map") {
-        variables = result.elements.map((e) => new Variable(e.key, e.value));
+        variables = result.elements.map((e) =>
+          e.children
+            ? new Variable(
+                e.key,
+                e.value,
+                this.registerCompound({ kind: "struct", children: e.children, expression: handle.expression }),
+              )
+            : new Variable(e.key, e.value),
+        );
       } else if (result.kind === "unsupported") {
         // Confirmed live only for List<String> so far (PLAN.md M5): the
         // target's own SendListData mistags string elements' type and never
