@@ -4,6 +4,7 @@ import Mocha from "mocha";
 export function run(): Promise<void> {
   const mocha = new Mocha({ ui: "tdd", timeout: 120000, color: false });
   mocha.addFile(path.resolve(__dirname, "debugSession.test.js"));
+  mocha.addFile(path.resolve(__dirname, "configRestart.test.js"));
 
   return new Promise((resolve, reject) => {
     try {

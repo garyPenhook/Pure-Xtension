@@ -62,9 +62,16 @@ async function runTask(mode: "build" | "buildRun" | "check"): Promise<void> {
   await vscode.tasks.executeTask(task);
 }
 
-export function activate(context: vscode.ExtensionContext): void {
+/** Exposed via the activation return value so integration tests can observe
+ *  internal restart behavior without reaching into module-private state. */
+export interface PureXtensionExports {
+  getRestartCount(): number;
+}
+
+export function activate(context: vscode.ExtensionContext): PureXtensionExports {
   const diagnostics = new PureBasicDiagnostics();
   const helpTree = new HelpTreeProvider();
+  let restartCount = 0;
 
   // The tree's data lives behind the language client; refresh it every time the
   // client (re)starts so a sidebar expanded before the compiler resolved (or
@@ -121,10 +128,16 @@ export function activate(context: vscode.ExtensionContext): void {
       if (e.affectsConfiguration("pureXtension.purebasicHome")) {
         invalidateHomeCache();
       }
+      // purebasicHome must also restart the client, not just invalidate the
+      // home-resolution cache -- otherwise a running server keeps using the
+      // compilerPath (and cacheDir-scoped built-in/help data) it was started
+      // with until something else happens to trigger a restart.
       if (
+        e.affectsConfiguration("pureXtension.purebasicHome") ||
         e.affectsConfiguration("pureXtension.backend") ||
         e.affectsConfiguration("pureXtension.compilerPath")
       ) {
+        restartCount++;
         restartLanguageClient().catch((error) =>
           vscode.window.showErrorMessage(`Pure Xtension: ${String(error)}`),
         );
@@ -137,6 +150,8 @@ export function activate(context: vscode.ExtensionContext): void {
   }
 
   void restartLanguageClient();
+
+  return { getRestartCount: () => restartCount };
 }
 
 export async function deactivate(): Promise<void> {

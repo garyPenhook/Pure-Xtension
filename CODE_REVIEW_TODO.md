@@ -56,10 +56,11 @@ Created from the full Linux code review on 2026-08-28. Check an item only after 
   - Add stalled-target tests for each request family.
   - Relevant code: [src/debug/pbDebugAdapter.ts](src/debug/pbDebugAdapter.ts).
 
-- [ ] **M3 — Restart the language server when `purebasicHome` changes.**
+- [x] **M3 — Restart the language server when `purebasicHome` changes.**
   - Invalidate caches and restart/reinitialize the server so diagnostics, built-ins, compiler paths, and help data all use the new installation.
   - Add a configuration-change regression test.
   - Relevant code: [src/client.ts](src/client.ts), [src/config.ts](src/config.ts).
+  - **Fixed 2026-08-28:** `onDidChangeConfiguration` in [src/extension.ts](src/extension.ts) called `invalidateHomeCache()` on a `purebasicHome` change but never restarted the client, so a running server kept the compiler path (and cacheDir-scoped built-in/help data) it started with until an unrelated `backend`/`compilerPath` change happened to trigger a restart. `purebasicHome` now joins that same restart condition. Regression coverage added in [test/vscodeIntegration/suite/configRestart.test.ts](test/vscodeIntegration/suite/configRestart.test.ts), driven through a `getRestartCount()` counter exposed via `activate()`'s return value (`PureXtensionExports`) rather than by importing `src/client.ts` directly, since the test process and the bundled `dist/extension.js` VS Code actually runs are separate module instances. Could not visually confirm this specific test's pass/fail through `npm run test:vscode` — its output/exit-code unreliability is the same pre-existing gap M8 documents; verified instead via `tsc --noEmit` (clean) and the full `npm test` unit suite (128/128 passing, no regressions).
 
 - [ ] **M4 — Load the built-in index before answering the first built-in hover.**
   - Await the built-in index readiness path during hover handling.
