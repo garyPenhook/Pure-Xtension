@@ -20,15 +20,20 @@ import { DebugProtocol } from "@vscode/debugprotocol";
 import { Backend, resolveBackendSilent, resolveCompilerPath } from "../config";
 import {
   allocateFreeTcpPort,
+  compileAsync,
   DBP_COULD_NOT_ADD,
   DBP_EVAL_ERROR,
   DBP_TRUE,
+  DEFAULT_COMPILE_TIMEOUT_MS,
   parseCompilerVersionBanner,
   PbDataBreakpointEvent,
   PbDebugSession,
   PbEvaluateResult,
   PbVariable,
+  shouldRefuseUnvalidatedWindowsLaunch,
   STOP_REASON_DATA_BREAKPOINT,
+  STRING_TYPE_TAG,
+  unstickFifoRendezvous,
 } from "./pbSession";
 import { GdbMiPtraceEngine, gdbEngineAvailable } from "./ptraceEngine";
 
@@ -47,7 +52,7 @@ const FORCE_PAUSE_FALLBACK_MS = 750;
 const COMPOUND_REF_BASE = 100000;
 
 type CompoundHandle =
-  | { kind: "struct"; children: PbVariable[] }
+  | { kind: "struct"; children: PbVariable[]; expression: string }
   | { kind: "array" | "list" | "map"; expression: string };
 
 /** A data breakpoint currently armed on the wire. `condition` is the exact
@@ -114,6 +119,10 @@ interface LaunchArgs extends DebugProtocol.LaunchRequestArguments {
 export class PureBasicDebugSession extends DebugSession {
   private pb = new PbDebugSession();
   private child?: cp.ChildProcess;
+  /** The debug-build compiler invocation in flight during launchRequest, if
+   *  any -- tracked so disconnectRequest can kill it if the user stops the
+   *  session while a (possibly stalled) compile is still running. */
+  private compileChild?: cp.ChildProcess;
   private workDir?: string;
   private fifoDir?: string;
   private sourcePath = "";
@@ -388,11 +397,25 @@ export class PureBasicDebugSession extends DebugSession {
     this.workDir = fs.mkdtempSync(path.join(os.tmpdir(), "pure-xtension-debug-"));
     const outBinary = path.join(this.workDir, "target.bin");
     const compileArgs = ["-d", "-ds", "-l", "-o", outBinary, ...(args.compilerArgs ?? []), args.program];
-    const compileResult = cp.spawnSync(compiler, compileArgs, { encoding: "utf8" });
+    // H4: spawnSync used to block the entire extension host -- all UI, all
+    // other requests -- for however long the compile took, with no timeout
+    // and no way to cancel a stalled compiler. compileAsync() hands back the
+    // child immediately so disconnectRequest can kill it if the user stops
+    // the session mid-compile (see this.compileChild).
+    const { child: compileChild, result: compileResultPromise } = compileAsync(compiler, compileArgs);
+    this.compileChild = compileChild;
+    const compileResult = await compileResultPromise;
+    this.compileChild = undefined;
     if (compileResult.status !== 0) {
-      this.sendEvent(new OutputEvent(compileResult.stdout ?? "", "stdout"));
-      this.sendEvent(new OutputEvent(compileResult.stderr ?? "", "stderr"));
-      this.sendErrorResponse(response, 1002, "Pure Xtension: compile (debug build) failed — see debug console.");
+      this.sendEvent(new OutputEvent(compileResult.stdout, "stdout"));
+      this.sendEvent(new OutputEvent(compileResult.stderr, "stderr"));
+      this.sendErrorResponse(
+        response,
+        1002,
+        compileResult.timedOut
+          ? `Pure Xtension: compile (debug build) timed out after ${DEFAULT_COMPILE_TIMEOUT_MS / 1000}s and was killed — see debug console.`
+          : "Pure Xtension: compile (debug build) failed — see debug console.",
+      );
       this.cleanupTempDirs();
       return;
     }
@@ -402,40 +425,42 @@ export class PureBasicDebugSession extends DebugSession {
       this.logError(err);
     }
 
-    // Automatic selection is FIFO everywhere except Windows (where FIFOs
-    // don't exist); `args.transport` is an internal-only override so the
-    // e2e suite can exercise the TCP/NetworkServer path on this Linux
-    // machine too -- there's no Windows box available to verify against,
-    // so TCP's correctness is proven here by running the identical protocol
-    // over a real local NetworkServer connection, not by process.platform
-    // actually being "win32".
-    // Only an explicit "fifo" opts out of the platform default -- any other
-    // (e.g. mistyped) override value must not silently fall back to FIFO on
-    // Windows, where it would fail with a raw execFileSync("mkfifo") ENOENT
-    // instead of a clear error.
-    const useTcp = args.transport === "fifo" ? false : args.transport === "tcp" || process.platform === "win32";
+    // FIFOs are POSIX-only, so non-Windows always uses that proven
+    // transport. The TCP/NetworkServer transport is implemented and
+    // protocol-verified (over a real NetworkServer connection on Linux),
+    // but has never been run on an actual Windows machine end-to-end
+    // (launch, breakpoints, stepping, variables, evaluate, termination,
+    // cleanup) — until that validation pass happens, Windows must not
+    // silently get an unverified debugger by default. `args.transport` is
+    // an internal-only override so the e2e suite can still exercise the
+    // TCP/NetworkServer path here on Linux.
+    if (shouldRefuseUnvalidatedWindowsLaunch(process.platform, args.transport)) {
+      this.sendErrorResponse(
+        response,
+        1006,
+        "Pure Xtension: debugging on Windows isn't enabled yet — a TCP transport is implemented and protocol-verified on Linux, but has not been validated end-to-end on real Windows hardware (see README.md).",
+      );
+      this.cleanupTempDirs();
+      return;
+    }
+    // Only an explicit "fifo" opts out of TCP -- any other (e.g. mistyped)
+    // override value must not silently fall back to FIFO on Windows, where
+    // it would fail with a raw execFileSync("mkfifo") ENOENT instead of a
+    // clear error.
+    const useTcp = args.transport === "fifo" ? false : args.transport === "tcp";
 
     let transportEnv: Record<string, string>;
     let doConnect: () => Promise<unknown>;
+    let fifoPaths: { outFifo: string; inFifo: string } | undefined;
 
     if (useTcp) {
-      if (!args.transport) {
-        // Auto-selected by platform detection, not the internal test
-        // override -- surface that this path is newer and has not been run
-        // on a real Windows machine (only verified via the identical
-        // protocol over TCP on Linux), since a Windows-specific failure
-        // here (firewall, antivirus interference) would otherwise look
-        // identical to the fully-proven Linux/FIFO path with no indication
-        // it's a different level of confidence.
-        this.sendEvent(new OutputEvent("Pure Xtension: debugging on Windows uses a TCP transport that has not yet been verified on a real Windows machine (see the README). Please report any issues.\n"));
-      }
       // PureBasic's TCP handshake requires the compiler's own numeric
       // version (PLAN.md M10.1) -- parsed from the version banner every
       // compiler invocation already prints as its first stdout line, so no
       // extra invocation is needed. Never guess a version: a wrong one
       // produces a confusing target-side ERROR ... WrongVersion instead of
       // this clear, adapter-side explanation.
-      const version = parseCompilerVersionBanner(compileResult.stdout ?? "");
+      const version = parseCompilerVersionBanner(compileResult.stdout);
       if (version === undefined) {
         this.sendErrorResponse(
           response,
@@ -462,6 +487,7 @@ export class PureBasicDebugSession extends DebugSession {
       cp.execFileSync("mkfifo", [outFifo, inFifo]);
       transportEnv = { PB_DEBUGGER_Communication: `FifoFiles;${outFifo};${inFifo}` };
       doConnect = () => this.pb.connect(outFifo, inFifo);
+      fifoPaths = { outFifo, inFifo };
     }
 
     this.child = cp.spawn(outBinary, args.args ?? [], {
@@ -472,6 +498,26 @@ export class PureBasicDebugSession extends DebugSession {
         ...transportEnv,
       },
     });
+    // Node never throws synchronously for a bad cwd, missing executable, or
+    // permission failure here -- spawn() reports those asynchronously via
+    // this 'error' event instead. An EventEmitter with no 'error' listener
+    // re-throws on emit, which would otherwise surface as an unhandled
+    // exception (it fires after spawn() has already returned, so outside
+    // this function's try/catch) and could take down the whole extension
+    // host. This permanent listener covers the entire session lifetime, not
+    // just the launch race below -- e.g. a broken-pipe write error long
+    // after a successful launch must not crash the extension host either.
+    this.child.on("error", (err) => this.logError(err));
+    // Racing the same event against doConnect() below turns what would
+    // otherwise be a several-second wait for a generic connect timeout into
+    // an immediate, specific spawn error, just during this launch window.
+    let spawnError: Error | undefined;
+    const spawnFailure = new Promise<never>((_resolve, reject) => {
+      this.child?.once("error", (err) => {
+        spawnError = err;
+        reject(err);
+      });
+    });
     this.child.stdout?.on("data", (d) => this.sendEvent(new OutputEvent(d.toString(), "stdout")));
     this.child.stderr?.on("data", (d) => this.sendEvent(new OutputEvent(d.toString(), "stderr")));
     this.child.on("exit", (code) => {
@@ -480,19 +526,35 @@ export class PureBasicDebugSession extends DebugSession {
     });
 
     try {
-      await doConnect();
-      await this.pb.drainStartupAnnouncement();
+      await Promise.race([
+        (async () => {
+          await doConnect();
+          await this.pb.drainStartupAnnouncement();
+        })(),
+        spawnFailure,
+      ]);
     } catch (err) {
       this.sendErrorResponse(
         response,
         1003,
-        `Pure Xtension: failed to connect to the target's debugger (${String(err)}). Is "${path.basename(outBinary)}" a real -d debug build?`,
+        spawnError
+          ? `Pure Xtension: failed to start the target process (${spawnError.message}). Check that "${path.basename(outBinary)}" exists, is executable, and the working directory is valid.`
+          : `Pure Xtension: failed to connect to the target's debugger (${String(err)}). Is "${path.basename(outBinary)}" a real -d debug build?`,
       );
       // SIGTERM (the default) is confirmed ineffective against a running
       // -d target (PLAN.md M5: live-tested, the process just ignores it) —
-      // SIGKILL is the only signal verified to actually terminate it.
+      // SIGKILL is the only signal verified to actually terminate it. Safe
+      // to call even when spawn() itself failed (no pid): kill() is then a
+      // harmless no-op rather than a throw.
       this.child.kill("SIGKILL");
       this.pb.close();
+      // doConnect() above already started (and, on this failure path, will
+      // never finish) fs.createReadStream(outFifo)/createWriteStream(inFifo)'s
+      // blocking opens -- pb.close()'s destroy()/end() only defers cleanup
+      // until those opens eventually complete, which never happens on their
+      // own once the target never started. See unstickFifoRendezvous's doc
+      // comment for why this is needed and how it's safe.
+      if (fifoPaths) unstickFifoRendezvous(fifoPaths.outFifo, fifoPaths.inFifo);
       this.cleanupTempDirs();
       return;
     }
@@ -1047,10 +1109,41 @@ export class PureBasicDebugSession extends DebugSession {
     return ref;
   }
 
-  /** Converts a scalar-stream record into a DAP Variable, giving structure children their own expandable reference. */
-  private toDapVariable(v: PbVariable): Variable {
+  /**
+   * Converts a scalar-stream record into a DAP Variable, giving structure
+   * children their own expandable reference. `parentExpression`, set only
+   * when converting a struct's own field records, qualifies a String
+   * field's name into a real evaluatable expression (e.g. `p\label`) --
+   * see the String-handling branch below for why that lookup is needed at
+   * all.
+   */
+  private async toDapVariable(v: PbVariable, parentExpression?: string): Promise<Variable> {
     if (v.children) {
-      return new Variable(v.name, "{...}", this.registerCompound({ kind: "struct", children: v.children }));
+      return new Variable(
+        v.name,
+        "{...}",
+        this.registerCompound({ kind: "struct", children: v.children, expression: v.name }),
+      );
+    }
+    if (v.unsupported) {
+      // PLAN.md M12: an unrecognized wire type tag -- its value (and, while
+      // parsing, its byte width) genuinely isn't known, so this is an
+      // honest "can't decode" instead of a guessed/blank/garbage value.
+      return new Variable(v.name, `<unsupported type 0x${v.type.toString(16)}>`);
+    }
+    if (v.type === STRING_TYPE_TAG) {
+      // A String scalar's ExamineCurrentFrame/ExamineFrame record carries
+      // no inline value at all (PLAN.md M12) -- only evaluate() can recover
+      // the actual text. The module-scope struct-field path already
+      // populates v.value itself (it evaluates every field up front,
+      // regardless of type) -- trust that instead of a redundant re-fetch.
+      // Otherwise, a top-level local's own name is already a valid
+      // expression; a struct field needs the parent's expression prefixed
+      // with PureBasic's field-access backslash.
+      if (v.value !== undefined) return new Variable(v.name, v.value);
+      const expr = parentExpression ? `${parentExpression}\\${v.name}` : v.name;
+      const result = await this.pb.evaluate(expr);
+      return new Variable(v.name, result.value ?? result.error ?? "<unavailable>");
     }
     return new Variable(v.name, v.value ?? "");
   }
@@ -1076,7 +1169,9 @@ export class PureBasicDebugSession extends DebugSession {
         return;
       }
       if (handle.kind === "struct") {
-        response.body = { variables: handle.children.map((v) => this.toDapVariable(v)) };
+        response.body = {
+          variables: await Promise.all(handle.children.map((v) => this.toDapVariable(v, handle.expression))),
+        };
         this.sendResponse(response);
         return;
       }
@@ -1146,7 +1241,7 @@ export class PureBasicDebugSession extends DebugSession {
 
     let variables: Variable[];
     if (handle?.kind === "proc") {
-      variables = (await this.pb.examineFrame(handle.pbIndex)).map((v) => this.toDapVariable(v));
+      variables = await Promise.all((await this.pb.examineFrame(handle.pbIndex)).map((v) => this.toDapVariable(v)));
     } else {
       // Main/module scope (also the fallback for an unknown/stale ref). Opcode
       // 9 lists the names; each scalar's value is read via evaluate (opcode
@@ -1174,7 +1269,7 @@ export class PureBasicDebugSession extends DebugSession {
             });
           }
           variables.push(
-            new Variable(d.name, "{...}", this.registerCompound({ kind: "struct", children })),
+            new Variable(d.name, "{...}", this.registerCompound({ kind: "struct", children, expression })),
           );
           continue;
         }
@@ -1318,6 +1413,12 @@ export class PureBasicDebugSession extends DebugSession {
     // target, live-tested (the process just ignores it and keeps running).
     this.pb.close();
     this.child?.kill("SIGKILL");
+    // H4: launchRequest's compile step is async now (see compileAsync), so
+    // it's possible to reach here while a (possibly stalled) compile is
+    // still running -- e.g. Stop pressed before the debug build finishes.
+    // Without this, that compiler process would keep running orphaned after
+    // the session it belongs to is gone.
+    this.compileChild?.kill("SIGKILL");
     this.cleanupTempDirs();
     this.sendResponse(response);
   }

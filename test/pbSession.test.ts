@@ -5,9 +5,14 @@
 // next to each parser.
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import * as cp from "child_process";
+import * as fs from "fs";
 import * as net from "net";
+import * as os from "os";
+import * as path from "path";
 import {
   allocateFreeTcpPort,
+  compileAsync,
   type PbReadable,
   type PbWritable,
   buildConnectRequest,
@@ -30,7 +35,9 @@ import {
   parseMapDecls,
   parseMapElements,
   parseVariables,
+  shouldRefuseUnvalidatedWindowsLaunch,
   splitHandshakeFrame,
+  unstickFifoRendezvous,
   type PbMessage,
 } from "../src/debug/pbSession";
 
@@ -175,7 +182,10 @@ test("parseVariables decodes a scalar record", () => {
     nulString("a"),
     int64le(42),
   ]);
-  assert.deepEqual(parseVariables(payload), [{ type: 0x15, kind: 3, name: "a", value: "42" }]);
+  // parseVariables always assigns an `unsupported` property, even undefined
+  // -- deepStrictEqual treats a present-but-undefined key differently from
+  // a missing one, so every expectation below lists it explicitly.
+  assert.deepEqual(parseVariables(payload), [{ type: 0x15, kind: 3, name: "a", value: "42", unsupported: undefined }]);
 });
 
 test("parseVariables attaches nested records to a preceding structure header", () => {
@@ -189,26 +199,73 @@ test("parseVariables attaches nested records to a preceding structure header", (
       type: 0x07,
       kind: 3,
       name: "p.Point",
-      // parseVariables always assigns a `value` property, even undefined
-      // (structure headers carry no trailing scalar value of their own) —
-      // deepStrictEqual treats a present-but-undefined key differently from
-      // a missing one, so this must be listed explicitly.
       value: undefined,
+      unsupported: undefined,
       children: [
-        { type: 0x15, kind: 3, name: "x", value: "10" },
-        { type: 0x15, kind: 3, name: "y", value: "20" },
+        { type: 0x15, kind: 3, name: "x", value: "10", unsupported: undefined },
+        { type: 0x15, kind: 3, name: "y", value: "20", unsupported: undefined },
       ],
     },
   ]);
 });
 
-test("parseVariables falls back to a hex dump when the trailing value is truncated", () => {
+test("parseVariables reports an explicit unsupported result when a value is truncated mid-decode, instead of guessing and desyncing later records", () => {
+  // PLAN.md M12: reading the wrong number of trailing bytes for one record
+  // desyncs every record after it, so a truncated (or unrecognized-type)
+  // value stops decoding rather than falling back to a guessed hex dump.
   const payload = Buffer.concat([
     Buffer.from([0x15, 0, 3, 0, 0, 0, 0]),
     nulString("a"),
-    Buffer.from([0xde, 0xad]), // only 2 bytes, not the full 8-byte value
+    Buffer.from([0xde, 0xad]), // only 2 bytes, not Integer's full 8-byte value
   ]);
-  assert.deepEqual(parseVariables(payload), [{ type: 0x15, kind: 3, name: "a", value: "0xdead" }]);
+  assert.deepEqual(parseVariables(payload), [{ type: 0x15, kind: 3, name: "a", value: undefined, unsupported: true }]);
+});
+
+test("parseVariables reports an explicit unsupported result for an unrecognized type tag", () => {
+  const payload = Buffer.concat([Buffer.from([0xfe, 0, 3, 0, 0, 0, 0]), nulString("a"), int64le(1)]);
+  assert.deepEqual(parseVariables(payload), [{ type: 0xfe, kind: 3, name: "a", value: undefined, unsupported: true }]);
+});
+
+test("parseVariables decodes every confirmed scalar type from real captured wire bytes (PLAN.md M12)", () => {
+  // Each hex payload below is an exact live capture (Linux x64, PureBasic
+  // 6.41) of opcode 11's reply for a single isolated `Protected` local of
+  // the given type -- not hand-built or inferred. Byte width and signedness
+  // vary per type; this is the regression fixture for the discovery that
+  // an earlier version of this parser blindly read every non-struct type
+  // as a uniform 8-byte int64, which was only ever correct for Integer/Quad
+  // and silently wrong (or, for the shorter types, buffer-desyncing) for
+  // everything else.
+  const cases: Array<[hex: string, expected: string]> = [
+    ["010003000000007661724279746500f4", "-12"], // Byte .b, 1 byte signed
+    ["1800030000000076617241736369690041", "65"], // Ascii .a, 1 byte unsigned
+    ["0b000300000000766172436861720042000000", "66"], // Character .c, 4 bytes unsigned
+    ["03000300000000766172576f7264002efb", "-1234"], // Word .w, 2 bytes signed
+    ["19000300000000766172556e69636f6465000326", "9731"], // Unicode .u, 2 bytes unsigned
+    ["050003000000007661724c6f6e67006079feff", "-100000"], // Long .l, 4 bytes signed
+    ["15000300000000766172496e746567657200141a99be1c000000", "123456789012"], // Integer .i, 8 bytes signed
+    ["0d0003000000007661725175616400ffffffffffffff7f", "9223372036854775807"], // Quad .q, 8 bytes signed (max int64)
+    ["09000300000000766172466c6f617400c3f54840", "3.140000104904175"], // Float .f, 4 bytes IEEE754 single
+    ["0c000300000000766172446f75626c65009b91048b0abf0540", "2.718281828"], // Double .d, 8 bytes IEEE754 double
+    ["95000300000000766172506f696e746572003930000000000000", "0x3039"], // Pointer, 8 bytes unsigned hex
+  ];
+  for (const [hex, expected] of cases) {
+    const [{ name, value, unsupported }] = parseVariables(Buffer.from(hex, "hex"));
+    assert.equal(value, expected, `${name}: expected ${expected}, got ${value}`);
+    assert.equal(unsupported, undefined, `${name} should not be marked unsupported`);
+  }
+});
+
+test("parseVariables treats a String scalar as value-less (needs a separate evaluate() call)", () => {
+  // Live-confirmed (PLAN.md M12): unlike every numeric type, a String
+  // record's value trails the name as a single pad byte, not an inline
+  // 8-byte (or any-width) value -- the actual text is never on this wire
+  // path at all. Getting this wrong previously corrupted every record
+  // parsed after a String in the same reply, not just the String itself.
+  const [v] = parseVariables(Buffer.from("08000300000000766172537472696e670000", "hex"));
+  assert.equal(v.type, 0x08);
+  assert.equal(v.name, "varString");
+  assert.equal(v.value, undefined);
+  assert.equal(v.unsupported, undefined);
 });
 
 test("parseGlobalDecls decodes name-only records (7-byte header + name + 1 pad byte, no value)", () => {
@@ -354,9 +411,21 @@ test("parseEvaluateReply decodes an error (kind 0) as a NUL-terminated string", 
   assert.deepEqual(result, { kind: 0, error: "Missing a value to assign." });
 });
 
-test("parseEvaluateReply decodes a numeric reply (kind 1-3) as a raw LE int64", () => {
+test("parseEvaluateReply decodes a numeric reply (kind 1-2) as a raw LE int64", () => {
   const result = parseEvaluateReply(fakeMessage(2, int64le(99)));
   assert.deepEqual(result, { kind: 2, value: "99" });
+});
+
+test("parseEvaluateReply decodes a kind-3 reply as a float64, not another int64 variant", () => {
+  // PLAN.md M12, live-confirmed: kind 3 is floating point -- both `.f` and
+  // `.d` arrive as a full 8-byte float64 (a `.f`'s value is promoted to
+  // double on the wire, never sent as 4 raw bytes). The pre-fix code
+  // treated this the same as kind 1/2 (raw int64), which read a `.f`'s
+  // double-promoted bit pattern as a nonsense huge integer instead of 3.14.
+  const buf = Buffer.alloc(8);
+  buf.writeDoubleLE(3.140000104904175, 0);
+  const result = parseEvaluateReply(fakeMessage(3, buf));
+  assert.deepEqual(result, { kind: 3, value: "3.140000104904175" });
 });
 
 test("parseEvaluateReply decodes a string reply (kind 4)", () => {
@@ -492,6 +561,20 @@ test("parseCompilerVersionBanner decodes the real live compiler banner into majo
 test("parseCompilerVersionBanner returns undefined for unrecognizable text, never a guess", () => {
   assert.equal(parseCompilerVersionBanner(""), undefined);
   assert.equal(parseCompilerVersionBanner("some unrelated compiler output"), undefined);
+});
+
+test("shouldRefuseUnvalidatedWindowsLaunch refuses a plain win32 launch (no Windows validation pass yet)", () => {
+  assert.equal(shouldRefuseUnvalidatedWindowsLaunch("win32", undefined), true);
+});
+
+test("shouldRefuseUnvalidatedWindowsLaunch allows win32 only with an explicit transport override", () => {
+  assert.equal(shouldRefuseUnvalidatedWindowsLaunch("win32", "tcp"), false);
+  assert.equal(shouldRefuseUnvalidatedWindowsLaunch("win32", "fifo"), false);
+});
+
+test("shouldRefuseUnvalidatedWindowsLaunch never refuses non-Windows platforms", () => {
+  assert.equal(shouldRefuseUnvalidatedWindowsLaunch("linux", undefined), false);
+  assert.equal(shouldRefuseUnvalidatedWindowsLaunch("darwin", undefined), false);
 });
 
 test("allocateFreeTcpPort returns a port that can actually be bound", async () => {
@@ -636,4 +719,103 @@ test("connectTcp shares one overall timeout budget across connect/handshake/hell
   } finally {
     await closeServerAndSockets(server, sockets);
   }
+});
+
+test("unstickFifoRendezvous releases blocking opens left over from a target that never started", async () => {
+  // H3: connect()'s fs.createReadStream(outFifo)/createWriteStream(inFifo)
+  // each start a blocking open() on a libuv threadpool worker that only
+  // returns once something opens the FIFO's other end. When the target
+  // process never starts, nothing ever does -- reproduced here directly
+  // against a real mkfifo pair with deliberately no reader/writer, the same
+  // shape pbDebugAdapter.ts hits on a spawn failure (bad cwd, missing
+  // binary). Without the unstick, this test would hang until forcibly
+  // killed instead of resolving.
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pure-xtension-fifo-unstick-"));
+  const outFifo = path.join(dir, "pb_out");
+  const inFifo = path.join(dir, "pb_in");
+  cp.execFileSync("mkfifo", [outFifo, inFifo]);
+  try {
+    const rs = fs.createReadStream(outFifo);
+    const ws = fs.createWriteStream(inFifo);
+    const rsOpen = new Promise<void>((resolve, reject) => {
+      rs.once("open", () => resolve());
+      rs.once("error", reject);
+    });
+    const wsOpen = new Promise<void>((resolve, reject) => {
+      ws.once("open", () => resolve());
+      ws.once("error", reject);
+    });
+    unstickFifoRendezvous(outFifo, inFifo);
+    await Promise.all([rsOpen, wsOpen]);
+    rs.destroy();
+    ws.destroy();
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("compileAsync resolves with the exit code and captured stdout/stderr of a normal run", async () => {
+  const { result } = compileAsync(process.execPath, [
+    "-e",
+    "process.stdout.write('out'); process.stderr.write('err'); process.exit(0);",
+  ]);
+  const r = await result;
+  assert.equal(r.status, 0);
+  assert.equal(r.stdout, "out");
+  assert.equal(r.stderr, "err");
+  assert.equal(r.timedOut, false);
+});
+
+test("compileAsync reports a nonzero exit code without treating it as a spawn failure", async () => {
+  const { result } = compileAsync(process.execPath, ["-e", "process.exit(3);"]);
+  const r = await result;
+  assert.equal(r.status, 3);
+  assert.equal(r.timedOut, false);
+});
+
+test("compileAsync kills and reports timedOut for a stalled compiler instead of hanging forever", async () => {
+  // H4: spawnSync had no timeout at all -- a hung compiler blocked the
+  // extension host indefinitely. This proves the replacement actually
+  // enforces one instead of just accepting a timeoutMs parameter unused.
+  const { result } = compileAsync(process.execPath, ["-e", "setInterval(() => {}, 1000);"], 300);
+  const start = Date.now();
+  const r = await result;
+  const elapsed = Date.now() - start;
+  assert.equal(r.timedOut, true);
+  assert.equal(r.status, null);
+  assert.ok(elapsed < 2000, `should be killed near the 300ms timeout, took ${elapsed}ms`);
+});
+
+test("compileAsync reports a spawn failure (missing compiler) as status null instead of throwing", async () => {
+  // Mirrors H3's spawn 'error' handling for the target process -- an ENOENT
+  // here must resolve cleanly, not throw an unhandled exception.
+  const { result } = compileAsync("/nonexistent/pure-xtension-compiler-xyz", []);
+  const r = await result;
+  assert.equal(r.status, null);
+  assert.equal(r.timedOut, false);
+  assert.match(r.stderr, /ENOENT/);
+});
+
+test("compileAsync bounds stdout collection instead of growing without limit", async () => {
+  const { result } = compileAsync(process.execPath, [
+    "-e",
+    "for (let i = 0; i < 40000; i++) process.stdout.write('x'.repeat(100));",
+  ]);
+  const r = await result;
+  assert.equal(r.status, 0);
+  assert.ok(r.stdout.length < 2.5 * 1024 * 1024, `stdout should be capped, was ${r.stdout.length} bytes`);
+  assert.match(r.stdout, /output truncated/);
+});
+
+test("compileAsync's returned child can be killed externally (cancellation) and result still resolves", async () => {
+  // H4: the caller (pbDebugAdapter.ts's disconnectRequest) needs to be able
+  // to cancel a compile the user stopped mid-flight -- this is that path,
+  // exercised directly against the returned child handle.
+  const { child, result } = compileAsync(process.execPath, ["-e", "setInterval(() => {}, 1000);"], 10000);
+  setTimeout(() => child.kill("SIGKILL"), 100);
+  const start = Date.now();
+  const r = await result;
+  assert.equal(r.status, null);
+  assert.equal(r.timedOut, false, "an externally-cancelled run should not be reported as a timeout");
+  assert.ok(Date.now() - start < 2000);
 });

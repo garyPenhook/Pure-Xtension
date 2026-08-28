@@ -101,10 +101,38 @@ const DATA_BREAKPOINT_FIXTURE_LINES = [
   'Debug "done"', // 7
 ];
 
+// Fixture for the per-type decode test below (PLAN.md M12): one Protected
+// local of several different PureBasic scalar types, deliberately with a
+// String in the middle rather than last -- before the per-type fix, a
+// String record's true (1-byte) trailing length was misread as a uniform
+// 8 bytes, desyncing every variable parsed after it, so this ordering is
+// what actually catches that regression instead of just a formatting nit.
+const TYPES_FIXTURE_LINES = [
+  "EnableExplicit", // 1
+  "Structure Widget", // 2
+  "  label.s", // 3
+  "  count.i", // 4
+  "EndStructure", // 5
+  "Procedure ProbeTypes()", // 6
+  "  Protected varByte.b = -12", // 7
+  "  Protected varString.s = \"Hi\"", // 8
+  "  Protected varWord.w = -1234", // 9
+  "  Protected varFloat.f = 3.140000104904175", // 10
+  "  Protected varDouble.d = 2.718281828", // 11
+  "  Protected w.Widget", // 12
+  "  w\\label = \"gizmo\"", // 13
+  "  w\\count = 7", // 14
+  '  Debug "stop here"', // 15 <- breakpoint
+  "EndProcedure", // 16
+  "ProbeTypes()", // 17
+];
+const TYPES_BP = 15;
+
 let fixtureDir: string | undefined;
 let program = "";
 let blockingProgram = "";
 let dataBreakpointProgram = "";
+let typesProgram = "";
 if (compiler) {
   fixtureDir = fs.mkdtempSync(path.join(os.tmpdir(), "pure-xtension-e2e-"));
   program = path.join(fixtureDir, "fixture.pb");
@@ -113,6 +141,8 @@ if (compiler) {
   fs.writeFileSync(blockingProgram, BLOCKING_FIXTURE_LINES.join("\n") + "\n");
   dataBreakpointProgram = path.join(fixtureDir, "databreakpoint.pb");
   fs.writeFileSync(dataBreakpointProgram, DATA_BREAKPOINT_FIXTURE_LINES.join("\n") + "\n");
+  typesProgram = path.join(fixtureDir, "types.pb");
+  fs.writeFileSync(typesProgram, TYPES_FIXTURE_LINES.join("\n") + "\n");
 }
 
 after(() => {
@@ -246,6 +276,58 @@ test("TCP transport: the same breakpoint/locals/continue flow reproduces over Ne
   }
 });
 
+test("TCP transport: repeated back-to-back launches each succeed (startup retry doesn't leak or wedge state)", { skip }, async () => {
+  // H1: the retry loop in openTcpSocket() and the free-port probe in
+  // allocateFreeTcpPort() are both per-launch state that could leak a
+  // socket/handle or race a reused port across launches. Three consecutive
+  // full launch/breakpoint/continue/terminate cycles, each through a fresh
+  // adapter process, is what would surface that -- a single launch (the test
+  // above) can't.
+  for (let i = 0; i < 3; i++) {
+    const dc = await launchToBreakpoint(MODULE_BP, "tcp");
+    try {
+      const st = await frames(dc);
+      assert.equal(st.length, 1, `launch ${i}: a module-scope stop should yield exactly the synthetic main frame`);
+      const locals = await localsOf(dc, st[0].id);
+      assert.equal(locals.get("a"), "3", `launch ${i}: module local a should be visible with its value over TCP`);
+
+      await Promise.all([
+        dc.continueRequest({ threadId: MAIN_THREAD_ID }),
+        dc.waitForEvent("terminated"),
+      ]);
+    } finally {
+      await dc.stop();
+    }
+  }
+});
+
+test("launch surfaces a spawn failure (nonexistent cwd) as a clean DAP error, not an unhandled adapter crash", { skip }, async () => {
+  // H3: an invalid cwd makes child_process.spawn() emit an async 'error'
+  // event (ENOENT) instead of throwing -- before the 'error' listener this
+  // adapter now attaches, that would either hang until the connect timeout
+  // with a generic message, or (if nothing ever drained the event) throw
+  // unhandled and take the adapter process down. The launch response
+  // rejecting promptly and specifically, and the adapter process staying up
+  // to answer a follow-up request, is what proves both are fixed.
+  const dc = new DebugClient("node", ADAPTER, "purebasic");
+  dc.defaultTimeout = 30000;
+  await dc.start();
+  try {
+    await dc.initializeRequest();
+    const missingCwd = path.join(fixtureDir!, "does-not-exist");
+    await assert.rejects(
+      dc.launch({ program, backend: "asm", cwd: missingCwd }),
+      /failed to start the target process/,
+      "a bad cwd should be reported as a specific spawn failure, not a generic connect timeout",
+    );
+    // The adapter process must still be alive and responsive afterwards --
+    // an unhandled 'error' event would have crashed it instead.
+    await dc.threadsRequest();
+  } finally {
+    await dc.stop();
+  }
+});
+
 test("native step-in descends into a called procedure", { skip }, async () => {
   const dc = await launchToBreakpoint(MODULE_BP);
   try {
@@ -300,6 +382,50 @@ test("procedure-scope stop: reports the procedure frame plus the synthesized mai
       dc.continueRequest({ threadId: MAIN_THREAD_ID }),
       dc.waitForEvent("terminated"),
     ]);
+  } finally {
+    await dc.stop();
+  }
+});
+
+test("procedure locals decode correctly per PureBasic type, including a String that doesn't corrupt later variables", { skip }, async () => {
+  const dc = new DebugClient("node", ADAPTER, "purebasic");
+  dc.defaultTimeout = 30000;
+  await dc.start();
+  try {
+    await Promise.all([
+      dc.waitForEvent("initialized").then(() =>
+        dc
+          .setBreakpointsRequest({ source: { path: typesProgram }, breakpoints: [{ line: TYPES_BP }], lines: [TYPES_BP] })
+          .then(() => dc.configurationDoneRequest()),
+      ),
+      dc.launch({ program: typesProgram, backend: "asm", stopOnEntry: false }),
+      dc.assertStoppedLocation("breakpoint", { path: typesProgram, line: TYPES_BP }),
+    ]);
+
+    const st = await frames(dc);
+    const locals = await localsOf(dc, st[0].id);
+    // PLAN.md M12: before the per-type fix, varString's record's true
+    // (1-byte) trailing length was misread as a uniform 8, desyncing every
+    // variable parsed after it in the same reply -- so a wrong value for
+    // varWord/varFloat/varDouble here would mean that desync regressed,
+    // not just a display formatting nit.
+    assert.equal(locals.get("varByte"), "-12", "Byte (.b)");
+    assert.equal(locals.get("varString"), "Hi", "String (.s) needs its own evaluate() fetch, not an inline value");
+    assert.equal(locals.get("varWord"), "-1234", "Word (.w) -- first variable after the String");
+    assert.equal(locals.get("varFloat"), "3.140000104904175", "Float (.f) must render as a number, not a huge int64");
+    assert.equal(locals.get("varDouble"), "2.718281828", "Double (.d)");
+
+    const vars = await variablesOf(dc, st[0].id);
+    const w = vars.find((v) => v.name === "w.Widget");
+    assert.ok(w && w.variablesReference > 0, "struct local should be expandable");
+    const fields = await dc.variablesRequest({ variablesReference: w!.variablesReference });
+    assert.deepEqual(
+      new Map(fields.body.variables.map((v) => [v.name, v.value])),
+      new Map([["label", "gizmo"], ["count", "7"]]),
+      "a struct's String field should resolve its real text via evaluate(), not a blank or garbage value",
+    );
+
+    await Promise.all([dc.continueRequest({ threadId: MAIN_THREAD_ID }), dc.waitForEvent("terminated")]);
   } finally {
     await dc.stop();
   }

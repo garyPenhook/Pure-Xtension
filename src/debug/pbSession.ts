@@ -4,6 +4,7 @@
 // trail). This file only encodes what was actually confirmed against a real
 // running target, not the still-unconfirmed parts (stepping, data
 // breakpoints, array/struct expansion).
+import * as cp from "child_process";
 import * as fs from "fs";
 import * as net from "net";
 import { EventEmitter } from "events";
@@ -44,6 +45,73 @@ export const OP_EXAMINE_EXPRESSION = 15; // parse expr, dispatch to SendArrayDat
 // following records whose 4-byte "reserved" field is nonzero are that
 // structure's fields, not new top-level variables.
 const STRUCT_TYPE_TAG = 0x07;
+// String type tag (PLAN.md M12, live-confirmed against an isolated `.s`
+// local): unlike every numeric type below, a String record carries no
+// inline value at all -- just a single trailing pad byte after the name
+// (the same shape opcode 9's value-less module-scope declarations already
+// use). The actual text has to come from a separate evaluate() call.
+export const STRING_TYPE_TAG = 0x08;
+
+/**
+ * Per-scalar-type wire encoding of the value that trails a variable
+ * record's header+name (opcode 11/17's ExamineCurrentFrame/ExamineFrame,
+ * and the equivalent nested-field records inside a structure). PLAN.md M12
+ * live-confirmed every entry here against a real PureBasic 6.41 x64 target:
+ * each PB type was declared in isolation as a single `Protected` local and
+ * examined through opcode 11, so the byte width/interpretation below is
+ * measured, not inferred from documentation (there is none). Critically,
+ * this is NOT a uniform 8-byte value for every type as earlier code
+ * (incorrectly) assumed -- Byte/Ascii are 1 byte, Word/Unicode are 2,
+ * Long/Character/Float are 4, and Integer/Quad/Double/Pointer are 8, each
+ * with its own signedness or float width. Getting this wrong doesn't just
+ * mis-render one variable: reading the wrong number of trailing bytes
+ * desyncs every record that follows it in the same reply (live-reproduced
+ * with a String local ahead of other variables, before this table existed).
+ */
+type ScalarValueKind = "int" | "float";
+interface ScalarTypeInfo {
+  kind: ScalarValueKind;
+  /** Trailing value width in bytes. */
+  valueBytes: 1 | 2 | 4 | 8;
+  /** Only meaningful for kind "int". Pointers are unsigned and hex-formatted, not decimal. */
+  signed?: boolean;
+  pointer?: boolean;
+}
+const SCALAR_TYPES: Record<number, ScalarTypeInfo> = {
+  0x01: { kind: "int", valueBytes: 1, signed: true }, // Byte .b
+  0x18: { kind: "int", valueBytes: 1, signed: false }, // Ascii .a
+  0x0b: { kind: "int", valueBytes: 4, signed: false }, // Character .c (Unicode code point)
+  0x03: { kind: "int", valueBytes: 2, signed: true }, // Word .w
+  0x19: { kind: "int", valueBytes: 2, signed: false }, // Unicode .u
+  0x05: { kind: "int", valueBytes: 4, signed: true }, // Long .l
+  0x15: { kind: "int", valueBytes: 8, signed: true }, // Integer .i
+  0x0d: { kind: "int", valueBytes: 8, signed: true }, // Quad .q
+  0x09: { kind: "float", valueBytes: 4 }, // Float .f
+  0x0c: { kind: "float", valueBytes: 8 }, // Double .d
+  0x95: { kind: "int", valueBytes: 8, signed: false, pointer: true }, // Pointer (`*var`, no `.type` suffix)
+};
+
+/** Decodes `buf`'s first `info.valueBytes` bytes per SCALAR_TYPES' confirmed
+ *  layout for `info`. Pointers render as `0x`-prefixed hex (the conventional,
+ *  useful way to show an address), everything else as a decimal string. */
+function decodeScalarValue(info: ScalarTypeInfo, buf: Buffer): string {
+  if (info.kind === "float") {
+    return (info.valueBytes === 4 ? buf.readFloatLE(0) : buf.readDoubleLE(0)).toString();
+  }
+  if (info.pointer) {
+    return `0x${buf.readBigUInt64LE(0).toString(16)}`;
+  }
+  switch (info.valueBytes) {
+    case 1:
+      return (info.signed ? buf.readInt8(0) : buf.readUInt8(0)).toString();
+    case 2:
+      return (info.signed ? buf.readInt16LE(0) : buf.readUInt16LE(0)).toString();
+    case 4:
+      return (info.signed ? buf.readInt32LE(0) : buf.readUInt32LE(0)).toString();
+    case 8:
+      return (info.signed ? buf.readBigInt64LE(0) : buf.readBigUInt64LE(0)).toString();
+  }
+}
 
 // Breakpoint sub-commands (opcode 3's f8 field).
 export const BP_ADD_LINE = 1;
@@ -128,11 +196,13 @@ export interface PbFrame {
 }
 
 export interface PbVariable {
-  type: number; // e.g. 0x15 for `.i`; 0x07 marks a structure header (see STRUCT_TYPE_TAG)
+  type: number; // e.g. 0x15 for `.i`; 0x07 marks a structure header (see STRUCT_TYPE_TAG); see SCALAR_TYPES for every other confirmed tag
   kind: number; // 0 = global/module scope, 3 = local
   name: string; // structure headers carry the target's own "Name.TypeName" formatting
-  /** Decimal string if the trailing 8 bytes parsed as a plausible number, else a hex dump. Absent for structure headers (type === 0x07), which have no scalar value of their own. */
+  /** Formatted per SCALAR_TYPES (decimal for ints, decimal for floats/doubles, `0x`-hex for pointers). Absent for a structure header (type === 0x07, no scalar value of its own) or a String (type === 0x08, whose real text needs a separate evaluate() call -- see STRING_TYPE_TAG). */
   value?: string;
+  /** True when `type` isn't a recognized tag (SCALAR_TYPES/STRUCT_TYPE_TAG/STRING_TYPE_TAG) -- its value is unknown and, critically, so is its byte width, so parseVariables stops decoding the rest of this reply rather than guess and desync every record after it. */
+  unsupported?: boolean;
   /** Populated for structure headers from the nesting-flagged records that immediately follow them (PLAN.md M5, live-confirmed). */
   children?: PbVariable[];
 }
@@ -182,35 +252,46 @@ export interface PbMapElement {
 }
 
 export interface PbEvaluateResult {
-  /** Reply f12: 0 = error, 1-3 = numeric (int/double, tag not yet distinguished), 4 = string, 5 = structure. */
+  /** Reply f12: 0 = error, 1/2 = integer-family (live-confirmed: every int width plus pointers all arrive sign-extended to a full int64, regardless of the original PB type's actual width), 3 = floating point (live-confirmed: both `.f` and `.d` arrive as a full float64, PLAN.md M12), 4 = string, 5 = structure. */
   kind: number;
   /** Set when kind is 0. */
   error?: string;
-  /** Set when kind is 1-3 (raw little-endian int64) or 4 (string text). */
+  /** Set when kind is 1/2 (decimal int64), 3 (decimal float64), or 4 (string text). */
   value?: string;
 }
 
-// Reply format for opcodes 33/34 (PLAN.md M5, "Expression's read side"),
-// live-confirmed for the numeric case (kind 1-3): 8-byte little-endian raw
-// value followed by the echoed expression text (payload-length bytes, no
-// null terminator). Kind 0 (error) is the PB_Language_GetKey error string,
-// NUL-terminated, followed by the echoed expression text. Kind 4 (string)
-// is now live-confirmed too — a NUL-terminated value string followed by the
-// echoed expression text (e.g. evaluating a List<String>'s bare `name()`
-// returns its *current* element this way, live-tested against
-// src/debug/spike/test-arrays.pb's `names()`: payload
+// Reply format for opcodes 33/34 (PLAN.md M5, "Expression's read side"):
+// an 8-byte little-endian value (kind 1-3) followed by the echoed
+// expression text (payload-length bytes, no null terminator). Kind 0
+// (error) is the PB_Language_GetKey error string, NUL-terminated, followed
+// by the echoed expression text. Kind 4 (string) is a NUL-terminated value
+// string followed by the echoed expression text (e.g. evaluating a
+// List<String>'s bare `name()` returns its *current* element this way,
+// live-tested against src/debug/spike/test-arrays.pb's `names()`: payload
 // `"beta\0names()\0"`). Kind 5 (structure) is still only decoded from the
 // disassembly, not live-tested, so it's surfaced as unsupported rather than
-// guessed at.
+// guessed at. PLAN.md M12 live-confirmed the split within "numeric": kind
+// 1/2 is always a plain int64 (every integer width and pointers arrive
+// pre-sign-extended to the full 8 bytes, regardless of the source type's
+// real width), while kind 3 is always a float64 -- a `.f` Float's value is
+// promoted to double on the wire, not sent as 4 raw bytes.
 export function parseEvaluateReply(msg: PbMessage): PbEvaluateResult {
   if (msg.f12 === 0) {
     const nul = msg.payload.indexOf(0);
     const error = nul === -1 ? msg.payload.toString("latin1") : msg.payload.toString("latin1", 0, nul);
     return { kind: 0, error };
   }
-  if (msg.f12 === 1 || msg.f12 === 2 || msg.f12 === 3) {
+  if (msg.f12 === 1 || msg.f12 === 2) {
     const value = msg.payload.readBigInt64LE(0).toString();
     return { kind: msg.f12, value };
+  }
+  if (msg.f12 === 3) {
+    // PLAN.md M12, live-confirmed: kind 3 is floating point, not another
+    // int64 variant -- both `.f` (Float) and `.d` (Double) arrive here as a
+    // full 8-byte float64 (a `.f`'s value is promoted on the wire, not
+    // truncated to 4 bytes), so this is unconditionally a double read.
+    const value = msg.payload.readDoubleLE(0).toString();
+    return { kind: 3, value };
   }
   if (msg.f12 === 4) {
     const nul = msg.payload.indexOf(0);
@@ -339,6 +420,7 @@ export function parseVariables(payload: Buffer): PbVariable[] {
     nested: boolean;
     name: string;
     value?: string;
+    unsupported?: boolean;
   }
   const flat: FlatRecord[] = [];
   let off = 0;
@@ -347,25 +429,41 @@ export function parseVariables(payload: Buffer): PbVariable[] {
     if (!header) break;
     const { type, kind, nested, name } = header;
     off = header.next;
-    let value: string | undefined;
-    if (type !== STRUCT_TYPE_TAG) {
-      if (off + 8 <= payload.length) {
-        value = payload.readBigInt64LE(off).toString();
-        off += 8;
-      } else {
-        value = `0x${payload.subarray(off).toString("hex")}`;
-        off = payload.length;
-      }
+
+    if (type === STRUCT_TYPE_TAG) {
+      flat.push({ type, kind, nested, name });
+      continue;
     }
+    if (type === STRING_TYPE_TAG) {
+      // No inline value -- one trailing pad byte, the same shape opcode 9
+      // uses for every value-less module-scope declaration (see
+      // parseGlobalDecls below). The real text needs a separate evaluate()
+      // call (see toDapVariable in pbDebugAdapter.ts).
+      flat.push({ type, kind, nested, name });
+      off += 1;
+      continue;
+    }
+    const info = SCALAR_TYPES[type];
+    if (!info || off + info.valueBytes > payload.length) {
+      // Unknown type, or a known one truncated mid-value: its true byte
+      // width is unknown either way, so guessing would desync every record
+      // after it in this reply. Surface this one as explicitly unsupported
+      // and stop -- a partial, honest result beats a corrupted one.
+      flat.push({ type, kind, nested, name, unsupported: true });
+      break;
+    }
+    const value = decodeScalarValue(info, payload.subarray(off, off + info.valueBytes));
+    off += info.valueBytes;
     flat.push({ type, kind, nested, name, value });
   }
   const result: PbVariable[] = [];
   for (const rec of flat) {
     const parent = result[result.length - 1];
+    const child: PbVariable = { type: rec.type, kind: rec.kind, name: rec.name, value: rec.value, unsupported: rec.unsupported };
     if (rec.nested && parent && parent.type === STRUCT_TYPE_TAG) {
-      (parent.children ??= []).push({ type: rec.type, kind: rec.kind, name: rec.name, value: rec.value });
+      (parent.children ??= []).push(child);
     } else {
-      result.push({ type: rec.type, kind: rec.kind, name: rec.name, value: rec.value });
+      result.push(child);
     }
   }
   return result;
@@ -645,6 +743,20 @@ export function parseHandshakeReply(text: string): HandshakeReply {
   return { ok: status === "ACCEPT", version: Number(versionStr), token: token ?? "", error };
 }
 
+/**
+ * H2: the TCP/NetworkServer transport is protocol-verified on Linux but has
+ * never been run end-to-end on real Windows hardware -- so `win32` must not
+ * silently get it by default. Only an explicit transport override (used by
+ * the local e2e suite to exercise TCP here on Linux) may opt in; anything
+ * else on `win32` is refused with a clear error instead. A pure function so
+ * this gate is unit-testable without needing to fake `process.platform` for
+ * a whole spawned adapter process (which would also break its compiler-path
+ * resolution, which is itself platform-aware).
+ */
+export function shouldRefuseUnvalidatedWindowsLaunch(platform: string, transport?: "fifo" | "tcp"): boolean {
+  return platform === "win32" && transport === undefined;
+}
+
 /** Parses PureBasic's own compiler-stdout version banner (its first printed
  *  line on every invocation, e.g. `"PureBasic 6.41 (Linux - x64)"`, already
  *  captured by pbDebugAdapter.ts's launchRequest but unused on success)
@@ -677,6 +789,103 @@ export function allocateFreeTcpPort(): Promise<number> {
       probe.close(() => resolve(address.port));
     });
   });
+}
+
+/**
+ * H3: `connect()`'s `fs.createReadStream(outFifo)`/`fs.createWriteStream(inFifo)`
+ * each start a blocking POSIX `open()` on a libuv threadpool worker that only
+ * returns once *something* opens the FIFO's other end. If the target process
+ * never starts (bad cwd, missing binary, permission error -- see
+ * pbDebugAdapter.ts's spawn 'error' handling), nothing ever will, and that
+ * worker stays blocked in the kernel forever; `.destroy()`ing the stream
+ * object doesn't cancel the in-flight syscall, only defers cleanup until it
+ * eventually completes. Opening each FIFO's complementary end ourselves,
+ * even just to immediately close it again, completes the kernel-level
+ * rendezvous from both sides so the stuck opens return and the worker is
+ * freed -- live-confirmed against a real mkfifo pair with no target. This
+ * is intentionally fire-and-forget: callers have already sent their DAP
+ * error response and are cleaning up, and there is nothing to do differently
+ * if this best-effort unstick itself fails.
+ */
+export function unstickFifoRendezvous(outFifo: string, inFifo: string): void {
+  fs.open(outFifo, "w", (err, fd) => {
+    if (!err) fs.close(fd, () => {});
+  });
+  fs.open(inFifo, "r", (err, fd) => {
+    if (!err) fs.close(fd, () => {});
+  });
+}
+
+export interface CompileResult {
+  /** Exit code, or `null` if the compiler never started (spawn error) or was killed for timing out. */
+  status: number | null;
+  stdout: string;
+  stderr: string;
+  /** True if the compiler was killed after exceeding the timeout rather than exiting on its own. */
+  timedOut: boolean;
+}
+
+// A few KB is typical for a real compile; this is generous headroom while
+// still bounding memory if a compiler invocation goes pathological (e.g.
+// runs away printing in a loop) instead of accumulating output forever.
+const MAX_COMPILE_OUTPUT_BYTES = 2 * 1024 * 1024;
+const TRUNCATION_MARKER = "\n[Pure Xtension: output truncated]\n";
+export const DEFAULT_COMPILE_TIMEOUT_MS = 120_000;
+
+function boundedAppend(current: string, chunk: Buffer): string {
+  if (current.endsWith(TRUNCATION_MARKER)) return current;
+  if (current.length >= MAX_COMPILE_OUTPUT_BYTES) return current + TRUNCATION_MARKER;
+  return current + chunk.toString("utf8");
+}
+
+/**
+ * H4: async replacement for `cp.spawnSync(compiler, ...)` in the debug
+ * launch path -- spawnSync blocks the extension host's entire event loop
+ * (all UI, all other requests, everything) for as long as the compile
+ * takes, with no way to time out a stalled/hung compiler and no way to
+ * cancel it if the user stops the debug session mid-compile. This spawns
+ * asynchronously instead, returning the child immediately (so the caller
+ * can track it and kill it on disconnect -- see pbDebugAdapter.ts's
+ * `compileChild`) alongside a promise that resolves once the compiler exits,
+ * is killed for exceeding `timeoutMs`, or fails to start at all (mirrors
+ * H3's spawn 'error' handling: reported as `status: null`, not left to
+ * throw unhandled).
+ */
+export function compileAsync(
+  compiler: string,
+  args: string[],
+  timeoutMs = DEFAULT_COMPILE_TIMEOUT_MS,
+): { child: cp.ChildProcess; result: Promise<CompileResult> } {
+  const child = cp.spawn(compiler, args);
+  const result = new Promise<CompileResult>((resolve) => {
+    let stdout = "";
+    let stderr = "";
+    let timedOut = false;
+    let settled = false;
+    child.stdout?.on("data", (chunk: Buffer) => {
+      stdout = boundedAppend(stdout, chunk);
+    });
+    child.stderr?.on("data", (chunk: Buffer) => {
+      stderr = boundedAppend(stderr, chunk);
+    });
+    const timer = setTimeout(() => {
+      timedOut = true;
+      child.kill("SIGKILL");
+    }, timeoutMs);
+    child.on("error", (err) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolve({ status: null, stdout, stderr: boundedAppend(stderr, Buffer.from(`${err.message}\n`)), timedOut: false });
+    });
+    child.on("close", (code) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolve({ status: code, stdout, stderr, timedOut });
+    });
+  });
+  return { child, result };
 }
 
 /**

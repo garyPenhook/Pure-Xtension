@@ -11,13 +11,15 @@ Language support, IntelliSense, build/diagnostics, and help all work on
 Windows, macOS, and Linux (the extension auto-detects a PureBasic install on
 each). **Debugging is fully supported and verified on Linux**, built on
 POSIX FIFOs plus a GDB/ptrace-backed Force Pause for targets blocked in
-native calls. **On Windows, the same debugger wire protocol is implemented
-over a TCP transport instead** — PureBasic's `-d` builds support this
-natively — and has been verified end-to-end using the identical code path
-against a Linux PureBasic install (`NetworkServer` mode), but has not yet
-been run on a real Windows machine. macOS debugging isn't implemented yet;
-launching a debug session there fails with a clear error instead of silently
-misbehaving.
+native calls. **On Windows, the debugger wire protocol has also been
+implemented, over a TCP transport instead** — PureBasic's `-d` builds
+support this natively — and it has been protocol-verified end-to-end using
+the identical code path against a Linux PureBasic install (`NetworkServer`
+mode). It has not yet been run on a real Windows machine, so launching a
+debug session on Windows still fails with a clear error until that
+validation pass happens, the same as macOS (where debugging isn't
+implemented at all yet) — neither platform silently gets an unverified
+debugger.
 
 ## Features
 
@@ -57,7 +59,7 @@ misbehaving.
 - Completion items carry full documentation (description + doc link) pulled
   from the same live index.
 
-### Debugging — ⚠️ Linux fully verified; Windows implemented but not yet run on real Windows; macOS not yet supported
+### Debugging — ⚠️ Linux fully verified; not yet enabled on Windows or macOS (see below)
 Standard VS Code debugging for PureBasic programs, via a `purebasic` launch
 configuration:
 - Launch, line breakpoints, continue, step-over/into/out, and a real
@@ -97,7 +99,7 @@ configuration:
 
 ## Debugging a program
 
-**Linux is fully verified; Windows is implemented via TCP but unverified on real Windows hardware; macOS isn't supported yet** — see the platform note above.
+**Linux is fully verified.** Windows has a protocol-verified TCP transport implemented, but launching still fails with a clear error there until it's been validated end-to-end on real Windows hardware; macOS debugging isn't implemented yet — see the platform note above.
 
 Add a launch configuration to your workspace's `.vscode/launch.json`:
 
