@@ -8,7 +8,13 @@ on:
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    # This self-hosted runner owns a licensed PureBasic 6.41 Linux x64
+    # installation and Xvfb.  Hosted runners must not silently skip the real
+    # FIFO/TCP debugger lifecycle tests because PureBasic is unavailable.
+    runs-on: [self-hosted, linux, purebasic-6.41]
+    env:
+      PUREBASIC_HOME: /opt/purebasic-6.41
+      VSCODE_EXECUTABLE_PATH: /usr/share/code-insiders/code-insiders
     steps:
       - uses: actions/checkout@v4
 
@@ -19,11 +25,20 @@ jobs:
 
       - run: npm ci
 
+      - name: Verify required Linux debug-test runner
+        run: |
+          test -x "$PUREBASIC_HOME/compilers/pbcompiler"
+          test -x "$VSCODE_EXECUTABLE_PATH"
+          command -v xvfb-run
+
       - name: Typecheck + bundle
         run: npm run compile
 
       - name: Test
         run: npm test
+
+      - name: Real VS Code integration test
+        run: xvfb-run -a npm run test:vscode
 
       - name: Package .vsix
         run: npx vsce package

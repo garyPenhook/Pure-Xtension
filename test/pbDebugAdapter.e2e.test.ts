@@ -128,11 +128,27 @@ const TYPES_FIXTURE_LINES = [
 ];
 const TYPES_BP = 15;
 
+const INCLUDE_MAIN_LINES = [
+  "EnableExplicit", // 1
+  'IncludeFile "nested/included.pb"', // 2
+  "Define result.i = IncludedAdd(3, 4)", // 3
+  "Debug result", // 4
+];
+const INCLUDE_SOURCE_LINES = [
+  "Procedure.i IncludedAdd(x.i, y.i)", // 1
+  "  Protected sum.i = x + y", // 2 <-- include breakpoint
+  "  ProcedureReturn sum", // 3
+  "EndProcedure", // 4
+];
+const INCLUDE_BP = 2;
+
 let fixtureDir: string | undefined;
 let program = "";
 let blockingProgram = "";
 let dataBreakpointProgram = "";
 let typesProgram = "";
+let includeMainProgram = "";
+let includeSourceProgram = "";
 if (compiler) {
   fixtureDir = fs.mkdtempSync(path.join(os.tmpdir(), "pure-xtension-e2e-"));
   program = path.join(fixtureDir, "fixture.pb");
@@ -143,6 +159,11 @@ if (compiler) {
   fs.writeFileSync(dataBreakpointProgram, DATA_BREAKPOINT_FIXTURE_LINES.join("\n") + "\n");
   typesProgram = path.join(fixtureDir, "types.pb");
   fs.writeFileSync(typesProgram, TYPES_FIXTURE_LINES.join("\n") + "\n");
+  includeMainProgram = path.join(fixtureDir, "includes-main.pb");
+  includeSourceProgram = path.join(fixtureDir, "nested", "included.pb");
+  fs.mkdirSync(path.dirname(includeSourceProgram), { recursive: true });
+  fs.writeFileSync(includeMainProgram, INCLUDE_MAIN_LINES.join("\n") + "\n");
+  fs.writeFileSync(includeSourceProgram, INCLUDE_SOURCE_LINES.join("\n") + "\n");
 }
 
 after(() => {
@@ -182,6 +203,28 @@ async function variablesOf(dc: DebugClient, frameId: number) {
   const scopes = await dc.scopesRequest({ frameId });
   return (await dc.variablesRequest({ variablesReference: scopes.body.scopes[0].variablesReference })).body.variables;
 }
+
+test("included-source breakpoints and frames retain the include path", { skip }, async () => {
+  const dc = new DebugClient("node", ADAPTER, "purebasic");
+  dc.defaultTimeout = 30000;
+  await dc.start();
+  try {
+    await Promise.all([
+      dc.waitForEvent("initialized").then(() =>
+        dc.setBreakpointsRequest({ source: { path: includeSourceProgram }, breakpoints: [{ line: INCLUDE_BP }], lines: [INCLUDE_BP] })
+          .then(() => dc.configurationDoneRequest()),
+      ),
+      dc.launch({ program: includeMainProgram, backend: "asm", stopOnEntry: false }),
+      dc.assertStoppedLocation("breakpoint", { path: includeSourceProgram, line: INCLUDE_BP }),
+    ]);
+    const st = await frames(dc);
+    assert.equal(st[0].source?.path, includeSourceProgram, "innermost frame must identify the included source");
+    assert.equal(st[0].line, INCLUDE_BP);
+    await Promise.all([dc.continueRequest({ threadId: MAIN_THREAD_ID }), dc.waitForEvent("terminated")]);
+  } finally {
+    await dc.stop();
+  }
+});
 
 test("stopOnEntry reports the first executable module line, not line 1", { skip }, async () => {
   const dc = new DebugClient("node", ADAPTER, "purebasic");

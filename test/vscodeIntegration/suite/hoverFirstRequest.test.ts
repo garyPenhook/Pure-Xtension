@@ -17,6 +17,13 @@ suite("First hover request in a fresh session", () => {
   test("hovering a built-in function resolves without a prior warming request", async function () {
     this.timeout(30000);
 
+    // The test runner intentionally exposes both compiler backends, making
+    // `auto` ambiguous.  Pick ASM before activation so the client exists;
+    // this is configuration, not a request that could warm the index.
+    const config = vscode.workspace.getConfiguration("pureXtension");
+    const originalBackend = config.get<string>("backend");
+    await config.update("backend", "asm", vscode.ConfigurationTarget.Global);
+
     const ext = vscode.extensions.getExtension("local.pure-xtension");
     assert.ok(ext, "extension local.pure-xtension not found");
     await ext!.activate();
@@ -25,21 +32,30 @@ suite("First hover request in a fresh session", () => {
     const doc = await vscode.workspace.openTextDocument(fixturePath);
     await vscode.window.showTextDocument(doc);
 
+    // Activation starts the language client asynchronously.  Waiting for that
+    // startup window does not send a completion/signature/hover request, so
+    // the hover below is still the server's first built-in-index consumer.
+    await new Promise((resolve) => setTimeout(resolve, 1000));
+
     const text = doc.getText();
     const strOffset = text.indexOf("Str(c)");
     assert.ok(strOffset >= 0, "fixture must contain a Str(...) call");
     const position = doc.positionAt(strOffset);
 
-    const hovers = await vscode.commands.executeCommand<vscode.Hover[]>(
-      "vscode.executeHoverProvider",
-      doc.uri,
-      position,
-    );
+    try {
+      const hovers = await vscode.commands.executeCommand<vscode.Hover[]>(
+        "vscode.executeHoverProvider",
+        doc.uri,
+        position,
+      );
 
-    assert.ok(hovers && hovers.length > 0, "expected a hover result for the built-in Str() function");
-    const contents = hovers[0].contents
-      .map((c) => (typeof c === "string" ? c : c.value))
-      .join("\n");
-    assert.match(contents, /Str/);
+      assert.ok(hovers && hovers.length > 0, "expected a hover result for the built-in Str() function");
+      const contents = hovers[0].contents
+        .map((c) => (typeof c === "string" ? c : c.value))
+        .join("\n");
+      assert.match(contents, /Str/);
+    } finally {
+      await config.update("backend", originalBackend, vscode.ConfigurationTarget.Global);
+    }
   });
 });

@@ -30,11 +30,15 @@ import {
   parseEvaluateReply,
   parseFrames,
   parseGlobalDecls,
+  parseIncludedSources,
   parseListDecls,
   parseListElements,
   parseMapDecls,
   parseMapElements,
+  parseModuleNames,
   parseVariables,
+  makeDebuggerLine,
+  splitDebuggerLine,
   shouldRefuseUnvalidatedPlatformLaunch,
   splitHandshakeFrame,
   unstickFifoRendezvous,
@@ -180,14 +184,35 @@ test("parseFrames decodes repeated (line, NUL-terminated display) records", () =
     nulString("Sub(1, 2)"),
   ]);
   assert.deepEqual(parseFrames(payload), [
-    { callSiteLine0: 5, display: "Main()" },
-    { callSiteLine0: 12, display: "Sub(1, 2)" },
+    { callSiteLine0: 5, moduleId: 0, display: "Main()" },
+    { callSiteLine0: 12, moduleId: 0, display: "Sub(1, 2)" },
   ]);
 });
 
 test("parseFrames tolerates a missing trailing NUL by reading to buffer end", () => {
   const payload = Buffer.concat([int32le(3), Buffer.from("NoTerminator", "latin1")]);
-  assert.deepEqual(parseFrames(payload), [{ callSiteLine0: 3, display: "NoTerminator" }]);
+  assert.deepEqual(parseFrames(payload), [{ callSiteLine0: 3, moduleId: 0, display: "NoTerminator" }]);
+});
+
+test("packed debugger lines retain independent include-file ids and line numbers", () => {
+  const packed = makeDebuggerLine(7, 1234);
+  assert.deepEqual(splitDebuggerLine(packed), { moduleId: 7, line: 1234 });
+  const payload = Buffer.concat([int32le(packed), nulString("IncludedProc()")]);
+  assert.deepEqual(parseFrames(payload), [{ callSiteLine0: 1234, moduleId: 7, display: "IncludedProc()" }]);
+  assert.throws(() => makeDebuggerLine(4096, 0), /12 bits/);
+  assert.throws(() => makeDebuggerLine(0, 1 << 20), /20 bits/);
+});
+
+test("Init and Modules payload decoders preserve source and module identities", () => {
+  const init = Buffer.concat([nulString("/project/src"), nulString("main.pb"), nulString("lib/one.pb"), nulString("two.pb")]);
+  assert.deepEqual(parseIncludedSources(init, 2), {
+    sourceRoot: "/project/src",
+    mainPath: "main.pb",
+    includedPaths: ["lib/one.pb", "two.pb"],
+  });
+  assert.deepEqual(parseModuleNames(Buffer.concat([nulString("Main"), nulString("Math")]), 2), ["Main", "Math"]);
+  assert.throws(() => parseIncludedSources(nulString("/project/src"), 1), /declared 1 included files/);
+  assert.throws(() => parseModuleNames(nulString("Main"), 2), /declared 2 names/);
 });
 
 test("parseVariables decodes a scalar record", () => {

@@ -20,9 +20,11 @@
 // through that detaching wrapper) and correctly waits for the actual test
 // run to finish.
 import * as fs from "fs";
+import { readFile, rm } from "fs/promises";
 import * as os from "os";
 import * as path from "path";
 import { runTests } from "@vscode/test-electron";
+import { RESULT_FILE_ENV, VsCodeTestResult } from "./resultFile";
 
 async function main() {
   // __dirname (compiled) is out-test/test/vscodeIntegration -- three levels
@@ -35,7 +37,13 @@ async function main() {
   const extensionTestsPath = path.resolve(__dirname, "suite", "index");
   const workspacePath = path.resolve(__dirname, "fixture");
 
-  const vscodeExecutablePath = process.env.VSCODE_EXECUTABLE_PATH || "/usr/bin/code-insiders";
+  // @vscode/test-electron must start Electron itself.  The distro's
+  // /usr/bin/code-insiders shell wrapper detaches and returns before the
+  // extension host runs, so prefer its real executable when no explicit test
+  // binary was supplied.
+  const bundledInsiders = "/usr/share/code-insiders/code-insiders";
+  const vscodeExecutablePath = process.env.VSCODE_EXECUTABLE_PATH
+    || (fs.existsSync(bundledInsiders) ? bundledInsiders : "/usr/bin/code-insiders");
 
   // Without an isolated user-data-dir, VS Code's single-instance IPC just
   // forwards this invocation to whatever Insiders window the desktop
@@ -44,21 +52,40 @@ async function main() {
   // launched a fresh extension host.
   const userDataDir = fs.mkdtempSync(path.join(os.tmpdir(), "pure-xtension-vscode-test-userdata-"));
   const extensionsDir = fs.mkdtempSync(path.join(os.tmpdir(), "pure-xtension-vscode-test-extensions-"));
+  const resultDir = fs.mkdtempSync(path.join(os.tmpdir(), "pure-xtension-vscode-test-result-"));
+  const resultFile = path.join(resultDir, "result.json");
 
-  await runTests({
-    vscodeExecutablePath,
-    extensionDevelopmentPath,
-    extensionTestsPath,
-    launchArgs: [
-      workspacePath,
-      "--disable-extensions",
-      "--skip-welcome",
-      "--skip-release-notes",
-      "--disable-workspace-trust",
-      `--user-data-dir=${userDataDir}`,
-      `--extensions-dir=${extensionsDir}`,
-    ],
-  });
+  try {
+    await runTests({
+      vscodeExecutablePath,
+      extensionDevelopmentPath,
+      extensionTestsPath,
+      extensionTestsEnv: { [RESULT_FILE_ENV]: resultFile },
+      launchArgs: [
+        workspacePath,
+        "--disable-extensions",
+        "--skip-welcome",
+        "--skip-release-notes",
+        "--disable-workspace-trust",
+        `--user-data-dir=${userDataDir}`,
+        `--extensions-dir=${extensionsDir}`,
+      ],
+    });
+
+    let result: VsCodeTestResult;
+    try {
+      result = JSON.parse(await readFile(resultFile, "utf8")) as VsCodeTestResult;
+    } catch (err) {
+      throw new Error(`VS Code exited without an extension-test result record (${resultFile}): ${String(err)}`);
+    }
+    if (result.status !== "passed") {
+      throw new Error(`VS Code extension tests failed: ${result.error ?? "no failure detail was recorded"}`);
+    }
+  } finally {
+    await rm(resultDir, { recursive: true, force: true });
+    await rm(userDataDir, { recursive: true, force: true });
+    await rm(extensionsDir, { recursive: true, force: true });
+  }
 }
 
 main().catch((err) => {

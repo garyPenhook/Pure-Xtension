@@ -29,7 +29,10 @@ import {
   PbDataBreakpointEvent,
   PbDebugSession,
   PbEvaluateResult,
+  PbMessage,
+  PbSourceFile,
   PbVariable,
+  parseIncludedSources,
   shouldRefuseUnvalidatedPlatformLaunch,
   STOP_REASON_DATA_BREAKPOINT,
   STRING_TYPE_TAG,
@@ -126,6 +129,10 @@ export class PureBasicDebugSession extends DebugSession {
   private workDir?: string;
   private fifoDir?: string;
   private sourcePath = "";
+  /** PureBasic's source-file ids (0 = launch file) keyed by normalized local
+   * path.  The Init payload establishes these ids for IncludeFile sources. */
+  private sourcesByPath = new Map<string, PbSourceFile>();
+  private sourcesById = new Map<number, PbSourceFile>();
   /**
    * True once `this.pb.connect()` has actually opened the FIFOs. VS Code
    * sends `setBreakpoints` as soon as `initialized` fires — which happens
@@ -141,6 +148,7 @@ export class PureBasicDebugSession extends DebugSession {
   private pbConnected = false;
   /** 1-based line the target last stopped at (StoppedEvent's `line`/`msg.f8`), used as the innermost/main frame's current line since opcode 16 never carries it. */
   private lastStopLine = 0;
+  private lastStopModuleId = 0;
   /**
    * Per-stop map from DAP frameId to what that frame actually is: a procedure
    * frame (addressable by its opcode-17 index) or the synthetic module/main
@@ -161,7 +169,7 @@ export class PureBasicDebugSession extends DebugSession {
   private configurationDone: Promise<void>;
   private resolveConfigurationDone!: () => void;
   /** The real (user-set) line breakpoints currently active on the wire. */
-  private activeBreakpoints = new Set<number>();
+  private activeBreakpoints = new Map<string, Set<number>>();
   /** Armed data breakpoints, keyed by the wire's numeric id -- the only key
    *  ever looked up by (correlating a dataBreakpoint event/re-arming);
    *  setDataBreakpointsRequest always fully clears and rebuilds rather than
@@ -220,7 +228,7 @@ export class PureBasicDebugSession extends DebugSession {
     this.configurationDone = new Promise((resolve) => {
       this.resolveConfigurationDone = resolve;
     });
-    this.pb.on("stopped", async ({ line, reason }: { line: number; reason: number }) => {
+    this.pb.on("stopped", async ({ moduleId, line, reason }: { moduleId: number; line: number; reason: number }) => {
       // A genuine cooperative wire stop always supersedes any in-flight
       // Force Pause attempt/timer -- it arrived, so the fallback (which
       // would only yield a degraded GDB-only stop) must not also fire.
@@ -232,6 +240,7 @@ export class PureBasicDebugSession extends DebugSession {
       // Capture the stop line before the state checks below so it is available
       // to the stack trace requested immediately after the stop event.
       this.lastStopLine = line;
+      this.lastStopModuleId = moduleId;
       this.compoundHandles.clear();
       this.frameHandles.clear();
       this.nextCompoundRef = COMPOUND_REF_BASE;
@@ -380,13 +389,52 @@ export class PureBasicDebugSession extends DebugSession {
     this.resolveConfigurationDone();
   }
 
+  private canonicalSourcePath(file: string): string {
+    return path.resolve(file);
+  }
+
+  /** Retains Init's source-root/include table before any breakpoint is sent.
+   * The debugger's main source is not listed in that payload, so it is always
+   * assigned id 0 from the launch configuration. */
+  private setSourceFiles(init: PbMessage): void {
+    const { sourceRoot, includedPaths } = parseIncludedSources(init.payload, init.f8);
+    this.sourcesByPath.clear();
+    this.sourcesById.clear();
+    const add = (id: number, file: string) => {
+      const source = { id, path: this.canonicalSourcePath(file) };
+      this.sourcesByPath.set(source.path, source);
+      this.sourcesById.set(id, source);
+    };
+    add(0, this.sourcePath);
+    const root = sourceRoot ? this.canonicalSourcePath(sourceRoot) : path.dirname(this.sourcePath);
+    includedPaths.forEach((included, index) => add(index + 1, path.isAbsolute(included) ? included : path.resolve(root, included)));
+  }
+
+  private sourceForId(moduleId: number): PbSourceFile {
+    return this.sourcesById.get(moduleId) ?? { id: moduleId, path: this.sourcePath };
+  }
+
+  private sourceForPath(file: string | undefined): PbSourceFile | undefined {
+    const canonical = file ? this.canonicalSourcePath(file) : this.sourcePath;
+    // setBreakpoints may arrive while the target is still compiling, before
+    // Init has supplied its include table. The launch file is already known
+    // at that point and is always debugger source id 0.
+    if (canonical === this.sourcePath) return this.sourcesById.get(0) ?? { id: 0, path: this.sourcePath };
+    return this.sourcesByPath.get(canonical);
+  }
+
+  private sourceForFrame(moduleId: number): Source {
+    const file = this.sourceForId(moduleId).path;
+    return new Source(path.basename(file), file);
+  }
+
   protected async launchRequest(
     response: DebugProtocol.LaunchResponse,
     args: LaunchArgs,
   ): Promise<void> {
     let responseSent = false;
     try {
-    this.sourcePath = args.program;
+    this.sourcePath = this.canonicalSourcePath(args.program);
     // Linux is the only platform with a complete, real-machine debugger
     // validation pass. `transport` is deliberately an undocumented test hook
     // (used to exercise NetworkServer on Linux); it may opt out of this gate.
@@ -442,7 +490,7 @@ export class PureBasicDebugSession extends DebugSession {
     const useTcp = args.transport === "fifo" ? false : args.transport === "tcp";
 
     let transportEnv: Record<string, string>;
-    let doConnect: () => Promise<unknown>;
+    let doConnect: () => Promise<PbMessage>;
     let fifoPaths: { outFifo: string; inFifo: string } | undefined;
 
     if (useTcp) {
@@ -520,8 +568,10 @@ export class PureBasicDebugSession extends DebugSession {
     try {
       await Promise.race([
         (async () => {
-          await doConnect();
+          const init = await doConnect();
+          this.setSourceFiles(init);
           await this.pb.drainStartupAnnouncement();
+          await this.pb.getModules();
         })(),
         spawnFailure,
       ]);
@@ -594,21 +644,23 @@ export class PureBasicDebugSession extends DebugSession {
     try {
     const lines = args.breakpoints?.map((b) => b.line) ?? args.lines ?? [];
 
-    // This adapter only ever compiles/debugs one module (args.program from
-    // launchRequest) — there's no confirmed moduleId scoping for the wire
-    // protocol's breakpoint opcode (PLAN.md M5), so clearAllLineBreakpoints()
-    // is target-wide. VS Code sends one setBreakpoints call per file with
-    // breakpoints; without this guard, setting a breakpoint in an unrelated
-    // open file would wipe (and never restore) the real session's
-    // breakpoints in the file actually being debugged.
-    if (args.source.path && args.source.path !== this.sourcePath) {
+    const source = this.sourceForPath(args.source.path);
+    // The line-breakpoint list is target-wide, but each packed breakpoint
+    // carries the Init-assigned source-file id.  Reject only files not part
+    // of this compiled include graph; replacing breakpoints in one included
+    // file must preserve every other source's set.
+    if (!source && this.pbConnected) {
       response.body = { breakpoints: lines.map((line) => new Breakpoint(false, line)) };
       this.sendResponse(response);
       return;
     }
 
-    this.activeBreakpoints.clear();
-    for (const line of lines) this.activeBreakpoints.add(line);
+    // Configuration requests normally arrive before the target's Init
+    // message. Keep a prospective include-file set by canonical path until
+    // Init supplies the authoritative id table; flushBreakpointsToWire()
+    // will then replay it if it is genuinely part of this compilation.
+    const sourcePath = source?.path ?? this.canonicalSourcePath(args.source.path!);
+    this.activeBreakpoints.set(sourcePath, new Set(lines));
     // Before the target is connected (still compiling, in launchRequest),
     // there's no wire to write to yet — activeBreakpoints above is the
     // record launchRequest replays via flushBreakpointsToWire() once
@@ -627,14 +679,18 @@ export class PureBasicDebugSession extends DebugSession {
   /** Replays active user breakpoints and any entry-discovery coverage onto the wire. Only safe once `pbConnected` is true. */
   private flushBreakpointsToWire(): void {
     this.pb.clearAllLineBreakpoints();
-    for (const line of this.activeBreakpoints) this.pb.addLineBreakpoint(line - 1);
+    for (const [sourcePath, lines] of this.activeBreakpoints) {
+      const source = this.sourcesByPath.get(sourcePath);
+      if (!source) continue;
+      for (const line of lines) this.pb.addLineBreakpoint(line - 1, source.id);
+    }
     if (this.entryDiscoveryInProgress) {
       // A breakpoint edit clears target-wide state, so restore the temporary
       // coverage that stopOnEntry uses to find the first executable line.
       this.entryTempLines.clear();
       for (let line = 1; line <= this.totalLines; line++) {
-        if (!this.activeBreakpoints.has(line)) {
-          this.pb.addLineBreakpoint(line - 1);
+        if (!this.activeBreakpoints.get(this.sourcePath)?.has(line)) {
+          this.pb.addLineBreakpoint(line - 1, 0);
           this.entryTempLines.add(line);
         }
       }
@@ -793,8 +849,8 @@ export class PureBasicDebugSession extends DebugSession {
     try {
       this.entryTempLines.clear();
       for (let line = 1; line <= this.totalLines; line++) {
-        if (!this.activeBreakpoints.has(line)) {
-          this.pb.addLineBreakpoint(line - 1);
+        if (!this.activeBreakpoints.get(this.sourcePath)?.has(line)) {
+          this.pb.addLineBreakpoint(line - 1, 0);
           this.entryTempLines.add(line);
         }
       }
@@ -803,7 +859,7 @@ export class PureBasicDebugSession extends DebugSession {
       // A breakpoint edit during this internal run can promote a temporary
       // line to a real breakpoint, so activeBreakpoints remains authoritative.
       for (const line of this.entryTempLines) {
-        if (!this.activeBreakpoints.has(line)) this.pb.removeLineBreakpoint(line - 1);
+        if (!this.activeBreakpoints.get(this.sourcePath)?.has(line)) this.pb.removeLineBreakpoint(line - 1, 0);
       }
       this.entryTempLines.clear();
       this.entryDiscoveryInProgress = false;
@@ -1049,7 +1105,7 @@ export class PureBasicDebugSession extends DebugSession {
       // GDB-frozen outside its wire wait loop and cannot answer (live-
       // confirmed, src/debug/spike/spike3.mjs). Report a single synthetic
       // frame from the GDB-read PC instead of blocking the client forever.
-      const source = new Source(path.basename(this.sourcePath), this.sourcePath);
+      const source = this.sourceForFrame(this.lastStopModuleId);
       this.frameHandles.clear();
       this.frameHandles.set(0, { kind: "main" });
       const frame = new StackFrame(0, `native code (paused) — 0x${this.forcePauseNativeAddress.toString(16)}`, source, this.lastStopLine || 1);
@@ -1060,7 +1116,6 @@ export class PureBasicDebugSession extends DebugSession {
     try {
     const pbFrames = await this.pb.stackTrace(); // opcode 16: procedure frames only, outermost-first
     this.frameHandles.clear();
-    const source = new Source(path.basename(this.sourcePath), this.sourcePath);
     const procInnermostFirst = [...pbFrames].reverse();
     const frames: StackFrame[] = [];
     let id = 0;
@@ -1076,7 +1131,8 @@ export class PureBasicDebugSession extends DebugSession {
       const frame = procInnermostFirst[j];
       const pbIndex = pbFrames.length - 1 - j; // opcode-17 frame index (0 = outermost)
       this.frameHandles.set(id, { kind: "proc", pbIndex });
-      frames.push(new StackFrame(id, frame.display, source, line));
+      const moduleId = j === 0 ? this.lastStopModuleId : frame.moduleId;
+      frames.push(new StackFrame(id, frame.display, this.sourceForFrame(moduleId), line));
       id++;
       line = frame.callSiteLine0 + 1;
     }
@@ -1085,7 +1141,8 @@ export class PureBasicDebugSession extends DebugSession {
     // bottom of the stack when stopped inside a procedure (opcode 16 never
     // includes it). Its locals come from opcode 9 + evaluate (see variablesRequest).
     this.frameHandles.set(id, { kind: "main" });
-    frames.push(new StackFrame(id, `${path.basename(this.sourcePath)} (main)`, source, line));
+    const mainSource = this.sourceForFrame(procInnermostFirst.length === 0 ? this.lastStopModuleId : pbFrames[0].moduleId);
+    frames.push(new StackFrame(id, `${path.basename(mainSource.path!)} (main)`, mainSource, line));
 
     response.body = { stackFrames: frames, totalFrames: frames.length };
     this.sendResponse(response);

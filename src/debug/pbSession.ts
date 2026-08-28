@@ -39,6 +39,9 @@ export const OP_STACK_TRACE = 16;
 export const OP_EXAMINE_FRAME = 17; // f8 = frame index, 0 = outermost
 export const OP_EVALUATE = 33; // ExternalDebugger_Expression read side; 34 is byte-identical
 export const OP_MODIFY = 35; // ExternalDebugger_Expression write side (ModifyVariable)
+// `#COMMAND_GetModules` is the last debugger->target command in PureBasic
+// 6.41's ExternalCommands.h enumeration.  Its reply is MSG_MODULES below.
+export const OP_GET_MODULES = 40;
 
 // ExternalDebugger_ArraysLists opcodes (PLAN.md M5, live-tested against
 // src/debug/spike/test-arrays.pb via fifo-arrayslists.mjs). f8=0 selects
@@ -191,6 +194,7 @@ export const MSG_EVALUATE_REPLY = 36;
 // DataBreakPoints.pb): f8 is the status below, f12 is the numeric id echoed
 // back from the add/remove request that triggered it.
 export const MSG_DATA_BREAKPOINT = 39;
+export const MSG_MODULES = 50;
 export const DBP_ADDED = 1;
 export const DBP_COULD_NOT_ADD = 2;
 export const DBP_EVAL_ERROR = 3; // payload: NUL-terminated latin1 error text
@@ -206,9 +210,74 @@ export interface PbMessage {
   payload: Buffer;
 }
 
+/** A source file as assigned by PureBasic's debugger.  File id 0 is the
+ * launch source; positive ids are `IncludeFile`/`XIncludeFile` sources. */
+export interface PbSourceFile {
+  id: number;
+  path: string;
+}
+
+const DEBUGGER_LINE_BITS = 20;
+const DEBUGGER_LINE_MASK = (1 << DEBUGGER_LINE_BITS) - 1;
+
+/** PureBasic packs its source-file id and zero-based line into one int32. */
+export function splitDebuggerLine(value: number): { moduleId: number; line: number } {
+  const unsigned = value >>> 0;
+  return { moduleId: unsigned >>> DEBUGGER_LINE_BITS, line: unsigned & DEBUGGER_LINE_MASK };
+}
+
+/** The inverse of {@link splitDebuggerLine}, with range checks before a value
+ * is placed into the signed int32 protocol header. */
+export function makeDebuggerLine(moduleId: number, line: number): number {
+  if (!Number.isInteger(moduleId) || moduleId < 0 || moduleId > 0xfff) throw new Error("module id must fit in 12 bits");
+  if (!Number.isInteger(line) || line < 0 || line > DEBUGGER_LINE_MASK) throw new Error("source line must fit in 20 bits");
+  return ((moduleId << DEBUGGER_LINE_BITS) | line) | 0;
+}
+
+/** Parses Init's NUL-delimited source-root plus include-file payload.  The
+ * main file is deliberately not in the payload: callers supply its real path
+ * as id 0, then resolve the `Value1` included filenames against `sourceRoot`.
+ * The target stores source names as UTF-8 (as the standalone debugger does). */
+export function parseIncludedSources(payload: Buffer, includedFileCount: number): { sourceRoot?: string; mainPath?: string; includedPaths: string[] } {
+  if (!Number.isInteger(includedFileCount) || includedFileCount < 0) throw new Error("included file count must be a non-negative integer");
+  const strings: string[] = [];
+  let offset = 0;
+  // The first two strings are the source root and the main source's stored
+  // relative filename. Positive debugger file ids begin only after those.
+  while (offset < payload.length && strings.length < includedFileCount + 2) {
+    const nul = payload.indexOf(0, offset);
+    const end = nul === -1 ? payload.length : nul;
+    strings.push(payload.toString("utf8", offset, end));
+    if (nul === -1) break;
+    offset = nul + 1;
+  }
+  if (strings.length < includedFileCount + 2) {
+    throw new Error(`debugger Init declared ${includedFileCount} included files but supplied only ${Math.max(0, strings.length - 2)}`);
+  }
+  return { sourceRoot: strings[0] || undefined, mainPath: strings[1] || undefined, includedPaths: strings.slice(2) };
+}
+
+/** Parses `#COMMAND_Modules`: `Value1` NUL-terminated ASCII names.  Module
+ * names are retained separately from source-file ids; they are useful
+ * diagnostics, but only the Init include table defines line-file mapping. */
+export function parseModuleNames(payload: Buffer, count: number): string[] {
+  if (!Number.isInteger(count) || count < 0) throw new Error("module count must be a non-negative integer");
+  const result: string[] = [];
+  let offset = 0;
+  for (let i = 0; i < count; i++) {
+    const nul = payload.indexOf(0, offset);
+    if (nul === -1) throw new Error(`debugger Modules declared ${count} names but payload ended at ${i}`);
+    result.push(payload.toString("latin1", offset, nul));
+    offset = nul + 1;
+  }
+  return result;
+}
+
 export interface PbFrame {
   /** 0-based call-site line number (verified against known source lines). */
   callSiteLine0: number;
+  /** PureBasic source-file id encoded alongside `callSiteLine0`. */
+  moduleId: number;
   /** Formatted "ProcName(arg1, arg2, ...)" display string. */
   display: string;
 }
@@ -394,11 +463,11 @@ export function parseFrames(payload: Buffer): PbFrame[] {
   const frames: PbFrame[] = [];
   let off = 0;
   while (off + 4 <= payload.length) {
-    const callSiteLine0 = payload.readInt32LE(off);
+    const location = splitDebuggerLine(payload.readInt32LE(off));
     off += 4;
     const nul = payload.indexOf(0, off);
     const end = nul === -1 ? payload.length : nul;
-    frames.push({ callSiteLine0, display: payload.toString("latin1", off, end) });
+    frames.push({ moduleId: location.moduleId, callSiteLine0: location.line, display: payload.toString("latin1", off, end) });
     off = nul === -1 ? payload.length : nul + 1;
   }
   return frames;
@@ -1325,7 +1394,8 @@ export class PbDebugSession extends EventEmitter {
       return;
     }
     if (msg.type === MSG_STOPPED) {
-      this.emit("stopped", { line: msg.f8, reason: msg.f12 });
+      const location = splitDebuggerLine(msg.f8);
+      this.emit("stopped", { ...location, reason: msg.f12 });
       return;
     }
     if (msg.type === MSG_CONTINUED) {
@@ -1508,12 +1578,12 @@ export class PbDebugSession extends EventEmitter {
 
   /** Adds a breakpoint by the wire protocol's 0-based compiled-line index. */
   addLineBreakpoint(line: number, moduleId = 0): void {
-    this.write(OP_BREAKPOINTS, BP_ADD_LINE, (moduleId << 20) | line);
+    this.write(OP_BREAKPOINTS, BP_ADD_LINE, makeDebuggerLine(moduleId, line));
   }
 
   /** Removes a breakpoint by the wire protocol's 0-based compiled-line index. */
   removeLineBreakpoint(line: number, moduleId = 0): void {
-    this.write(OP_BREAKPOINTS, BP_REMOVE_LINE, (moduleId << 20) | line);
+    this.write(OP_BREAKPOINTS, BP_REMOVE_LINE, makeDebuggerLine(moduleId, line));
   }
 
   clearAllLineBreakpoints(): void {
@@ -1548,6 +1618,17 @@ export class PbDebugSession extends EventEmitter {
       this.write(OP_STACK_TRACE);
       const msg = await this.nextMessageWithTimeout(timeoutMs, "the stack trace", 0x16);
       return parseFrames(msg.payload);
+    });
+  }
+
+  /** Requests the target's named PureBasic modules.  This is intentionally
+   * separate from Init's source-file table: a module name is not necessarily
+   * a source filename, while only the latter can decode a packed line id. */
+  async getModules(timeoutMs = DEFAULT_REQUEST_TIMEOUT_MS): Promise<string[]> {
+    return this.serialize(async () => {
+      this.write(OP_GET_MODULES);
+      const msg = await this.nextMessageWithTimeout(timeoutMs, "the debugger module names", MSG_MODULES);
+      return parseModuleNames(msg.payload, msg.f8);
     });
   }
 

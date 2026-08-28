@@ -81,6 +81,17 @@ configuration:
 - The C backend additionally requires a system C toolchain (gcc/clang) if
   you choose it over the self-contained ASM backend.
 
+## Release validation
+
+CI and tag releases run on the `self-hosted`, `linux`, `purebasic-6.41`
+runner label. That runner provides the licensed PureBasic 6.41 Linux x64
+installation at `/opt/purebasic-6.41`, the direct Insiders executable at
+`/usr/share/code-insiders/code-insiders`, and `xvfb-run`. It runs the real FIFO
+and TCP debugger lifecycle tests through `npm test`, then runs the extension
+host suite through `xvfb-run -a npm run test:vscode`. The latter has an
+extension-host result record checked by its parent process, so a failed Mocha
+suite cannot be mistaken for Electron's successful exit.
+
 ## Settings
 
 | Setting | Description |
