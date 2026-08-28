@@ -222,6 +222,15 @@ export class PureBasicDebugSession extends DebugSession {
    * stackTraceRequest/variablesRequest below.
    */
   private forcePauseEngine?: GdbMiPtraceEngine;
+  /** Set the instant forcePause() creates its GdbMiPtraceEngine, before attach()
+   *  resolves -- attach() itself is a bounded but real wait (spawn gdb, run
+   *  MI setup, `-target-attach`, wait for `*stopped`), and until it resolves
+   *  the engine isn't assigned to forcePauseEngine yet. Without this,
+   *  disconnecting (or Continue/Step) while an attach is still in flight had
+   *  no reference to dispose, so the owned gdb process -- and the ptrace
+   *  attach it holds on the target -- outlived the DAP session that spawned
+   *  it. Cleared the instant attach() settles, on every exit path. */
+  private forcePauseAttaching?: GdbMiPtraceEngine;
   private forcePauseActive = false;
   /** GDB-read PC at the moment forcePause() attached, used only to label the synthetic frame stackTraceRequest returns while forcePauseActive. */
   private forcePauseNativeAddress = 0;
@@ -230,8 +239,6 @@ export class PureBasicDebugSession extends DebugSession {
   /** Invalidates an in-flight forcePause() attempt/timer when superseded by a real event (a cooperative stop, a second pause, continue, disconnect). */
   private pauseGeneration = 0;
   private forcePauseTimer?: ReturnType<typeof setTimeout>;
-  /** Memoizes gdbEngineAvailable() per session -- it synchronously spawns `gdb --version` (spawnSync), which would otherwise block the extension host's event loop on every single Pause click, not just once. */
-  private gdbAvailableCache?: boolean;
 
   constructor() {
     super();
@@ -1031,7 +1038,7 @@ export class PureBasicDebugSession extends DebugSession {
       return;
     }
     try {
-      if (this.forcePauseActive) await this.resumeFromForcePauseIfActive();
+      if (this.forcePauseActive || this.forcePauseAttaching) await this.resumeFromForcePauseIfActive();
       else this.pb.continue();
       this.targetStopped = false;
       this.sendResponse(response);
@@ -1049,23 +1056,27 @@ export class PureBasicDebugSession extends DebugSession {
       // covers that gap; see the class-level Force Pause doc comment.
       this.pb.pause();
       this.sendResponse(response);
-      this.armForcePauseFallback();
+      // Fire-and-forget: the response above must not wait on gdb's own
+      // (async, process-shared) availability probe. Any pause superseded
+      // while that probe is in flight is caught by the generation check
+      // inside armForcePauseFallback() itself.
+      void this.armForcePauseFallback();
     } catch (err) {
       this.sendAsyncRequestError(response, "pausing execution", err);
     }
   }
 
-  private isGdbAvailable(): boolean {
-    if (this.gdbAvailableCache === undefined) this.gdbAvailableCache = gdbEngineAvailable();
-    return this.gdbAvailableCache;
-  }
-
   /** Starts (or restarts) the bounded wait after a cooperative pause request, after which forcePause() takes over if no wire stop arrived. */
-  private armForcePauseFallback(): void {
-    if (!this.isGdbAvailable() || process.platform !== "linux" || !this.child?.pid) return;
+  private async armForcePauseFallback(): Promise<void> {
+    if (process.platform !== "linux" || !this.child?.pid) return;
+    const generation = this.pauseGeneration;
+    if (!(await gdbEngineAvailable())) return;
+    // A cooperative wire stop, a newer pause, a continue, or a disconnect
+    // can all land while the (memoized, but still async) probe above was in
+    // flight -- do not arm a fallback for a pause that is no longer current.
+    if (generation !== this.pauseGeneration || !this.child?.pid) return;
     this.pausePending = true;
     if (this.forcePauseTimer) clearTimeout(this.forcePauseTimer);
-    const generation = this.pauseGeneration;
     this.forcePauseTimer = setTimeout(() => {
       this.forcePauseTimer = undefined;
       void this.forcePause(generation);
@@ -1094,12 +1105,20 @@ export class PureBasicDebugSession extends DebugSession {
     const pid = this.child?.pid;
     if (!pid) return;
     const engine = new GdbMiPtraceEngine();
+    // Visible to disconnectRequest/resumeFromForcePauseIfActive from this
+    // point on -- attach() below is a real, if bounded, wait (spawn gdb, MI
+    // setup, `-target-attach`, wait for `*stopped`), and until it resolves
+    // this engine has no other owner that could dispose it if the session
+    // ends or the user hits Continue/Step first.
+    this.forcePauseAttaching = engine;
     let pc: number;
     try {
       pc = await engine.attach(pid);
     } catch (err) {
       this.logError(err);
       return;
+    } finally {
+      if (this.forcePauseAttaching === engine) this.forcePauseAttaching = undefined;
     }
     if (generation !== this.pauseGeneration) {
       // A cooperative stop (or a newer pause/continue/disconnect) won the
@@ -1131,10 +1150,29 @@ export class PureBasicDebugSession extends DebugSession {
     this.sendEvent(new StoppedEvent("pause", MAIN_THREAD_ID));
   }
 
-  /** Detaches/disposes an active Force Pause engine and clears the wire's cooperative pause flag (opcode 2), if one is active; a no-op otherwise. Every resume path (continue/step/disconnect) must go through this before touching `this.pb` again. */
+  /** Detaches/disposes an active Force Pause engine (or cancels one still
+   *  attaching, see forcePauseAttaching) and clears the wire's cooperative
+   *  pause flag (opcode 2), if either is active; a no-op otherwise. Every
+   *  resume path (continue/step/disconnect) must go through this before
+   *  touching `this.pb` again. */
   private async resumeFromForcePauseIfActive(): Promise<void> {
-    if (!this.forcePauseActive) return;
+    if (!this.forcePauseActive && !this.forcePauseAttaching) return;
     this.pauseGeneration++;
+    if (this.forcePauseAttaching) {
+      // Disposing here rejects attach()'s in-flight promise (see
+      // GdbMiPtraceEngine.dispose()'s "aborted" event), which forcePause()
+      // catches and returns from cleanly -- the generation bump above also
+      // means forcePause() would have discarded a successful attach anyway,
+      // but a hung/slow attach must not be left to finish on its own time.
+      const attaching = this.forcePauseAttaching;
+      this.forcePauseAttaching = undefined;
+      try {
+        await attaching.dispose();
+      } catch (err) {
+        this.logError(err);
+      }
+    }
+    if (!this.forcePauseActive) return;
     this.forcePauseActive = false;
     this.targetStopped = false;
     const engine = this.forcePauseEngine;
@@ -1189,7 +1227,7 @@ export class PureBasicDebugSession extends DebugSession {
       this.sendResponse(response);
       return;
     }
-    if (this.forcePauseActive) {
+    if (this.forcePauseActive || this.forcePauseAttaching) {
       // There is no wire statement-boundary context at a forced pause (see
       // the class-level Force Pause doc comment), so a native step isn't
       // meaningful here -- resume instead, same as continueRequest.
@@ -1583,6 +1621,21 @@ export class PureBasicDebugSession extends DebugSession {
     _args: DebugProtocol.DisconnectArguments,
   ): Promise<void> {
     this.cancelForcePauseFallback();
+    if (this.forcePauseAttaching) {
+      // attach() hasn't resolved yet -- there is no forcePauseEngine to find
+      // below. dispose() rejects the in-flight attach via its "aborted"
+      // event, which forcePause() catches and returns from; without this,
+      // stopping the session while a Force Pause attach was still underway
+      // left its owned gdb process (and the ptrace attach it holds on the
+      // target) running past the end of the DAP session.
+      const attaching = this.forcePauseAttaching;
+      this.forcePauseAttaching = undefined;
+      try {
+        await attaching.dispose();
+      } catch (err) {
+        this.logError(err);
+      }
+    }
     if (this.forcePauseEngine) {
       // SIGKILLing the target below works fine even while GDB still has it
       // ptrace-attached (SIGKILL cannot be intercepted or deferred by a

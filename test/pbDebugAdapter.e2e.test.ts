@@ -23,7 +23,7 @@ import * as fs from "fs";
 import * as os from "os";
 import * as path from "path";
 import { DebugClient } from "@vscode/debugadapter-testsupport";
-import { gdbEngineAvailable } from "../src/debug/ptraceEngine";
+import { gdbEngineAvailableSync } from "../src/debug/ptraceEngine";
 
 const MAIN_THREAD_ID = 1;
 const ADAPTER = path.join(__dirname, "..", "adapter.cjs");
@@ -514,7 +514,7 @@ test("requests after disconnect receive an error response instead of writing a c
 
 test(
   "Force Pause: GDB attach interrupts a target blocked in Delay(), and Continue actually resumes it",
-  { skip: skip || !gdbEngineAvailable(), timeout: 30000 },
+  { skip: skip || !gdbEngineAvailableSync(), timeout: 30000 },
   async () => {
     const dc = new DebugClient("node", ADAPTER, "purebasic");
     dc.defaultTimeout = 30000;
@@ -566,7 +566,7 @@ test(
 
 test(
   "Force Pause: a quick Continue after Pause cancels the still-pending fallback timer",
-  { skip: skip || !gdbEngineAvailable(), timeout: 30000 },
+  { skip: skip || !gdbEngineAvailableSync(), timeout: 30000 },
   async () => {
     // Regression test: armForcePauseFallback()'s timer used to only be
     // invalidated by an already-*active* force pause or a cooperative wire

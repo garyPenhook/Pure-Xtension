@@ -33,8 +33,9 @@ import { formatStructureField, StructureField } from "./dumpParsers";
 import { HelpIndex, getHelpUrl, loadOrFetchHelpIndex } from "./onlineHelpIndex";
 import { getKeywordHelpUrl, isKeyword } from "./keywordHelp";
 import { RetryableLoader } from "./retryableLoader";
-import { isWordChar, maskStringsAndComments, qualifiedWordAt, wordAt } from "./textUtils";
+import { maskStringsAndComments, qualifiedWordAt, typedModuleQualifierBefore, wordAt } from "./textUtils";
 import { findRenameRangesForTarget, IDENTIFIER_RE, RenameTarget, resolveRenameTargetFromSymbols } from "./rename";
+import { enclosingModuleAt, isVisibleUnqualified, pickVisibleCandidate, resolveSymbolAt } from "./symbolResolver";
 
 interface InitializationOptions {
   compilerPath?: string;
@@ -108,26 +109,6 @@ async function getBuiltinStructureFields(name: string): Promise<StructureField[]
 }
 
 
-function findWordRanges(doc: TextDocument, word: string): Range[] {
-  const text = maskStringsAndComments(doc.getText());
-  const lower = word.toLowerCase();
-  const ranges: Range[] = [];
-  let i = 0;
-  while (i < text.length) {
-    if (isWordChar(text[i]) && (i === 0 || !isWordChar(text[i - 1]))) {
-      let j = i;
-      while (j < text.length && isWordChar(text[j])) j++;
-      if (text.slice(i, j).toLowerCase() === lower) {
-        ranges.push(Range.create(doc.positionAt(i), doc.positionAt(j)));
-      }
-      i = j;
-    } else {
-      i++;
-    }
-  }
-  return ranges;
-}
-
 function workspaceSymbolKindToLsp(kind: WorkspaceSymbol["kind"]): SymbolKind {
   switch (kind) {
     case "procedure":
@@ -148,8 +129,10 @@ function workspaceSymbolKindToLsp(kind: WorkspaceSymbol["kind"]): SymbolKind {
 }
 
 /** Backward scan from `offset` for the enclosing, unclosed `(` and which comma-separated
- *  argument slot `offset` falls in — used to resolve the active function call for signatureHelp. */
-function findEnclosingCall(text: string, offset: number): { name: string; activeParameter: number } | undefined {
+ *  argument slot `offset` falls in — used to resolve the active function call for signatureHelp.
+ *  `module` is set for a `Module::Proc(` call site so the caller can prefer that module's own
+ *  procedure over a same-named one elsewhere. */
+function findEnclosingCall(text: string, offset: number): { name: string; module?: string; activeParameter: number } | undefined {
   let depth = 0;
   let activeParameter = 0;
   let i = offset - 1;
@@ -159,8 +142,8 @@ function findEnclosingCall(text: string, offset: number): { name: string; active
       depth++;
     } else if (ch === "(") {
       if (depth === 0) {
-        const name = wordAt(text, i);
-        return name ? { name, activeParameter } : undefined;
+        const qualified = qualifiedWordAt(text, i);
+        return qualified ? { name: qualified.name, module: qualified.module, activeParameter } : undefined;
       }
       depth--;
     } else if (ch === "," && depth === 0) {
@@ -330,19 +313,46 @@ connection.onCompletion(async (params): Promise<CompletionItem[]> => {
 
   const items: CompletionItem[] = [];
 
-  // Initialization starts this in the background so first completion is not
-  // held behind a network timeout. Re-kick it here without awaiting it: if the
-  // initial fetch happened while offline, a later completion can self-heal and
-  // builtinCompletionItems() will invalidate its no-help cache when the index
-  // arrives.
-  void ensureHelpIndex();
+  // A completion request right after "Module::" (or "Module::partial") only
+  // ever wants that module's own members -- never a builtin (builtins are
+  // never module members) and never an unrelated same-named symbol from
+  // elsewhere, so this branches away from the normal visibility rule below
+  // entirely rather than trying to fold both into one filter.
+  const typedModule = typedModuleQualifierBefore(text, offset);
 
-  const index = await ensureBuiltinIndex();
-  if (index) {
-    items.push(...builtinCompletionItems(index));
+  if (typedModule === undefined) {
+    // Initialization starts this in the background so first completion is not
+    // held behind a network timeout. Re-kick it here without awaiting it: if the
+    // initial fetch happened while offline, a later completion can self-heal and
+    // builtinCompletionItems() will invalidate its no-help cache when the index
+    // arrives.
+    void ensureHelpIndex();
+
+    const index = await ensureBuiltinIndex();
+    if (index) {
+      items.push(...builtinCompletionItems(index));
+    }
   }
 
+  const cursorLine = params.position.line;
+  const cursorModule = enclosingModuleAt(text, cursorLine);
+
   for (const symbol of await resolveIncludeGraphSymbols(doc.uri, documents)) {
+    // A procedure's locals/parameters (WorkspaceSymbol.scopeEndLine) must not
+    // leak into completion outside their own procedure and file.
+    if (symbol.scopeEndLine !== undefined && (symbol.uri !== doc.uri || cursorLine < symbol.line || cursorLine > symbol.scopeEndLine)) {
+      continue;
+    }
+    if (typedModule !== undefined) {
+      if ((symbol.module ?? "").toLowerCase() !== typedModule.toLowerCase()) continue;
+    } else if (symbol.kind !== "module" && !isVisibleUnqualified(symbol.module, cursorModule)) {
+      // A module's members are invisible unqualified from outside it, and
+      // main-code symbols are equally invisible from inside a module -- see
+      // symbolResolver.ts's isVisibleUnqualified. A module's own NAME is
+      // exempt: `OtherModule::Thing` is always valid from anywhere, so the
+      // module name itself must stay discoverable to type that qualifier.
+      continue;
+    }
     items.push({
       label: symbol.name,
       kind:
@@ -375,7 +385,7 @@ connection.onHover(async (params): Promise<Hover | undefined> => {
   const offset = doc.offsetAt(params.position);
   const qualified = qualifiedWordAt(doc.getText(), offset);
   if (!qualified) return undefined;
-  const { module, name: word } = qualified;
+  const { name: word } = qualified;
 
   const index = await ensureBuiltinIndex();
 
@@ -389,16 +399,15 @@ connection.onHover(async (params): Promise<Hover | undefined> => {
   }
 
   const symbols = await resolveIncludeGraphSymbols(doc.uri, documents);
-  // A `Module::Name`-qualified reference must resolve to that module's own
-  // symbol, not just the first same-named symbol anywhere -- otherwise a
-  // name that's also used in a different module (or in main code) silently
-  // wins on lookup order alone.
-  const symbol = symbols.find(
-    (s) =>
-      s.name.toLowerCase() === word.toLowerCase() &&
-      (!module || (s.module ?? "").toLowerCase() === module.toLowerCase()),
-  );
-  if (symbol) {
+  // resolveSymbolAt (symbolResolver.ts, shared with rename/definition/
+  // signature-help/references -- M10) resolves the identity at the cursor
+  // using module qualification, procedure-local scope, and (when
+  // unqualified) which module the cursor itself is in -- not just the first
+  // same-named symbol anywhere, so a name reused in a different module, in
+  // main code, or in an unrelated procedure's locals doesn't silently win.
+  const target = resolveSymbolAt(doc.getText(), offset, symbols, doc.uri);
+  if (target) {
+    const symbol = target.symbol;
     const fields =
       symbol.kind === "structure" ? await resolveStructureFields(symbols, symbol.name, getBuiltinStructureFields, symbol.module) : symbol.fields;
     const fieldList = fields?.length ? `\n\n${fields.map((f) => `- ${formatStructureField(f)}`).join("\n")}` : "";
@@ -468,16 +477,11 @@ connection.onDefinition(async (params): Promise<Definition | undefined> => {
   if (!doc) return undefined;
 
   const offset = doc.offsetAt(params.position);
-  const qualified = qualifiedWordAt(doc.getText(), offset);
-  if (!qualified) return undefined;
+  const symbols = await resolveIncludeGraphSymbols(doc.uri, documents);
+  const target = resolveSymbolAt(doc.getText(), offset, symbols, doc.uri);
+  if (!target) return undefined;
 
-  const symbol = (await resolveIncludeGraphSymbols(doc.uri, documents)).find(
-    (s) =>
-      s.name.toLowerCase() === qualified.name.toLowerCase() &&
-      (!qualified.module || (s.module ?? "").toLowerCase() === qualified.module.toLowerCase()),
-  );
-  if (!symbol) return undefined;
-
+  const symbol = target.symbol;
   const range = Range.create(Position.create(symbol.line, 0), Position.create(symbol.line, 0));
   return Location.create(symbol.uri, range);
 });
@@ -507,9 +511,16 @@ connection.onSignatureHelp(async (params): Promise<SignatureHelp | undefined> =>
     };
   }
 
-  const procedure = (await resolveIncludeGraphSymbols(doc.uri, documents)).find(
+  const procedureCandidates = (await resolveIncludeGraphSymbols(doc.uri, documents)).filter(
     (s) => s.kind === "procedure" && s.name.toLowerCase() === call.name.toLowerCase(),
   );
+  // Same module-visibility preference as resolveSymbolAt (symbolResolver.ts):
+  // an explicit Module::Proc(...) qualifier wins outright; otherwise prefer
+  // the procedure belonging to whichever module the call site itself is in,
+  // so a same-named procedure elsewhere doesn't win on file order alone.
+  const text = doc.getText();
+  const callLine = text.slice(0, offset).split("\n").length - 1;
+  const procedure = pickVisibleCandidate(procedureCandidates, call.module, enclosingModuleAt(text, callLine));
   if (procedure) {
     const rawParams = procedure.detail.replace(/^\(|\)$/g, "");
     const params_ = splitParams(rawParams);
@@ -529,15 +540,31 @@ connection.onSignatureHelp(async (params): Promise<SignatureHelp | undefined> =>
   return undefined;
 });
 
-connection.onReferences((params: ReferenceParams): Location[] => {
+connection.onReferences(async (params: ReferenceParams): Promise<Location[]> => {
   const doc = documents.get(params.textDocument.uri);
   if (!doc) return [];
 
-  const offset = doc.offsetAt(params.position);
-  const word = wordAt(doc.getText(), offset);
-  if (!word) return [];
+  // Resolves the same identity rename/hover/definition do (symbolResolver.ts,
+  // M10) rather than a plain spelling scan: an unresolvable word (a keyword,
+  // a built-in, or nothing at the cursor at all) refuses instead of
+  // text-searching for it, matching rename's existing "refuse rather than
+  // guess" philosophy -- and a resolved symbol's references are scoped and
+  // module-qualified exactly the way a rename's edits would be.
+  const symbols = await resolveIncludeGraphSymbols(doc.uri, documents);
+  const target = resolveSymbolAt(doc.getText(), doc.offsetAt(params.position), symbols, doc.uri);
+  if (!target) return [];
 
-  return findWordRanges(doc, word).map((range) => Location.create(doc.uri, range));
+  const locations: Location[] = [];
+  for (const uri of await resolveIncludeGraphUris(doc.uri, documents)) {
+    // Procedure locals cannot escape their declaring document/scope.
+    if (target.scope && uri !== target.symbol.uri) continue;
+    const candidate = await getIncludeGraphDocument(uri, documents);
+    if (!candidate) continue;
+    for (const range of findRenameRangesForTarget(candidate, target)) {
+      locations.push(Location.create(uri, range));
+    }
+  }
+  return locations;
 });
 
 async function resolveRenameTarget(doc: TextDocument, offset: number): Promise<RenameTarget | undefined> {

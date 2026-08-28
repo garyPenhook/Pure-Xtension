@@ -59,6 +59,22 @@ export function qualifiedWordAt(text: string, offset: number): { module?: string
   return { name };
 }
 
+/**
+ * The module name immediately before the cursor for a just-typed or
+ * in-progress `Module::` / `Module::partial` completion prefix.
+ * qualifiedWordAt requires a word AT the offset, so it can't tell a plain
+ * unqualified completion apart from one right after `Module::` with nothing
+ * typed yet -- this scans back past any in-progress word first.
+ */
+export function typedModuleQualifierBefore(text: string, offset: number): string | undefined {
+  const masked = maskStringsAndComments(text);
+  let i = offset;
+  while (i > 0 && isWordChar(masked[i - 1])) i--;
+  if (text.slice(i - 2, i) !== "::") return undefined;
+  const before = wordRangeAt(masked, i - 3);
+  return before && before.end === i - 2 ? text.slice(before.start, before.end) : undefined;
+}
+
 /** Blanks out `;`-comment and `"`-string contents (preserving offsets/newlines)
  *  so a word-boundary scan run over the result can't match inside them. */
 export function maskStringsAndComments(text: string): string {

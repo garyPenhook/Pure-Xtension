@@ -93,11 +93,88 @@ function parseMemory(text: string): Buffer {
   return Buffer.from(contents, "hex");
 }
 
-/** A bounded, side-effect-free probe. launch() is still the real capability check. */
-export function gdbEngineAvailable(gdbPath = "gdb"): boolean {
+const cachedAvailability = new Map<string, Promise<boolean>>();
+
+/**
+ * Bounded, side-effect-free async probe, memoized process-wide (per
+ * `gdbPath`) so repeated or concurrent callers (multiple Pause clicks,
+ * multiple debug sessions) never spawn more than one `gdb --version` check
+ * for the same path. launch()/attach() are still the real capability check --
+ * this only decides whether attempting them is worth it. Replaces a prior
+ * synchronous `spawnSync()` version that blocked the whole extension host's
+ * event loop for up to 3s on the first Pause.
+ */
+export function gdbEngineAvailable(gdbPath = "gdb"): Promise<boolean> {
+  if (process.platform !== "linux") return Promise.resolve(false);
+  let probeResult = cachedAvailability.get(gdbPath);
+  if (!probeResult) {
+    probeResult = new Promise<boolean>((resolve) => {
+      let probe: cp.ChildProcess;
+      try {
+        probe = cp.spawn(gdbPath, ["--version"]);
+      } catch {
+        resolve(false);
+        return;
+      }
+      let stdout = "";
+      const timer = setTimeout(() => {
+        probe.kill("SIGKILL");
+        resolve(false);
+      }, 3000);
+      probe.stdout?.on("data", (chunk: Buffer) => {
+        stdout += chunk.toString();
+      });
+      probe.once("error", () => {
+        clearTimeout(timer);
+        resolve(false);
+      });
+      probe.once("exit", (code) => {
+        clearTimeout(timer);
+        resolve(code === 0 && /GNU gdb/i.test(stdout));
+      });
+    }).then((available) => {
+      // Only memoize a positive result forever -- gdb won't uninstall
+      // itself mid-session. A negative one could be a one-off (PATH
+      // momentarily wrong, a spawn race, the probe's own 3s timeout
+      // tripping under load), and permanently caching that would silently
+      // disable Force Pause for every future Pause and every future debug
+      // session in this same extension host, with no re-probe and no
+      // visible signal, over what might never recur.
+      if (!available) cachedAvailability.delete(gdbPath);
+      return available;
+    });
+    cachedAvailability.set(gdbPath, probeResult);
+  }
+  return probeResult;
+}
+
+/**
+ * Synchronous variant retained only for test `{ skip }` conditions, which
+ * must be known synchronously at `test()` registration time, before any
+ * async work can run. Never call this from production/extension-host code --
+ * use the async `gdbEngineAvailable()` above there.
+ */
+export function gdbEngineAvailableSync(gdbPath = "gdb"): boolean {
   if (process.platform !== "linux") return false;
   const probe = cp.spawnSync(gdbPath, ["--version"], { encoding: "utf8", timeout: 3000 });
   return probe.status === 0 && /GNU gdb/i.test(probe.stdout ?? "");
+}
+
+const DEFAULT_COMMAND_TIMEOUT_MS = 5000;
+const DEFAULT_STOP_WAIT_TIMEOUT_MS = 15000;
+
+export interface GdbMiPtraceEngineOptions {
+  /** Path to the gdb executable to spawn. Defaults to "gdb", resolved via PATH. */
+  gdbPath?: string;
+  /** Bound on any single MI command's round trip (startup/attach/detach commands included). */
+  commandTimeoutMs?: number;
+  /** Bound on waiting for the asynchronous `*stopped` record after a resume/attach. */
+  stopWaitTimeoutMs?: number;
+  /** Overrides the environment gdb itself (not the inferior -- see launch()'s
+   *  `-gdb-set environment`) is spawned with. Test-only hook for driving a
+   *  fake gdb fixture script through env vars without touching the real
+   *  process.env; production code never sets this. */
+  env?: NodeJS.ProcessEnv;
 }
 
 interface PendingCommand {
@@ -115,11 +192,23 @@ export class GdbMiPtraceEngine extends EventEmitter implements PtraceEngine {
   private gdb?: cp.ChildProcessWithoutNullStreams;
   private readonly pending = new Map<number, PendingCommand>();
   private readonly breakpoints = new Map<number, string>();
+  private readonly gdbPath: string;
+  private readonly commandTimeoutMs: number;
+  private readonly stopWaitTimeoutMs: number;
+  private readonly env?: NodeJS.ProcessEnv;
   private token = 1;
   private lastThreadId = 1;
   private inferiorPid = -1;
   private lastStop?: MiStoppedRecord;
   private closed = false;
+
+  constructor(options: GdbMiPtraceEngineOptions = {}) {
+    super();
+    this.gdbPath = options.gdbPath ?? "gdb";
+    this.commandTimeoutMs = options.commandTimeoutMs ?? DEFAULT_COMMAND_TIMEOUT_MS;
+    this.stopWaitTimeoutMs = options.stopWaitTimeoutMs ?? DEFAULT_STOP_WAIT_TIMEOUT_MS;
+    this.env = options.env;
+  }
 
   private rejectPending(err: Error): void {
     for (const pending of this.pending.values()) pending.reject(err);
@@ -150,7 +239,7 @@ export class GdbMiPtraceEngine extends EventEmitter implements PtraceEngine {
   }
 
   private async startGdb(cwd: string): Promise<void> {
-    this.gdb = cp.spawn("gdb", ["--quiet", "--interpreter=mi2"], { cwd, stdio: ["pipe", "pipe", "pipe"] });
+    this.gdb = cp.spawn(this.gdbPath, ["--quiet", "--interpreter=mi2"], { cwd, stdio: ["pipe", "pipe", "pipe"], env: this.env });
     this.closed = false;
     const gdb = this.gdb;
     gdb.on("error", (err) => this.rejectPending(err));
@@ -164,33 +253,95 @@ export class GdbMiPtraceEngine extends EventEmitter implements PtraceEngine {
     await this.command("-gdb-set non-stop on");
   }
 
-  private command(command: string, accepted: readonly string[] = ["done"]): Promise<MiResultRecord> {
+  /**
+   * Sends one MI command and bounds how long it waits for the matching
+   * `N^done`/`N^running` reply -- a GDB that goes silent (killed externally,
+   * wedged, or simply never implements a given command the way expected)
+   * would otherwise leave the caller awaiting forever, since nothing but a
+   * matching token or the process actually exiting ever settles this
+   * promise. On timeout the pending entry is dropped so a late, mismatched
+   * reply arriving afterward is silently ignored by onLine() rather than
+   * resolving/rejecting a promise nothing is awaiting anymore.
+   */
+  private command(
+    command: string,
+    accepted: readonly string[] = ["done"],
+    timeoutMs = this.commandTimeoutMs,
+  ): Promise<MiResultRecord> {
     const gdb = this.gdb;
     if (!gdb || this.closed || !gdb.stdin.writable) return Promise.reject(new Error("GDB MI engine is not running"));
     const token = this.token++;
     return new Promise((resolve, reject) => {
-      this.pending.set(token, { resolve, reject, accepted: new Set(accepted) });
+      const timer = setTimeout(() => {
+        this.pending.delete(token);
+        reject(new Error(`GDB MI command timed out after ${timeoutMs}ms: ${command}`));
+      }, timeoutMs);
+      this.pending.set(token, {
+        resolve: (record) => {
+          clearTimeout(timer);
+          resolve(record);
+        },
+        reject: (err) => {
+          clearTimeout(timer);
+          reject(err);
+        },
+        accepted: new Set(accepted),
+      });
       gdb.stdin.write(`${token}${command}\n`, (err) => {
         if (!err) return;
+        clearTimeout(timer);
         this.pending.delete(token);
         reject(err);
       });
     });
   }
 
-  private waitForStop(): { promise: Promise<MiStoppedRecord>; cancel: () => void } {
-    let listener!: () => void;
-    const promise = new Promise<MiStoppedRecord>((resolve) => {
-      listener = () => {
-        this.off("stopped", listener);
+  /**
+   * Waits for the next asynchronous `*stopped` record, bounded so a resume
+   * or attach that never actually stops (a GDB bug, a killed process, or the
+   * engine being disposed out from under an in-flight attach -- see
+   * pbDebugAdapter.ts's `forcePauseAttaching`) rejects instead of hanging
+   * the caller forever. dispose() emits "aborted" specifically so a stop-wait
+   * in flight when the engine is torn down rejects immediately rather than
+   * waiting out the full timeout.
+   */
+  private waitForStop(timeoutMs = this.stopWaitTimeoutMs): { promise: Promise<MiStoppedRecord>; cancel: () => void } {
+    let stoppedListener!: () => void;
+    let abortedListener!: (err: Error) => void;
+    let timer: ReturnType<typeof setTimeout>;
+    const cleanup = () => {
+      this.off("stopped", stoppedListener);
+      this.off("aborted", abortedListener);
+      clearTimeout(timer);
+    };
+    const promise = new Promise<MiStoppedRecord>((resolve, reject) => {
+      stoppedListener = () => {
+        cleanup();
         resolve(this.lastStop ?? { text: "*stopped" });
       };
-      this.on("stopped", listener);
+      abortedListener = (err) => {
+        cleanup();
+        reject(err);
+      };
+      timer = setTimeout(() => {
+        cleanup();
+        reject(new Error(`timed out after ${timeoutMs}ms waiting for GDB to report a stop`));
+      }, timeoutMs);
+      this.on("stopped", stoppedListener);
+      this.on("aborted", abortedListener);
     });
-    return {
-      promise,
-      cancel: () => this.off("stopped", listener),
-    };
+    // Every caller here creates this promise and then `await`s something
+    // ELSE first (the command that triggers the stop) before ever awaiting
+    // `.promise` itself -- so this timer (or an "aborted" emitted by a
+    // concurrent dispose()) can fire and reject it during that gap, with
+    // nothing attached yet. A `.catch` here marks it handled for Node's
+    // unhandled-rejection tracking without consuming the rejection --
+    // `.promise` still delivers it normally to whichever caller does
+    // eventually `await` it, or leaves it (safely, since nothing then
+    // observes it) if a caller's own cancel()/earlier failure means they
+    // never do.
+    promise.catch(() => {});
+    return { promise, cancel: cleanup };
   }
 
   private async resumeAndWait(command: string): Promise<number> {
@@ -207,7 +358,12 @@ export class GdbMiPtraceEngine extends EventEmitter implements PtraceEngine {
   }
 
   async launch(program: string, args: string[], cwd: string, env: NodeJS.ProcessEnv): Promise<number> {
-    if (!gdbEngineAvailable()) throw new Error("GDB/MI is unavailable (expected GNU gdb on Linux)");
+    if (!(await gdbEngineAvailable(this.gdbPath))) throw new Error("GDB/MI is unavailable (expected GNU gdb on Linux)");
+    // A dispose() concurrent with the awaited probe above (this engine
+    // cancelled before it ever got as far as owning a gdb process) must not
+    // be undone by starting one anyway -- startGdb() itself resets `closed`
+    // to false the moment it spawns, so this has to be checked before that.
+    if (this.closed) throw new Error("GDB MI engine disposed");
     await this.startGdb(cwd);
     try {
       await this.command(`-environment-cd ${miQuote(cwd)}`);
@@ -240,14 +396,25 @@ export class GdbMiPtraceEngine extends EventEmitter implements PtraceEngine {
    * lacks. Returns the stopped PC.
    */
   async attach(pid: number): Promise<number> {
-    if (!gdbEngineAvailable()) throw new Error("GDB/MI is unavailable (expected GNU gdb on Linux)");
+    if (!(await gdbEngineAvailable(this.gdbPath))) throw new Error("GDB/MI is unavailable (expected GNU gdb on Linux)");
+    // See launch()'s identical check: a dispose() concurrent with the
+    // awaited probe above must not be undone by starting gdb anyway.
+    if (this.closed) throw new Error("GDB MI engine disposed");
     await this.startGdb(process.cwd());
+    // Declared here, not inside the try, so the catch below can always
+    // reach it: if `-target-attach` itself rejects (e.g. its own command
+    // timeout), `stopped.promise` is abandoned mid-wait, still listening for
+    // "aborted" -- dispose() emits exactly that on the way out, which would
+    // otherwise reject an orphaned promise nothing is awaiting anymore.
+    // cancel() unsubscribes it first so it's left permanently (harmlessly)
+    // pending instead.
+    const stopped = this.waitForStop();
     try {
-      const stopped = this.waitForStop();
       await this.command(`-target-attach ${pid}`);
       await stopped.promise;
       return this.readRip();
     } catch (err) {
+      stopped.cancel();
       await this.dispose();
       throw err;
     }
@@ -316,13 +483,28 @@ export class GdbMiPtraceEngine extends EventEmitter implements PtraceEngine {
   }
 
   async dispose(): Promise<void> {
+    // Set/emitted unconditionally, even if gdb was never spawned yet (e.g.
+    // disposed while attach()/launch() are still awaiting the async
+    // gdbEngineAvailable() probe, before startGdb() runs) or already exited.
+    // Without `closed` being set here regardless of `gdb`, a dispose() that
+    // lands in that pre-spawn window did nothing observable: attach() would
+    // resume once its awaited probe settled and go on to actually spawn gdb
+    // and ptrace-attach the target, unaware it had already been cancelled --
+    // self-correcting only later via pbDebugAdapter.ts's `pauseGeneration`
+    // check, after a full spawn/MI-handshake/attach round trip the caller
+    // meant to skip entirely. An in-flight waitForStop() (same scenario, or
+    // a "Force Pause" attach that never got as far as forcePauseEngine, see
+    // pbDebugAdapter.ts's `forcePauseAttaching`) must also reject immediately
+    // on dispose rather than hang until its own timeout, since nothing will
+    // ever emit "stopped" for a GDB process that's about to be killed.
+    this.closed = true;
+    this.emit("aborted", new Error("GDB MI engine disposed"));
     const gdb = this.gdb;
     if (!gdb) return;
     // In non-stop mode GDB can defer every MI command (including
     // `-gdb-exit`) while an inferior thread is running. Do not make DAP
     // disconnect hang behind that queue; this is an engine-owned GDB process
     // and SIGKILL reliably releases both its ptrace tracee and MI pipes.
-    this.closed = true;
     if (!gdb.killed) gdb.kill("SIGKILL");
     this.gdb = undefined;
     this.breakpoints.clear();
