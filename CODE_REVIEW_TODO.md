@@ -44,7 +44,7 @@ Created from the full Linux code review on 2026-08-28. Check an item only after 
 
 ## Medium priority
 
-- [ ] **M1 — Accept valid variable-originated data-breakpoint requests.**
+- [x] **M1 — Accept valid variable-originated data-breakpoint requests.**
   - Do not reject a request solely because VS Code supplies `variablesReference` for the containing scope.
   - Accept eligible scalar variables and continue rejecting compound children or values without a stable address.
   - Test the real VS Code Variables-view flow, not only name-only synthetic requests.

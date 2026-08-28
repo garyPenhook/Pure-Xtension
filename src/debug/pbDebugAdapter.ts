@@ -699,7 +699,19 @@ export class PureBasicDebugSession extends DebugSession {
       this.sendErrorResponse(response, 1094, "Pure Xtension: data breakpoints are unavailable during a forced pause (target is not at a PureBasic statement boundary). Continue to resume.");
       return;
     }
-    if (args.variablesReference !== undefined || !PureBasicDebugSession.DATA_BREAKPOINT_NAME_RE.test(args.name)) {
+    // `variablesReference`, per the DAP spec, is the *containing* variable
+    // container -- for a plain top-level local that's just the scope's own
+    // reference (scopesRequest's `frameId + 1`, always below
+    // COMPOUND_REF_BASE), not a signal that `name` itself is a compound
+    // value. VS Code's real Variables-view "Add Data Breakpoint" flow
+    // always sends the scope reference alongside the variable's name, so
+    // rejecting whenever *any* variablesReference was present (the old
+    // behavior) rejected every real UI-driven request outright — only a
+    // compound container's own reference (>= COMPOUND_REF_BASE, meaning
+    // `name` names a struct field/array element/list-map entry with no
+    // stable address in this v1) should be rejected.
+    const isCompoundChild = args.variablesReference !== undefined && args.variablesReference >= COMPOUND_REF_BASE;
+    if (isCompoundChild || !PureBasicDebugSession.DATA_BREAKPOINT_NAME_RE.test(args.name)) {
       response.body = { dataId: null, description: "Pure Xtension only supports data breakpoints on a simple top-level variable name." };
       this.sendResponse(response);
       return;

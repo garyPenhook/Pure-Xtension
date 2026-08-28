@@ -106,6 +106,23 @@ suite("Real VS Code debug session (purebasic)", () => {
       assert.ok(cVar, `expected local 'c' at line 4, got: ${JSON.stringify(vars)}`);
       assert.strictEqual(cVar!.value, "3", `expected c=3 (a+b, before increment) at line 4, got c=${cVar!.value}`);
 
+      // --- 1b. Data breakpoint info for 'c', driven exactly the way the real
+      // Variables-view "Add Data Breakpoint" context menu action does: with
+      // the containing scope's own variablesReference alongside the plain
+      // variable name (per the DAP spec, that reference identifies the
+      // *container*, not "this is a compound value"). A prior bug rejected
+      // every such request outright, since it only ever tested a bare
+      // {name} with no variablesReference at all -- which the real UI never
+      // actually sends.
+      const dataBreakpointInfo = await session.customRequest("dataBreakpointInfo", {
+        variablesReference: localsScope.variablesReference,
+        name: "c",
+      });
+      assert.ok(
+        dataBreakpointInfo.dataId,
+        `expected a real Variables-view request for local 'c' to be accepted, got: ${JSON.stringify(dataBreakpointInfo)}`,
+      );
+
       // --- 2. Step (next) once, should land on line 5 (c = c + 1, not yet executed) ---
       await session.customRequest("next", { threadId });
       await waitFor(() => stoppedEvents.length >= 2, "second stopped event (step)");

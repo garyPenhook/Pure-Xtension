@@ -573,7 +573,20 @@ test(
         dc.waitForEvent("stopped"),
       ]);
 
-      const info = await dc.dataBreakpointInfoRequest({ name: "counter" });
+      // variablesReference here is the *scope's* own reference, exactly what
+      // VS Code's real Variables-view "Add Data Breakpoint" action sends
+      // alongside a plain top-level local's name (PLAN.md M1/DAP spec: it
+      // identifies the containing variable container, not "name is a
+      // compound value"). A prior bug rejected every request that carried
+      // any variablesReference at all, which is how the real UI always
+      // calls this -- a name-only request (no variablesReference) never
+      // actually happens outside a synthetic test.
+      const st = await frames(dc);
+      const scopes = await dc.scopesRequest({ frameId: st[0].id });
+      const info = await dc.dataBreakpointInfoRequest({
+        variablesReference: scopes.body.scopes[0].variablesReference,
+        name: "counter",
+      });
       assert.equal(info.body.dataId, "counter");
       assert.ok(info.body.accessTypes?.includes("write"), "counter should report a write access type");
 
@@ -619,3 +632,27 @@ test(
     }
   },
 );
+
+test("data breakpoint info: rejects a struct field's own compound variablesReference, not just any variablesReference", { skip }, async () => {
+  // PLAN.md M1: the fix that made a *scope's* variablesReference acceptable
+  // must not also accidentally start accepting a *compound container's*
+  // reference -- a struct field has no stable address in this v1, so this
+  // must stay rejected, driven through the same "expand a field, then ask
+  // about it" flow the real Variables-view would use.
+  const dc = await launchToBreakpoint(MODULE_BP);
+  try {
+    const moduleVars = await variablesOf(dc, (await frames(dc))[0].id);
+    const point = moduleVars.find((v) => v.name === "point.ProbePoint");
+    assert.ok(point && point.variablesReference > 0, "module structure should be expandable");
+
+    const info = await dc.dataBreakpointInfoRequest({
+      variablesReference: point!.variablesReference,
+      name: "x",
+    });
+    assert.equal(info.body.dataId, null, "a struct field must still be rejected as a data breakpoint target");
+
+    await Promise.all([dc.continueRequest({ threadId: MAIN_THREAD_ID }), dc.waitForEvent("terminated")]);
+  } finally {
+    await dc.stop();
+  }
+});
