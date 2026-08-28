@@ -13,6 +13,16 @@ const HEADER_SIZE = 20;
 // Sanity bound for a message's declared payload length (see drainMessages) —
 // real payloads (variable/array/list dumps) are a few KB at most.
 const MAX_MESSAGE_LEN = 16 * 1024 * 1024;
+// M2: bounds every ordinary in-session protocol request (stack trace,
+// scope/variable examine, evaluate, setVariable, array/list/map enumerate)
+// so a target that stops responding mid-session (wedged, blocked in a
+// native call Force Pause doesn't cover, or otherwise gone quiet without
+// actually closing the connection) fails each pending DAP request with a
+// clear error instead of leaving it -- and the VS Code UI waiting on it --
+// hung forever. Generous relative to a real round-trip (sub-millisecond to
+// low tens of ms locally) but still short enough that a wedged target is
+// caught well within normal interactive use, not just eventually.
+const DEFAULT_REQUEST_TIMEOUT_MS = 8000;
 
 // Execution-control opcodes, captured from the real PureBasic 6.41 standalone
 // debugger (PLAN.md M9). These are independent top-level commands; command 2
@@ -1206,12 +1216,6 @@ export class PbDebugSession extends EventEmitter {
     }
   }
 
-  private nextMessage(expectedType?: number | number[]): Promise<PbMessage> {
-    const index = this.unclaimed.findIndex((msg) => PbDebugSession.matchesType(msg, expectedType));
-    if (index !== -1) return Promise.resolve(this.unclaimed.splice(index, 1)[0]);
-    return new Promise((resolve, reject) => this.pending.push({ resolve, reject, expectedType }));
-  }
-
   /** Waits for one message without leaving an abandoned waiter behind when
    * the deadline expires. A stale waiter would consume the next real wire
    * message and permanently shift request/reply matching. */
@@ -1247,6 +1251,17 @@ export class PbDebugSession extends EventEmitter {
         const idx = this.pending.indexOf(waiter);
         if (idx !== -1) this.pending.splice(idx, 1);
         reject(new Error(`timed out after ${timeoutMs}ms waiting for ${description}`));
+        // The wire protocol carries no request ID (see serialize()'s doc
+        // comment), so a reply that eventually does show up for *this*
+        // abandoned wait has no way to be told apart from the reply to
+        // whatever request comes next -- it would silently get matched to
+        // that unrelated later caller instead, corrupting every request/
+        // reply pairing from that point on. Closing the whole connection
+        // once any wait has been given up on is what actually prevents
+        // that: there is no later caller left to corrupt. Safe to call
+        // unconditionally (idempotent) even for callers (connect()'s own
+        // handshake) that already close on their own timeout error.
+        this.close();
       }, timeoutMs);
       this.pending.push(waiter);
     });
@@ -1263,7 +1278,7 @@ export class PbDebugSession extends EventEmitter {
   /**
    * Serializes request/response round-trips over the shared FIFO connection.
    * The wire protocol carries no request ID — replies are matched purely by
-   * arrival order (see {@link nextMessage}/{@link dispatch}) — so two
+   * arrival order (see {@link nextMessageWithTimeout}/{@link dispatch}) — so two
    * overlapping requests (e.g. an `evaluate()` call racing `variablesRequest`'s
    * `Promise.all` of `examineArrays`/`examineLists`/`examineMaps`) could
    * otherwise hand one caller another caller's reply. Only `stopped` is
@@ -1374,10 +1389,10 @@ export class PbDebugSession extends EventEmitter {
     this.write(OP_BREAKPOINTS, BP_CLEAR_ALL_DATA);
   }
 
-  async stackTrace(): Promise<PbFrame[]> {
+  async stackTrace(timeoutMs = DEFAULT_REQUEST_TIMEOUT_MS): Promise<PbFrame[]> {
     return this.serialize(async () => {
       this.write(OP_STACK_TRACE);
-      const msg = await this.nextMessage(0x16);
+      const msg = await this.nextMessageWithTimeout(timeoutMs, "the stack trace", 0x16);
       return parseFrames(msg.payload);
     });
   }
@@ -1390,27 +1405,27 @@ export class PbDebugSession extends EventEmitter {
    * opcode 11 no locals when the target is stopped at module scope (outside
    * any procedure), so the main-body variables are only reachable this way.
    */
-  async examineModuleScope(): Promise<PbGlobalDecl[]> {
+  async examineModuleScope(timeoutMs = DEFAULT_REQUEST_TIMEOUT_MS): Promise<PbGlobalDecl[]> {
     return this.serialize(async () => {
       this.write(OP_EXAMINE_GLOBALS);
-      const msg = await this.nextMessage(0xd);
+      const msg = await this.nextMessageWithTimeout(timeoutMs, "the module scope's declarations", 0xd);
       return parseGlobalDecls(msg.payload);
     });
   }
 
-  async examineCurrentFrame(): Promise<PbVariable[]> {
+  async examineCurrentFrame(timeoutMs = DEFAULT_REQUEST_TIMEOUT_MS): Promise<PbVariable[]> {
     return this.serialize(async () => {
       this.write(OP_EXAMINE_CURRENT_FRAME);
-      const msg = await this.nextMessage(0xf);
+      const msg = await this.nextMessageWithTimeout(timeoutMs, "the current frame's variables", 0xf);
       return parseVariables(msg.payload);
     });
   }
 
   /** frameIndex is opcode-16 order: 0 = outermost caller, increasing toward the current frame. */
-  async examineFrame(frameIndex: number): Promise<PbVariable[]> {
+  async examineFrame(frameIndex: number, timeoutMs = DEFAULT_REQUEST_TIMEOUT_MS): Promise<PbVariable[]> {
     return this.serialize(async () => {
       this.write(OP_EXAMINE_FRAME, frameIndex);
-      const msg = await this.nextMessage(0x17);
+      const msg = await this.nextMessageWithTimeout(timeoutMs, "a stack frame's variables", 0x17);
       return parseVariables(msg.payload);
     });
   }
@@ -1423,28 +1438,28 @@ export class PbDebugSession extends EventEmitter {
    * target an arbitrary non-topmost frame the way opcode 17 does for
    * scalars.
    */
-  async examineArrays(global = false): Promise<PbArrayDecl[]> {
+  async examineArrays(global = false, timeoutMs = DEFAULT_REQUEST_TIMEOUT_MS): Promise<PbArrayDecl[]> {
     return this.serialize(async () => {
       this.write(OP_EXAMINE_ARRAYS, global ? 1 : 0);
-      const msg = await this.nextMessage(0x10);
+      const msg = await this.nextMessageWithTimeout(timeoutMs, "the array list", 0x10);
       return parseArrayDecls(msg.payload);
     });
   }
 
   /** Opcode 13: enumerate linked lists. Same f8/scope caveat as {@link examineArrays}. */
-  async examineLists(global = false): Promise<PbListDecl[]> {
+  async examineLists(global = false, timeoutMs = DEFAULT_REQUEST_TIMEOUT_MS): Promise<PbListDecl[]> {
     return this.serialize(async () => {
       this.write(OP_EXAMINE_LISTS, global ? 1 : 0);
-      const msg = await this.nextMessage(0x12);
+      const msg = await this.nextMessageWithTimeout(timeoutMs, "the linked-list list", 0x12);
       return parseListDecls(msg.payload);
     });
   }
 
   /** Opcode 14: enumerate maps. Same f8/scope caveat as {@link examineArrays}. */
-  async examineMaps(global = false): Promise<PbMapDecl[]> {
+  async examineMaps(global = false, timeoutMs = DEFAULT_REQUEST_TIMEOUT_MS): Promise<PbMapDecl[]> {
     return this.serialize(async () => {
       this.write(OP_EXAMINE_MAPS, global ? 1 : 0);
-      const msg = await this.nextMessage(0x14);
+      const msg = await this.nextMessageWithTimeout(timeoutMs, "the map list", 0x14);
       return parseMapDecls(msg.payload);
     });
   }
@@ -1463,7 +1478,7 @@ export class PbDebugSession extends EventEmitter {
    * matches the expression actually sent; a real reply always echoes it
    * verbatim, an error message never does.
    *
-   * Unlike the other request methods, this one's {@link nextMessage} call
+   * Unlike the other request methods, this one's {@link nextMessageWithTimeout} call
    * deliberately accepts *any* reply type: the error path's own type tag was
    * never confirmed (PLAN.md M5 only pinned down the three success tags
    * above), so type-filtering here would make a genuine error reply time out
@@ -1475,6 +1490,7 @@ export class PbDebugSession extends EventEmitter {
   async examineExpression(
     expression: string,
     frameContext = -1,
+    timeoutMs = DEFAULT_REQUEST_TIMEOUT_MS,
   ): Promise<
     | { kind: "array"; name: string; elements: PbArrayElement[] }
     | { kind: "map"; name: string; elements: PbMapElement[] }
@@ -1485,7 +1501,7 @@ export class PbDebugSession extends EventEmitter {
     return this.serialize(async () => {
       const payload = Buffer.concat([Buffer.from(expression, "latin1"), Buffer.from([0])]);
       this.write(OP_EXAMINE_EXPRESSION, 0, frameContext, 0, payload, payload.length);
-      const msg = await this.nextMessage();
+      const msg = await this.nextMessageWithTimeout(timeoutMs, "the array/list/map expression result");
       const echoesExpression = msg.payload.length >= expression.length && msg.payload.toString("latin1", 0, expression.length) === expression;
       if (msg.type === 0x11 && echoesExpression) {
         const { name, elements } = parseArrayElements(msg.payload);
@@ -1516,7 +1532,7 @@ export class PbDebugSession extends EventEmitter {
    * far (PLAN.md M5) — evaluating in an outer stack frame's context is an
    * open question, not yet confirmed to work or to even be meaningful here.
    */
-  async evaluate(expression: string, frameContext = -1): Promise<PbEvaluateResult> {
+  async evaluate(expression: string, frameContext = -1, timeoutMs = DEFAULT_REQUEST_TIMEOUT_MS): Promise<PbEvaluateResult> {
     return this.serialize(async () => {
       const payload = Buffer.concat([Buffer.from(expression, "latin1"), Buffer.from([0])]);
       // len must be the full byte count actually sent (incl. the NUL) — the
@@ -1528,7 +1544,7 @@ export class PbDebugSession extends EventEmitter {
       // *next* request's header framing — only surfaces across two
       // sequential requests on one connection, not a single one-off call.
       this.write(OP_EVALUATE, 0, frameContext, 0, payload, payload.length);
-      const msg = await this.nextMessage(MSG_EVALUATE_REPLY);
+      const msg = await this.nextMessageWithTimeout(timeoutMs, "the evaluate result", MSG_EVALUATE_REPLY);
       return parseEvaluateReply(msg);
     });
   }
@@ -1545,13 +1561,13 @@ export class PbDebugSession extends EventEmitter {
    * len-must-include-every-NUL framing bug found for opcode 33, not a real
    * target-side `ModifyVariable` problem.
    */
-  async setVariable(target: string, value: string): Promise<PbEvaluateResult> {
+  async setVariable(target: string, value: string, timeoutMs = DEFAULT_REQUEST_TIMEOUT_MS): Promise<PbEvaluateResult> {
     return this.serialize(async () => {
       const payload = Buffer.concat(
         [target, value].map((s) => Buffer.concat([Buffer.from(s, "latin1"), Buffer.from([0])])),
       );
       this.write(OP_MODIFY, 0, -1, 0, payload, payload.length);
-      const msg = await this.nextMessage(MSG_EVALUATE_REPLY);
+      const msg = await this.nextMessageWithTimeout(timeoutMs, "the setVariable result", MSG_EVALUATE_REPLY);
       return parseEvaluateReply(msg);
     });
   }

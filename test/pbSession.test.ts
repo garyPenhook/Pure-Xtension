@@ -107,6 +107,22 @@ function capturedWrites(send: (session: PbDebugSession) => void): Buffer[] {
   return writes;
 }
 
+/** A session wired to accept writes (so a request method's own `write()`
+ *  call succeeds) but with no target on the other end ever replying --
+ *  simulates a stalled/wedged target for the M2 timeout tests below. */
+function sessionWithStalledTarget(): PbDebugSession {
+  const session = new PbDebugSession();
+  (session as unknown as { writeStream: { write(): boolean; end(): void } }).writeStream = {
+    write(): boolean {
+      return true;
+    },
+    end(): void {
+      // no-op -- close()'s teardown calls this
+    },
+  };
+  return session;
+}
+
 test("addDataBreakpoint encodes opcode 3/f8=4/f12=procedureScope plus an id+latin1-condition payload", () => {
   const writes = capturedWrites((s) => s.addDataBreakpoint(1, "total > 400"));
   assert.equal(writes.length, 2, "header and payload are written separately");
@@ -482,7 +498,9 @@ test("dispatch() routes MSG_DATA_BREAKPOINT to the dataBreakpoint event, never t
   // Simulate an unrelated request still in flight when the unsolicited
   // type-39 event arrives -- it must not be handed to this waiter as if it
   // were that request's reply (same hazard MSG_DEBUG_OUTPUT was fixed for).
-  const pendingReply = (session as unknown as { nextMessage(expectedType?: number): Promise<PbMessage> }).nextMessage(16);
+  const pendingReply = (
+    session as unknown as { nextMessageWithTimeout(timeoutMs: number, description: string, expectedType?: number): Promise<PbMessage> }
+  ).nextMessageWithTimeout(30000, "test", 16);
   internals.dispatch(stray);
 
   assert.deepEqual(events, [{ id: 3, status: DBP_TRUE }]);
@@ -818,4 +836,85 @@ test("compileAsync's returned child can be killed externally (cancellation) and 
   assert.equal(r.status, null);
   assert.equal(r.timedOut, false, "an externally-cancelled run should not be reported as a timeout");
   assert.ok(Date.now() - start < 2000);
+});
+
+// M2: every ordinary in-session protocol request must be bounded, and a
+// timeout must leave the session in a defined (unusable, not corrupted)
+// state rather than risk a stale reply corrupting whichever request comes
+// next -- see nextMessageWithTimeout's doc comment. Each request family
+// gets its own stalled-target case: a session that accepts the outgoing
+// write but never delivers a reply, with a short timeoutMs so these run
+// fast instead of waiting out the real ~8s production default.
+test("stackTrace times out against a stalled target and leaves the session closed", async () => {
+  const session = sessionWithStalledTarget();
+  await assert.rejects(session.stackTrace(30), /timed out after 30ms waiting for the stack trace/);
+  await assert.rejects(session.stackTrace(30), /debugger session closed/, "a later request must fail fast, not hang again");
+});
+
+test("examineModuleScope times out against a stalled target and leaves the session closed", async () => {
+  const session = sessionWithStalledTarget();
+  await assert.rejects(session.examineModuleScope(30), /timed out after 30ms waiting for the module scope's declarations/);
+  await assert.rejects(session.examineModuleScope(30), /debugger session closed/);
+});
+
+test("examineCurrentFrame times out against a stalled target and leaves the session closed", async () => {
+  const session = sessionWithStalledTarget();
+  await assert.rejects(session.examineCurrentFrame(30), /timed out after 30ms waiting for the current frame's variables/);
+  await assert.rejects(session.examineCurrentFrame(30), /debugger session closed/);
+});
+
+test("examineFrame times out against a stalled target and leaves the session closed", async () => {
+  const session = sessionWithStalledTarget();
+  await assert.rejects(session.examineFrame(0, 30), /timed out after 30ms waiting for a stack frame's variables/);
+  await assert.rejects(session.examineFrame(0, 30), /debugger session closed/);
+});
+
+test("examineArrays times out against a stalled target and leaves the session closed", async () => {
+  const session = sessionWithStalledTarget();
+  await assert.rejects(session.examineArrays(false, 30), /timed out after 30ms waiting for the array list/);
+  await assert.rejects(session.examineArrays(false, 30), /debugger session closed/);
+});
+
+test("examineLists times out against a stalled target and leaves the session closed", async () => {
+  const session = sessionWithStalledTarget();
+  await assert.rejects(session.examineLists(false, 30), /timed out after 30ms waiting for the linked-list list/);
+  await assert.rejects(session.examineLists(false, 30), /debugger session closed/);
+});
+
+test("examineMaps times out against a stalled target and leaves the session closed", async () => {
+  const session = sessionWithStalledTarget();
+  await assert.rejects(session.examineMaps(false, 30), /timed out after 30ms waiting for the map list/);
+  await assert.rejects(session.examineMaps(false, 30), /debugger session closed/);
+});
+
+test("examineExpression times out against a stalled target and leaves the session closed", async () => {
+  const session = sessionWithStalledTarget();
+  await assert.rejects(session.examineExpression("nums()", -1, 30), /timed out after 30ms waiting for the array\/list\/map expression result/);
+  await assert.rejects(session.examineExpression("nums()", -1, 30), /debugger session closed/);
+});
+
+test("evaluate times out against a stalled target and leaves the session closed", async () => {
+  const session = sessionWithStalledTarget();
+  await assert.rejects(session.evaluate("a", -1, 30), /timed out after 30ms waiting for the evaluate result/);
+  await assert.rejects(session.evaluate("a", -1, 30), /debugger session closed/);
+});
+
+test("setVariable times out against a stalled target and leaves the session closed", async () => {
+  const session = sessionWithStalledTarget();
+  await assert.rejects(session.setVariable("a", "5", 30), /timed out after 30ms waiting for the setVariable result/);
+  await assert.rejects(session.setVariable("a", "5", 30), /debugger session closed/);
+});
+
+test("a request timeout does not leave a stale waiter that could steal a later request's reply", async () => {
+  // The specific failure mode nextMessageWithTimeout's close-on-timeout
+  // exists to prevent: without it, a late reply for the abandoned request
+  // could be handed to an unrelated later caller as if it were *that*
+  // caller's reply. Proven here by asserting the session is fully closed
+  // (every later request fails immediately, not just the timed-out one) --
+  // the fast, deterministic way to observe "no stale waiter can consume
+  // anything" without needing a real delayed-reply race.
+  const session = sessionWithStalledTarget();
+  await assert.rejects(session.stackTrace(30), /timed out/);
+  await assert.rejects(session.evaluate("a"), /debugger session closed/);
+  await assert.rejects(session.examineCurrentFrame(), /debugger session closed/);
 });

@@ -50,7 +50,7 @@ Created from the full Linux code review on 2026-08-28. Check an item only after 
   - Test the real VS Code Variables-view flow, not only name-only synthetic requests.
   - Relevant code: [src/debug/pbSession.ts](src/debug/pbSession.ts), [test/vscodeIntegration/suite/debugSession.test.ts](test/vscodeIntegration/suite/debugSession.test.ts).
 
-- [ ] **M2 — Put deadlines on normal debugger protocol operations.**
+- [x] **M2 — Put deadlines on normal debugger protocol operations.**
   - Bound stack, scope/variable, container, and evaluate requests rather than waiting indefinitely for the target.
   - On timeout or cancellation, reject the active DAP request, close or resynchronize the transport safely, and leave the session in a defined state.
   - Add stalled-target tests for each request family.
@@ -90,6 +90,7 @@ Created from the full Linux code review on 2026-08-28. Check an item only after 
   - Add an appropriately licensed runner or a documented protocol fixture strategy that exercises the same launch and debug lifecycle.
   - Run `npm run test:vscode` in a required workflow.
   - Require TCP and FIFO launch coverage before release packaging.
+  - **Newly discovered while verifying M1 (2026-08-28), live-confirmed, not yet fixed:** `npm run test:vscode`'s own process exit code does not reflect whether its mocha tests actually passed. VS Code's `--extensionTestsPath` machinery runs the suite in a separate extension-host process and does not reliably propagate a failed run (rejected `run()` promise, or even the extension host calling `process.exit(1)` directly) into a non-zero exit code on the outer `@vscode/test-electron` process — confirmed by deliberately breaking an assertion and observing `Exit code: 0` regardless. A same-filesystem sentinel-file side channel was attempted as a fix and also failed for reasons not root-caused (even an unconditional file write at the very start of `run()`, to an absolute hardcoded path, never happened) before the investigation was stopped as out of scope for M1. **Net effect: today, `npm run test:vscode` can never fail — it always exits 0 — so it must not be trusted as a release gate or CI check until this is actually fixed.** This makes fixing this part of M8 more urgent, not less: a suite that can't fail is worse than one that self-skips, since it gives false confidence.
   - Relevant workflows: [.github/workflows/ci.yml](.github/workflows/ci.yml), [.github/workflows/release.yml](.github/workflows/release.yml).
 
 ## Lower priority
