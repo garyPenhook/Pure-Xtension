@@ -681,6 +681,44 @@ test(
   },
 );
 
+test(
+  "data breakpoint: a setDataBreakpoints request that outruns launch is queued and armed at the first stop, not rejected as a dead session",
+  { skip, timeout: 20000 },
+  async () => {
+    // Reproduces VS Code replaying a data breakpoint persisted in the
+    // Breakpoints view during launch configuration -- sent the instant
+    // "initialized" fires, well before launchRequest's compile+connect can
+    // possibly finish. Before the fix this hit the same guard as a request
+    // arriving after the session had already ended.
+    const dc = new DebugClient("node", ADAPTER, "purebasic");
+    dc.defaultTimeout = 30000;
+    await dc.start();
+    try {
+      const [queued] = await Promise.all([
+        dc.waitForEvent("initialized").then(async () => {
+          const set = await dc.setDataBreakpointsRequest({
+            breakpoints: [{ dataId: "counter", accessType: "write" }],
+          });
+          await dc.configurationDoneRequest();
+          return set;
+        }),
+        dc.launch({ program: dataBreakpointProgram, backend: "asm", stopOnEntry: true }),
+      ]);
+      assert.equal(queued.body.breakpoints.length, 1);
+      assert.equal(queued.body.breakpoints[0].verified, false, "cannot be verified before the target even connects");
+
+      const [armed] = await Promise.all([dc.waitForEvent("breakpoint"), dc.waitForEvent("stopped")]);
+      assert.equal(armed.body.reason, "changed");
+      assert.equal(armed.body.breakpoint.verified, true, "the queued data breakpoint should arm once the target reaches its first stop");
+
+      const [stoppedEvent] = await Promise.all([dc.waitForEvent("stopped"), dc.continueRequest({ threadId: MAIN_THREAD_ID })]);
+      assert.equal(stoppedEvent.body.reason, "data breakpoint", "the queued data breakpoint must actually be wired, not just reported verified");
+    } finally {
+      await dc.stop();
+    }
+  },
+);
+
 test("data breakpoint info: rejects a struct field's own compound variablesReference, not just any variablesReference", { skip }, async () => {
   // PLAN.md M1: the fix that made a *scope's* variablesReference acceptable
   // must not also accidentally start accepting a *compound container's*

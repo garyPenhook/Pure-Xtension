@@ -180,6 +180,13 @@ export class PureBasicDebugSession extends DebugSession {
    *  setDataBreakpointsRequest always fully clears and rebuilds rather than
    *  diffing by DAP's `dataId`, so no second index is needed. */
   private dataBreakpointsByWireId = new Map<number, ArmedDataBreakpoint>();
+  /** setDataBreakpointsRequest args received while the target hasn't
+   *  connected yet. VS Code replays data breakpoints persisted in the
+   *  Breakpoints view during launch configuration -- well before
+   *  launchRequest's compile+connect can finish -- so this window is not the
+   *  same as a session that already ended. Queued here and armed for real by
+   *  flushPendingDataBreakpoints() at the target's first stop. */
+  private pendingDataBreakpoints?: DebugProtocol.SetDataBreakpointsArguments["breakpoints"];
   /** Client-assigned wire ids for data breakpoints. Monotonic and never
    *  reused -- see removeDataBreakpoint()'s doc comment for why an id must
    *  never be anything other than the exact value assigned here. */
@@ -288,6 +295,7 @@ export class PureBasicDebugSession extends DebugSession {
         return;
       }
       if (this.entryDiscoveryInProgress) return;
+      await this.flushPendingDataBreakpoints();
       this.sendEvent(new StoppedEvent(reason === 7 ? "breakpoint" : "pause", MAIN_THREAD_ID));
     });
     this.pb.on("dataBreakpoint", (evt: PbDataBreakpointEvent) => {
@@ -352,6 +360,7 @@ export class PureBasicDebugSession extends DebugSession {
     this.terminated = true;
     this.pbConnected = false;
     this.targetStopped = false;
+    this.pendingDataBreakpoints = undefined;
     // A pending (not yet fired) Force Pause timer captured this.child's pid
     // by reading it fresh only when it fires, not at arm time -- without
     // this, a target that exits while the timer is still pending would leave
@@ -626,7 +635,10 @@ export class PureBasicDebugSession extends DebugSession {
       // the DAP entry stop. See discoverEntryLine().
       await this.configurationDone;
       const foundEntry = await this.discoverEntryLine();
-      if (foundEntry) this.sendEvent(new StoppedEvent("entry", MAIN_THREAD_ID));
+      if (foundEntry) {
+        await this.flushPendingDataBreakpoints();
+        this.sendEvent(new StoppedEvent("entry", MAIN_THREAD_ID));
+      }
     } else {
       // Wait for configurationDone (fired once setBreakpoints has landed)
       // before releasing the target, so first-run breakpoints actually bind.
@@ -750,7 +762,10 @@ export class PureBasicDebugSession extends DebugSession {
   /** Returns a DAP error instead of attempting a write through a transport
    * that has already gone away. Unlike source breakpoints, data breakpoints
    * require a live evaluation of the currently stopped target to establish
-   * their initial value. */
+   * their initial value. Callers that can legitimately arrive before the
+   * target has ever connected (setDataBreakpointsRequest, via
+   * queuePendingDataBreakpoints) must check that case themselves first --
+   * this always treats "never connected" the same as "disconnected". */
   private requireStoppedDataBreakpointTarget(response: DebugProtocol.Response): boolean {
     if (this.forcePauseActive) {
       this.sendErrorResponse(response, 1094, "Pure Xtension: data breakpoints are unavailable during a forced pause (target is not at a PureBasic statement boundary). Continue to resume.");
@@ -765,6 +780,115 @@ export class PureBasicDebugSession extends DebugSession {
       return false;
     }
     return true;
+  }
+
+  /** Queues a setDataBreakpointsRequest that arrived before the target ever
+   *  connected (see pendingDataBreakpoints) instead of rejecting it as if the
+   *  session had already ended. Responds immediately with each breakpoint
+   *  unverified so the Breakpoints view doesn't show a false "armed" state
+   *  in the meantime; flushPendingDataBreakpoints() corrects it once the
+   *  target actually stops. */
+  private queuePendingDataBreakpoints(
+    response: DebugProtocol.SetDataBreakpointsResponse,
+    breakpoints: DebugProtocol.SetDataBreakpointsArguments["breakpoints"],
+  ): void {
+    this.pendingDataBreakpoints = breakpoints;
+    response.body = {
+      breakpoints: breakpoints.map(() => {
+        const pending = new Breakpoint(false);
+        (pending as DebugProtocol.Breakpoint).message = "Pure Xtension: will arm once the debug session connects and pauses.";
+        return pending;
+      }),
+    };
+    this.sendResponse(response);
+  }
+
+  /** Arms data breakpoints queued by queuePendingDataBreakpoints() once the
+   *  target reaches a stop where evaluation is actually possible. The
+   *  original setDataBreakpointsRequest response already went out
+   *  unverified, so the real result is reported via BreakpointEvent instead. */
+  private async flushPendingDataBreakpoints(): Promise<void> {
+    if (!this.pendingDataBreakpoints) return;
+    const breakpoints = this.pendingDataBreakpoints;
+    this.pendingDataBreakpoints = undefined;
+    try {
+      const results = await this.runSerializedDataBreakpointOp(() => this.applyDataBreakpoints(breakpoints));
+      for (const bp of results) this.sendEvent(new BreakpointEvent("changed", bp));
+    } catch (err) {
+      this.logError(err);
+      // The client is still showing every one of these as the "will arm..."
+      // placeholder from queuePendingDataBreakpoints() -- without this it
+      // would stay stuck that way for the rest of the session with no
+      // indication in the Breakpoints view itself, only a stderr line.
+      for (const bp of breakpoints) {
+        const failed = new Breakpoint(false);
+        (failed as DebugProtocol.Breakpoint).message = `Pure Xtension: failed to arm '${bp.dataId}': ${err instanceof Error ? err.message : String(err)}`;
+        this.sendEvent(new BreakpointEvent("changed", failed));
+      }
+    }
+  }
+
+  /** Serializes calls to applyDataBreakpoints() -- it isn't safe to run two
+   *  clear/rebuild passes concurrently. flushPendingDataBreakpoints() (fired
+   *  the instant the target first stops) and a live setDataBreakpointsRequest
+   *  can otherwise interleave: one call's `pb.clearAllDataBreakpoints()` runs
+   *  while the other is mid-loop awaiting seedDataBreakpointLiteral(), so the
+   *  second clear would wipe breakpoints the first call already armed after
+   *  it resumes, leaving the wire out of sync with what either caller's
+   *  response/event claimed. */
+  private dataBreakpointOpChain: Promise<unknown> = Promise.resolve();
+  private async runSerializedDataBreakpointOp<T>(op: () => Promise<T>): Promise<T> {
+    const prior = this.dataBreakpointOpChain;
+    const result = prior.then(op);
+    this.dataBreakpointOpChain = result.catch(() => undefined);
+    return result;
+  }
+
+  /** Clears and rebuilds the wire's data breakpoints from `breakpoints`,
+   *  seeding each one's change condition against the target's current value.
+   *  Shared by setDataBreakpointsRequest (live edits) and
+   *  flushPendingDataBreakpoints() (deferred initial arming) -- both need the
+   *  exact same clear/seed/arm sequence, differing only in how the result
+   *  reaches the client (response body vs. BreakpointEvent). Always call
+   *  through runSerializedDataBreakpointOp(), never directly. */
+  private async applyDataBreakpoints(
+    breakpoints: DebugProtocol.SetDataBreakpointsArguments["breakpoints"],
+  ): Promise<DebugProtocol.Breakpoint[]> {
+    this.pb.clearAllDataBreakpoints();
+    this.dataBreakpointsByWireId.clear();
+
+    const results: DebugProtocol.Breakpoint[] = [];
+    for (const bp of breakpoints) {
+      if (bp.hitCondition) {
+        this.sendEvent(new OutputEvent(`Pure Xtension: data breakpoint hitCondition on '${bp.dataId}' is not supported and will be ignored.\n`, "stderr"));
+      }
+
+      let condition: string;
+      let userCondition: string | undefined;
+      if (bp.condition) {
+        condition = bp.condition;
+        userCondition = bp.condition;
+      } else {
+        const seed = await this.seedDataBreakpointLiteral(bp.dataId);
+        if ("error" in seed) {
+          const failed = new Breakpoint(false);
+          (failed as DebugProtocol.Breakpoint).message = seed.error;
+          results.push(failed);
+          continue;
+        }
+        condition = `${bp.dataId} <> ${seed.literal}`;
+      }
+
+      const wireId = this.nextDataBreakpointWireId++;
+      const armed: ArmedDataBreakpoint = { wireId, name: bp.dataId, userCondition, condition };
+      this.dataBreakpointsByWireId.set(wireId, armed);
+      this.pb.addDataBreakpoint(wireId, condition);
+
+      const ok = new Breakpoint(true);
+      ok.setId(wireId);
+      results.push(ok);
+    }
+    return results;
   }
 
   protected async dataBreakpointInfoRequest(
@@ -812,43 +936,18 @@ export class PureBasicDebugSession extends DebugSession {
     response: DebugProtocol.SetDataBreakpointsResponse,
     args: DebugProtocol.SetDataBreakpointsArguments,
   ): Promise<void> {
+    // VS Code replays data breakpoints persisted in the Breakpoints view
+    // during launch configuration, well before launchRequest's compile+
+    // connect can finish -- requireStoppedDataBreakpointTarget's `terminated`
+    // check can't tell that apart from a session that already ended, so
+    // this genuinely-not-connected-yet case is queued here instead.
+    if (!this.pbConnected && !this.terminated && !this.forcePauseActive) {
+      this.queuePendingDataBreakpoints(response, args.breakpoints);
+      return;
+    }
     if (!this.requireStoppedDataBreakpointTarget(response)) return;
     try {
-      this.pb.clearAllDataBreakpoints();
-      this.dataBreakpointsByWireId.clear();
-
-      const results: DebugProtocol.Breakpoint[] = [];
-      for (const bp of args.breakpoints) {
-        if (bp.hitCondition) {
-          this.sendEvent(new OutputEvent(`Pure Xtension: data breakpoint hitCondition on '${bp.dataId}' is not supported and will be ignored.\n`, "stderr"));
-        }
-
-        let condition: string;
-        let userCondition: string | undefined;
-        if (bp.condition) {
-          condition = bp.condition;
-          userCondition = bp.condition;
-        } else {
-          const seed = await this.seedDataBreakpointLiteral(bp.dataId);
-          if ("error" in seed) {
-            const failed = new Breakpoint(false);
-            (failed as DebugProtocol.Breakpoint).message = seed.error;
-            results.push(failed);
-            continue;
-          }
-          condition = `${bp.dataId} <> ${seed.literal}`;
-        }
-
-        const wireId = this.nextDataBreakpointWireId++;
-        const armed: ArmedDataBreakpoint = { wireId, name: bp.dataId, userCondition, condition };
-        this.dataBreakpointsByWireId.set(wireId, armed);
-        this.pb.addDataBreakpoint(wireId, condition);
-
-        const ok = new Breakpoint(true);
-        ok.setId(wireId);
-        results.push(ok);
-      }
-
+      const results = await this.runSerializedDataBreakpointOp(() => this.applyDataBreakpoints(args.breakpoints));
       response.body = { breakpoints: results };
       this.sendResponse(response);
     } catch (err) {
@@ -1514,6 +1613,16 @@ export class PureBasicDebugSession extends DebugSession {
     // (Node's default) is confirmed ineffective against a running -d
     // target, live-tested (the process just ignores it and keeps running).
     this.pb.close();
+    // pb.close() kills the transport immediately, but the "close"/"exit"
+    // listeners that call notifyTerminated() only fire once Node's event
+    // loop gets back around to them. A request dispatched in that gap would
+    // otherwise still see pbConnected/targetStopped as their pre-disconnect
+    // values and attempt a real wire write, throwing a raw "session closed"
+    // error instead of the clean, purpose-built rejection those guards exist
+    // to give it. Calling it here makes the state change take effect exactly
+    // when the wire actually goes away; the later listener-driven call is a
+    // no-op (notifyTerminated() guards on this.terminated).
+    this.notifyTerminated();
     this.child?.kill("SIGKILL");
     // H4: launchRequest's compile step is async now (see compileAsync), so
     // it's possible to reach here while a (possibly stalled) compile is
