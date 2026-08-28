@@ -88,15 +88,31 @@ const BLOCKING_FIXTURE_LINES = [
   "End", // 4
 ];
 
+// Fixture for the data breakpoint test below: a module-global counter
+// incremented a few times with a short Delay between iterations, so each
+// change can be observed as a separate stop.
+const DATA_BREAKPOINT_FIXTURE_LINES = [
+  "Global counter.i = 0", // 1
+  "Define i.i", // 2
+  "For i = 1 To 3", // 3
+  "  counter = counter + 1", // 4
+  "  Delay(30)", // 5
+  "Next", // 6
+  'Debug "done"', // 7
+];
+
 let fixtureDir: string | undefined;
 let program = "";
 let blockingProgram = "";
+let dataBreakpointProgram = "";
 if (compiler) {
   fixtureDir = fs.mkdtempSync(path.join(os.tmpdir(), "pure-xtension-e2e-"));
   program = path.join(fixtureDir, "fixture.pb");
   fs.writeFileSync(program, FIXTURE_LINES.join("\n") + "\n");
   blockingProgram = path.join(fixtureDir, "blocking.pb");
   fs.writeFileSync(blockingProgram, BLOCKING_FIXTURE_LINES.join("\n") + "\n");
+  dataBreakpointProgram = path.join(fixtureDir, "databreakpoint.pb");
+  fs.writeFileSync(dataBreakpointProgram, DATA_BREAKPOINT_FIXTURE_LINES.join("\n") + "\n");
 }
 
 after(() => {
@@ -366,6 +382,67 @@ test(
         dc.removeListener("stopped", stoppedListener);
       }
       assert.equal(sawStoppedEvent, undefined, `no stopped event should fire after Continue cancelled the pause, got: ${JSON.stringify(sawStoppedEvent)}`);
+    } finally {
+      await dc.stop();
+    }
+  },
+);
+
+test(
+  "data breakpoint: re-arm loop catches each value change, and removal actually stops target-side",
+  { skip, timeout: 20000 },
+  async () => {
+    const dc = new DebugClient("node", ADAPTER, "purebasic");
+    dc.defaultTimeout = 30000;
+    await dc.start();
+    try {
+      await Promise.all([
+        dc.waitForEvent("initialized").then(() => dc.configurationDoneRequest()),
+        dc.launch({ program: dataBreakpointProgram, backend: "asm", stopOnEntry: true }),
+        dc.waitForEvent("stopped"),
+      ]);
+
+      const info = await dc.dataBreakpointInfoRequest({ name: "counter" });
+      assert.equal(info.body.dataId, "counter");
+      assert.ok(info.body.accessTypes?.includes("write"), "counter should report a write access type");
+
+      const set = await dc.setDataBreakpointsRequest({
+        breakpoints: [{ dataId: "counter", accessType: "write" }],
+      });
+      assert.equal(set.body.breakpoints.length, 1);
+      assert.equal(set.body.breakpoints[0].verified, true);
+
+      // Each iteration only succeeds if rearmDataBreakpoint() reused the
+      // same wire id and correctly reseeded the condition against the new
+      // value -- a reintroduced M9.6-style id bug would either stop firing
+      // after the first hit or fire on the wrong value.
+      for (const expected of [1, 2, 3]) {
+        const [stoppedEvent] = await Promise.all([
+          dc.waitForEvent("stopped"),
+          dc.continueRequest({ threadId: MAIN_THREAD_ID }),
+        ]);
+        assert.equal(stoppedEvent.body.reason, "data breakpoint");
+        const result = await dc.evaluateRequest({ expression: "counter" });
+        assert.equal(result.body.result, String(expected), `counter should read back ${expected} on hit ${expected}`);
+      }
+
+      const cleared = await dc.setDataBreakpointsRequest({ breakpoints: [] });
+      assert.equal(cleared.body.breakpoints.length, 0);
+
+      // If removal only updated local adapter state (the exact bug found in
+      // the real PureBasic GUI's own DataBreakPoints.pb, PLAN.md M9.6), the
+      // target-side breakpoint would remain armed and this would still stop.
+      let sawFurtherHit = false;
+      const listener = (event: { body?: { reason?: string } }) => {
+        if (event.body?.reason === "data breakpoint") sawFurtherHit = true;
+      };
+      dc.on("stopped", listener);
+      try {
+        await Promise.all([dc.continueRequest({ threadId: MAIN_THREAD_ID }), dc.waitForEvent("terminated")]);
+      } finally {
+        dc.removeListener("stopped", listener);
+      }
+      assert.equal(sawFurtherHit, false, "no data breakpoint stop should occur after removal");
     } finally {
       await dc.stop();
     }

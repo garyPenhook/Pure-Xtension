@@ -6,9 +6,14 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
+  DBP_EVAL_ERROR,
+  DBP_TRUE,
+  encodeDataBreakpointPayload,
+  MSG_DATA_BREAKPOINT,
   PbDebugSession,
   parseArrayDecls,
   parseArrayElements,
+  parseDataBreakpointEvent,
   parseDebugOutputText,
   parseEvaluateReply,
   parseFrames,
@@ -47,17 +52,7 @@ test("a timed-out message wait does not consume the next request's reply", async
 });
 
 function capturedControlHeader(send: (session: PbDebugSession) => void): Buffer {
-  const session = new PbDebugSession();
-  const writes: Buffer[] = [];
-  // These tests exercise the public control methods without needing a FIFO.
-  // `write()` only requires a stream-like object with `write(Buffer)`.
-  (session as unknown as { writeStream: { write(chunk: Buffer): boolean } }).writeStream = {
-    write(chunk: Buffer): boolean {
-      writes.push(Buffer.from(chunk));
-      return true;
-    },
-  };
-  send(session);
+  const writes = capturedWrites(send);
   assert.equal(writes.length, 1, "a header-only control command should write exactly one buffer");
   return writes[0];
 }
@@ -82,6 +77,52 @@ test("native execution-control methods encode the M9 opcode/value pairs", () => 
 test("stepInto rejects invalid wire counts before writing", () => {
   assert.throws(() => capturedControlHeader((s) => s.stepInto(0)), /positive int32/);
   assert.throws(() => capturedControlHeader((s) => s.stepInto(0x80000000)), /positive int32/);
+});
+
+function capturedWrites(send: (session: PbDebugSession) => void): Buffer[] {
+  const session = new PbDebugSession();
+  const writes: Buffer[] = [];
+  (session as unknown as { writeStream: { write(chunk: Buffer): boolean } }).writeStream = {
+    write(chunk: Buffer): boolean {
+      writes.push(Buffer.from(chunk));
+      return true;
+    },
+  };
+  send(session);
+  return writes;
+}
+
+test("addDataBreakpoint encodes opcode 3/f8=4/f12=procedureScope plus an id+latin1-condition payload", () => {
+  const writes = capturedWrites((s) => s.addDataBreakpoint(1, "total > 400"));
+  assert.equal(writes.length, 2, "header and payload are written separately");
+  const [header, payload] = writes;
+  assert.deepEqual(
+    [header.readInt32LE(0), header.readInt32LE(4), header.readInt32LE(8), header.readInt32LE(12)],
+    [3, 16, 4, -2],
+  );
+  // 4 (id) + 11 (latin1 "total > 400") + 1 (NUL) = 16. Live-confirmed against
+  // a real target: this adapter never sets PB_DEBUGGER_Options' Unicode
+  // field, so the target defaults to ANSI, not the UTF-16LE PLAN.md's M9.5
+  // GUI capture used (that capture explicitly ran with Unicode enabled).
+  assert.equal(payload.length, 16);
+  assert.equal(payload.readInt32LE(0), 1);
+  assert.equal(payload.subarray(4, payload.length - 1).toString("latin1"), "total > 400");
+  assert.equal(payload[payload.length - 1], 0);
+});
+
+test("addDataBreakpoint honors an explicit procedure scope", () => {
+  const [header] = capturedWrites((s) => s.addDataBreakpoint(2, "x > 0", 3));
+  assert.equal(header.readInt32LE(12), 3);
+});
+
+test("removeDataBreakpoint encodes opcode 3/f8=5 with the numeric id in f12 and no payload", () => {
+  const header = capturedControlHeader((s) => s.removeDataBreakpoint(7));
+  assert.deepEqual([header.readInt32LE(0), header.readInt32LE(4), header.readInt32LE(8), header.readInt32LE(12)], [3, 0, 5, 7]);
+});
+
+test("clearAllDataBreakpoints encodes opcode 3/f8=6 with no payload", () => {
+  const header = capturedControlHeader((s) => s.clearAllDataBreakpoints());
+  assert.deepEqual([header.readInt32LE(0), header.readInt32LE(4), header.readInt32LE(8)], [3, 0, 6]);
 });
 
 function nulString(s: string): Buffer {
@@ -337,4 +378,39 @@ test("parseEvaluateReply surfaces an unrecognized kind (e.g. 5, structure) as un
   const result = parseEvaluateReply(fakeMessage(5, Buffer.alloc(0)));
   assert.equal(result.kind, 5);
   assert.match(result.error ?? "", /not decoded/);
+});
+
+function dataBreakpointMessage(status: number, id: number, payload: Buffer = Buffer.alloc(0)): PbMessage {
+  return { type: MSG_DATA_BREAKPOINT, len: payload.length, f8: status, f12: id, f16: 0, payload };
+}
+
+test("parseDataBreakpointEvent decodes a no-payload status (added/could-not-add/false/true)", () => {
+  assert.deepEqual(parseDataBreakpointEvent(dataBreakpointMessage(1, 5)), { id: 5, status: 1 });
+  assert.deepEqual(parseDataBreakpointEvent(dataBreakpointMessage(DBP_TRUE, 5)), { id: 5, status: DBP_TRUE });
+});
+
+test("parseDataBreakpointEvent decodes the eval-error payload as a NUL-terminated latin1 string", () => {
+  const msg = dataBreakpointMessage(DBP_EVAL_ERROR, 5, nulString("Missing a value to assign."));
+  assert.deepEqual(parseDataBreakpointEvent(msg), { id: 5, status: DBP_EVAL_ERROR, error: "Missing a value to assign." });
+});
+
+test("dispatch() routes MSG_DATA_BREAKPOINT to the dataBreakpoint event, never to a pending request waiter", async () => {
+  const session = new PbDebugSession();
+  const internals = session as unknown as { dispatch(message: PbMessage): void };
+
+  const events: unknown[] = [];
+  session.on("dataBreakpoint", (evt) => events.push(evt));
+
+  const stray = dataBreakpointMessage(DBP_TRUE, 3);
+  // Simulate an unrelated request still in flight when the unsolicited
+  // type-39 event arrives -- it must not be handed to this waiter as if it
+  // were that request's reply (same hazard MSG_DEBUG_OUTPUT was fixed for).
+  const pendingReply = (session as unknown as { nextMessage(expectedType?: number): Promise<PbMessage> }).nextMessage(16);
+  internals.dispatch(stray);
+
+  assert.deepEqual(events, [{ id: 3, status: DBP_TRUE }]);
+
+  const realReply: PbMessage = { type: 16, len: 0, f8: 0, f12: 0, f16: 0, payload: Buffer.alloc(0) };
+  internals.dispatch(realReply);
+  assert.equal(await pendingReply, realReply);
 });

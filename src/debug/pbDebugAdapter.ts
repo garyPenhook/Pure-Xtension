@@ -4,6 +4,7 @@ import * as os from "os";
 import * as path from "path";
 import {
   Breakpoint,
+  BreakpointEvent,
   DebugSession,
   InitializedEvent,
   OutputEvent,
@@ -17,7 +18,16 @@ import {
 } from "@vscode/debugadapter";
 import { DebugProtocol } from "@vscode/debugprotocol";
 import { Backend, resolveBackendSilent, resolveCompilerPath } from "../config";
-import { PbDebugSession, PbVariable } from "./pbSession";
+import {
+  DBP_COULD_NOT_ADD,
+  DBP_EVAL_ERROR,
+  DBP_TRUE,
+  PbDataBreakpointEvent,
+  PbDebugSession,
+  PbEvaluateResult,
+  PbVariable,
+  STOP_REASON_DATA_BREAKPOINT,
+} from "./pbSession";
 import { GdbMiPtraceEngine, gdbEngineAvailable } from "./ptraceEngine";
 
 const MAIN_THREAD_ID = 1;
@@ -37,6 +47,43 @@ const COMPOUND_REF_BASE = 100000;
 type CompoundHandle =
   | { kind: "struct"; children: PbVariable[] }
   | { kind: "array" | "list" | "map"; expression: string };
+
+/** A data breakpoint currently armed on the wire. `condition` is the exact
+ *  PureBasic boolean expression last sent; for the default (non-`userCondition`)
+ *  case it's re-synthesized on every hit (see rearmDataBreakpoint()) so
+ *  "break on value change" keeps working after the first hit. */
+interface ArmedDataBreakpoint {
+  wireId: number;
+  /** Both DAP's `dataId` and the wire expression's variable name -- v1 only
+   *  supports bare top-level scalars, so the two are always identical. */
+  name: string;
+  /** Set when the client supplied a raw PB expression via `condition` — left
+   *  untouched by rearmDataBreakpoint() rather than being overwritten with a
+   *  synthesized value-changed check. */
+  userCondition?: string;
+  condition: string;
+}
+
+/** Formats an evaluate() result as a PureBasic literal usable in a
+ *  `<> <literal>` comparison. `undefined` means "can't be watched" (error,
+ *  or an unsupported/structure kind). Numeric kinds 1-3 are passed through
+ *  as-is; PbEvaluateResult doesn't yet distinguish int from double there
+ *  (see its doc comment), so a double being watched compares against its
+ *  raw int64-reinterpreted bits, not its true value -- a known v1 gap in
+ *  evaluate() itself, not something this feature attempts to fix. */
+function formatDataBreakpointLiteral(result: PbEvaluateResult): string | undefined {
+  if (result.value === undefined) return undefined;
+  if (result.kind === 4) {
+    // Plain PB string literals have no escape mechanism at all (confirmed:
+    // `"He said ""hi"""` fails to compile, "Garbage at the end of the
+    // line") -- the tilde-prefixed form (`~"...\"..."`) is required for a
+    // value that may itself contain a quote or backslash.
+    const escaped = result.value.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
+    return `~"${escaped}"`;
+  }
+  if (result.kind >= 1 && result.kind <= 3) return result.value;
+  return undefined;
+}
 
 interface LaunchArgs extends DebugProtocol.LaunchRequestArguments {
   program: string;
@@ -97,6 +144,21 @@ export class PureBasicDebugSession extends DebugSession {
   private resolveConfigurationDone!: () => void;
   /** The real (user-set) line breakpoints currently active on the wire. */
   private activeBreakpoints = new Set<number>();
+  /** Armed data breakpoints, keyed by the wire's numeric id -- the only key
+   *  ever looked up by (correlating a dataBreakpoint event/re-arming);
+   *  setDataBreakpointsRequest always fully clears and rebuilds rather than
+   *  diffing by DAP's `dataId`, so no second index is needed. */
+  private dataBreakpointsByWireId = new Map<number, ArmedDataBreakpoint>();
+  /** Client-assigned wire ids for data breakpoints. Monotonic and never
+   *  reused -- see removeDataBreakpoint()'s doc comment for why an id must
+   *  never be anything other than the exact value assigned here. */
+  private nextDataBreakpointWireId = 1;
+  /** Set by the "dataBreakpoint" listener on a DBP_TRUE status and consumed
+   *  by the "stopped" listener's reason-9 branch -- MSG_STOPPED carries no
+   *  id of its own, so this is how the two unsolicited events are
+   *  correlated (PLAN.md M9.6/M9.7 confirm the TRUE status always precedes
+   *  its matching stop). */
+  private lastDataBreakpointHitWireId?: number;
   /** True from a native step command until its matching stopped notification. */
   private stepInProgress = false;
   /** True while stopOnEntry is advancing from the debugger runtime's
@@ -140,7 +202,7 @@ export class PureBasicDebugSession extends DebugSession {
     this.configurationDone = new Promise((resolve) => {
       this.resolveConfigurationDone = resolve;
     });
-    this.pb.on("stopped", ({ line, reason }: { line: number; reason: number }) => {
+    this.pb.on("stopped", async ({ line, reason }: { line: number; reason: number }) => {
       // A genuine cooperative wire stop always supersedes any in-flight
       // Force Pause attempt/timer -- it arrived, so the fallback (which
       // would only yield a degraded GDB-only stop) must not also fire.
@@ -155,6 +217,38 @@ export class PureBasicDebugSession extends DebugSession {
       this.compoundHandles.clear();
       this.frameHandles.clear();
       this.nextCompoundRef = COMPOUND_REF_BASE;
+      // Checked before stepInProgress: a step's own statement can equally
+      // trip a separately-armed data breakpoint (the wire condition is
+      // re-checked at every debug statement regardless of what caused it,
+      // per PLAN.md M9.5), so a step-in-flight must not swallow reason 9 as
+      // a plain step completion -- that would both skip the re-arm (leaving
+      // the breakpoint stuck) and leave stepInProgress set, which silently
+      // no-ops every future step request (see sendNativeStep's guard).
+      if (reason === STOP_REASON_DATA_BREAKPOINT) {
+        this.stepInProgress = false;
+        const hitWireId = this.lastDataBreakpointHitWireId;
+        this.lastDataBreakpointHitWireId = undefined;
+        const armed = hitWireId !== undefined ? this.dataBreakpointsByWireId.get(hitWireId) : undefined;
+        // armed can be missing if setDataBreakpointsRequest's clear/replace
+        // raced an in-flight hit that the target had already sent before our
+        // clear reached it (fire-and-forget wire writes, no ack ordering
+        // guarantee against an already-in-transit stop). The target is
+        // genuinely stopped either way, so still notify the client, just
+        // without claiming a since-removed breakpoint caused it.
+        if (armed) {
+          // Re-arm before notifying the client, not lazily on the next
+          // continue -- otherwise a client that continues immediately could
+          // run past this breakpoint before it's reseeded with the new
+          // value. A user-supplied raw condition (bp.condition) is left
+          // as-is: it's not a value-changed check, so there's nothing to
+          // reseed.
+          if (!armed.userCondition) await this.rearmDataBreakpoint(armed);
+          this.sendEvent(new StoppedEvent("data breakpoint", MAIN_THREAD_ID, `${armed.name} changed`));
+        } else {
+          this.sendEvent(new StoppedEvent("pause", MAIN_THREAD_ID));
+        }
+        return;
+      }
       if (this.stepInProgress) {
         this.stepInProgress = false;
         this.sendEvent(new StoppedEvent("step", MAIN_THREAD_ID));
@@ -162,6 +256,28 @@ export class PureBasicDebugSession extends DebugSession {
       }
       if (this.entryDiscoveryInProgress) return;
       this.sendEvent(new StoppedEvent(reason === 7 ? "breakpoint" : "pause", MAIN_THREAD_ID));
+    });
+    this.pb.on("dataBreakpoint", (evt: PbDataBreakpointEvent) => {
+      const armed = this.dataBreakpointsByWireId.get(evt.id);
+      if (evt.status === DBP_TRUE) {
+        // MSG_STOPPED (reason 9) carries no id -- this is the only record of
+        // which breakpoint fired, consumed by the "stopped" listener above.
+        this.lastDataBreakpointHitWireId = evt.id;
+        return;
+      }
+      if (evt.status === DBP_COULD_NOT_ADD || evt.status === DBP_EVAL_ERROR) {
+        this.sendEvent(new OutputEvent(`Pure Xtension: data breakpoint on ${armed?.name ?? `id ${evt.id}`} failed to arm${evt.error ? `: ${evt.error}` : ""}.\n`, "stderr"));
+        if (armed) {
+          const dap = new Breakpoint(false);
+          dap.setId(evt.id);
+          // The Breakpoint class implements DebugProtocol.Breakpoint at
+          // runtime (it's a plain object) but its .d.ts only declares
+          // `verified`/`setId`, so `message` needs an explicit cast.
+          (dap as DebugProtocol.Breakpoint).message = evt.error ?? "could not add data breakpoint";
+          this.sendEvent(new BreakpointEvent("changed", dap));
+        }
+      }
+      // DBP_ADDED / DBP_FALSE are the expected steady state -- nothing to surface.
     });
     this.pb.on("terminated", () => this.notifyTerminated());
     this.pb.on("close", () => this.notifyTerminated());
@@ -233,6 +349,7 @@ export class PureBasicDebugSession extends DebugSession {
     response.body.supportsStepInTargetsRequest = false;
     response.body.supportsEvaluateForHovers = true;
     response.body.supportsSetVariable = true;
+    response.body.supportsDataBreakpoints = true;
     this.sendResponse(response);
     this.sendEvent(new InitializedEvent());
   }
@@ -414,6 +531,131 @@ export class PureBasicDebugSession extends DebugSession {
           this.entryTempLines.add(line);
         }
       }
+    }
+  }
+
+  /** Evaluates `name` and formats it for use in a `<name> <> <literal>`
+   *  data-breakpoint condition -- the one sequence every data-breakpoint call
+   *  site needs (dataBreakpointInfoRequest, setDataBreakpointsRequest,
+   *  rearmDataBreakpoint), each of which only differs in what it does with a
+   *  failure. `value` is the unformatted display value (for UI text);
+   *  `literal` is the PB-syntax form (quoted/escaped for strings). */
+  private async seedDataBreakpointLiteral(name: string): Promise<{ value: string; literal: string } | { error: string }> {
+    const result = await this.pb.evaluate(name);
+    const literal = formatDataBreakpointLiteral(result);
+    if (literal === undefined || result.value === undefined) {
+      return { error: result.error ?? `'${name}' cannot be watched (unsupported value type).` };
+    }
+    return { value: result.value, literal };
+  }
+
+  /** Re-seeds a "value changed" data breakpoint's condition against the
+   *  variable's new current value and re-arms it under the exact same wire
+   *  id, so the next change is also caught. Must reuse `armed.wireId`
+   *  verbatim on both the remove and the add -- see removeDataBreakpoint()'s
+   *  doc comment for why. */
+  private async rearmDataBreakpoint(armed: ArmedDataBreakpoint): Promise<void> {
+    try {
+      const seed = await this.seedDataBreakpointLiteral(armed.name);
+      if ("error" in seed) {
+        this.logError(new Error(`cannot re-arm data breakpoint on '${armed.name}': ${seed.error}`));
+        return;
+      }
+      armed.condition = `${armed.name} <> ${seed.literal}`;
+      this.pb.removeDataBreakpoint(armed.wireId);
+      this.pb.addDataBreakpoint(armed.wireId, armed.condition);
+    } catch (err) {
+      this.logError(err);
+    }
+  }
+
+  /** Only a bare identifier is supported as a v1 data-breakpoint target --
+   *  struct fields/array elements/list-map entries are rejected via
+   *  `variablesReference` above this check, but a raw expression string
+   *  (e.g. `a+b`) could still reach here and would evaluate fine yet make no
+   *  sense as a "value changed" watch target, so it's rejected too. */
+  private static readonly DATA_BREAKPOINT_NAME_RE = /^[A-Za-z_]\w*$/;
+
+  protected async dataBreakpointInfoRequest(
+    response: DebugProtocol.DataBreakpointInfoResponse,
+    args: DebugProtocol.DataBreakpointInfoArguments,
+  ): Promise<void> {
+    if (this.forcePauseActive) {
+      this.sendErrorResponse(response, 1094, "Pure Xtension: data breakpoints are unavailable during a forced pause (target is not at a PureBasic statement boundary). Continue to resume.");
+      return;
+    }
+    if (args.variablesReference !== undefined || !PureBasicDebugSession.DATA_BREAKPOINT_NAME_RE.test(args.name)) {
+      response.body = { dataId: null, description: "Pure Xtension only supports data breakpoints on a simple top-level variable name." };
+      this.sendResponse(response);
+      return;
+    }
+    try {
+      const seed = await this.seedDataBreakpointLiteral(args.name);
+      if ("error" in seed) {
+        response.body = { dataId: null, description: seed.error };
+        this.sendResponse(response);
+        return;
+      }
+      response.body = {
+        dataId: args.name,
+        description: `Break when '${args.name}' changes (current value: ${seed.value})`,
+        accessTypes: ["write"],
+        canPersist: false,
+      };
+      this.sendResponse(response);
+    } catch (err) {
+      this.sendAsyncRequestError(response, "getting data breakpoint info", err);
+    }
+  }
+
+  protected async setDataBreakpointsRequest(
+    response: DebugProtocol.SetDataBreakpointsResponse,
+    args: DebugProtocol.SetDataBreakpointsArguments,
+  ): Promise<void> {
+    if (this.forcePauseActive) {
+      this.sendErrorResponse(response, 1095, "Pure Xtension: data breakpoints are unavailable during a forced pause (target is not at a PureBasic statement boundary). Continue to resume.");
+      return;
+    }
+    try {
+      this.pb.clearAllDataBreakpoints();
+      this.dataBreakpointsByWireId.clear();
+
+      const results: DebugProtocol.Breakpoint[] = [];
+      for (const bp of args.breakpoints) {
+        if (bp.hitCondition) {
+          this.sendEvent(new OutputEvent(`Pure Xtension: data breakpoint hitCondition on '${bp.dataId}' is not supported and will be ignored.\n`, "stderr"));
+        }
+
+        let condition: string;
+        let userCondition: string | undefined;
+        if (bp.condition) {
+          condition = bp.condition;
+          userCondition = bp.condition;
+        } else {
+          const seed = await this.seedDataBreakpointLiteral(bp.dataId);
+          if ("error" in seed) {
+            const failed = new Breakpoint(false);
+            (failed as DebugProtocol.Breakpoint).message = seed.error;
+            results.push(failed);
+            continue;
+          }
+          condition = `${bp.dataId} <> ${seed.literal}`;
+        }
+
+        const wireId = this.nextDataBreakpointWireId++;
+        const armed: ArmedDataBreakpoint = { wireId, name: bp.dataId, userCondition, condition };
+        this.dataBreakpointsByWireId.set(wireId, armed);
+        this.pb.addDataBreakpoint(wireId, condition);
+
+        const ok = new Breakpoint(true);
+        ok.setId(wireId);
+        results.push(ok);
+      }
+
+      response.body = { breakpoints: results };
+      this.sendResponse(response);
+    } catch (err) {
+      this.sendAsyncRequestError(response, "setting data breakpoints", err);
     }
   }
 

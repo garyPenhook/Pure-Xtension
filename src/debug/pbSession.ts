@@ -54,6 +54,15 @@ export const BP_BULK = 3;
 // live while smoke-testing clearAllLineBreakpoints() during the M5
 // ArraysLists work (PLAN.md), not a hypothetical.
 export const BP_BULK_CLEAR_ALL = -1;
+// Data-breakpoint sub-commands (opcode 3's f8 field), decoded from the
+// official open-source fantaisie-software/purebasic debugger client
+// (PureBasicDebugger/DataBreakPoints.pb) and confirmed live (PLAN.md M9.5).
+// f12 on add is the procedure scope (-2 = all procedures, -1 = main body,
+// else a procedure index); on remove, f12 is the numeric id assigned at add
+// time. See removeDataBreakpoint's doc comment for the id-reuse invariant.
+export const BP_ADD_DATA = 4;
+export const BP_REMOVE_DATA = 5;
+export const BP_CLEAR_ALL_DATA = 6;
 
 // Message types seen on the wire (unsolicited unless noted).
 export const MSG_HELLO = 0;
@@ -67,6 +76,11 @@ export const MSG_TERMINATED = 1;
 // M5, "type=2, f12=0x20002"). Unsolicited, not a reply to any request.
 export const MSG_STARTUP_ANNOUNCEMENT = 2;
 export const MSG_STOPPED = 3; // f8 = 0-based compiled-line index (matches addLineBreakpoint's convention), f12 = stop-reason code
+// A data breakpoint's condition became true (PLAN.md M9.6). This stop
+// carries no id of its own -- correlate it to the firing breakpoint via the
+// most recent MSG_DATA_BREAKPOINT/DBP_TRUE event, which PLAN.md confirms
+// always arrives immediately before it.
+export const STOP_REASON_DATA_BREAKPOINT = 9;
 // Sent in response to OP_CONTINUE with f8=1. It is an acknowledgement, not a
 // request/reply payload, so dispatch it as an event rather than allowing it to
 // accumulate in the unmatched-message queue.
@@ -86,6 +100,15 @@ export const MSG_DEBUG_OUTPUT = 5;
 // numeric value in PLAN.md): a live evaluate("a") request's matching reply
 // arrived tagged type 36.
 export const MSG_EVALUATE_REPLY = 36;
+// DataBreakPoint status report (PLAN.md M9.5/M9.6, decoded from the official
+// DataBreakPoints.pb): f8 is the status below, f12 is the numeric id echoed
+// back from the add/remove request that triggered it.
+export const MSG_DATA_BREAKPOINT = 39;
+export const DBP_ADDED = 1;
+export const DBP_COULD_NOT_ADD = 2;
+export const DBP_EVAL_ERROR = 3; // payload: NUL-terminated latin1 error text
+export const DBP_FALSE = 4;
+export const DBP_TRUE = 5;
 
 export interface PbMessage {
   type: number;
@@ -227,6 +250,40 @@ export function parseEvaluateReply(msg: PbMessage): PbEvaluateResult {
 export function parseDebugOutputText(payload: Buffer): string {
   const nul = payload.indexOf(0);
   return nul === -1 ? payload.toString("latin1") : payload.toString("latin1", 0, nul);
+}
+
+// Add-data-breakpoint payload: int32 id, followed by a NUL-terminated
+// condition string. PLAN.md M9.5's live capture of the real GUI's own
+// request used UTF-16LE, but that session explicitly set
+// PB_DEBUGGER_Options' Unicode field to 1 (PLAN.md M9.3); this adapter never
+// sets that env var, so the target defaults to ANSI -- confirmed live: a
+// UTF-16LE payload here produced "Variable not found: 'c'" (the target read
+// only the first single-byte character before hitting what it saw as a NUL
+// terminator). latin1/single-NUL matches the convention every other string
+// payload in this file already uses (evaluate()/setVariable() below).
+export function encodeDataBreakpointPayload(id: number, condition: string): Buffer {
+  const idBuf = Buffer.alloc(4);
+  idBuf.writeInt32LE(id, 0);
+  return Buffer.concat([idBuf, Buffer.from(condition, "latin1"), Buffer.from([0])]);
+}
+
+export interface PbDataBreakpointEvent {
+  id: number;
+  status: number;
+  /** Set only when status is DBP_EVAL_ERROR. */
+  error?: string;
+}
+
+export function parseDataBreakpointEvent(msg: PbMessage): PbDataBreakpointEvent {
+  const status = msg.f8;
+  const id = msg.f12;
+  if (status === DBP_EVAL_ERROR) {
+    // Same NUL-terminated latin1 shape as a Debug statement's text -- the
+    // name is generic despite living next to the Debug-output-specific
+    // doc comment above.
+    return { id, status, error: parseDebugOutputText(msg.payload) };
+  }
+  return { id, status };
 }
 
 export function parseFrames(payload: Buffer): PbFrame[] {
@@ -626,6 +683,14 @@ export class PbDebugSession extends EventEmitter {
       this.emit("debugOutput", parseDebugOutputText(msg.payload));
       return;
     }
+    if (msg.type === MSG_DATA_BREAKPOINT) {
+      // Unsolicited, like MSG_DEBUG_OUTPUT above: a data breakpoint's
+      // FALSE/TRUE re-evaluation can arrive interleaved with ordinary
+      // request/reply traffic while the target runs, and must never be
+      // mistaken for the reply to an unrelated in-flight request.
+      this.emit("dataBreakpoint", parseDataBreakpointEvent(msg));
+      return;
+    }
     // Only ever one request in flight at a time (see serialize()), so the
     // front of the queue is the only waiter that could possibly be for this
     // message. Matching by type — not just "whichever waiter is next" — is
@@ -785,6 +850,29 @@ export class PbDebugSession extends EventEmitter {
 
   clearAllLineBreakpoints(): void {
     this.write(OP_BREAKPOINTS, BP_BULK, BP_BULK_CLEAR_ALL);
+  }
+
+  /** Arms a data breakpoint under a client-assigned numeric `id`. `condition`
+   *  is an arbitrary PureBasic boolean expression, re-checked at every debug
+   *  statement (not a memory-write trap -- see pbDebugAdapter.ts's re-arm
+   *  logic for how "break on value change" is built on top of this).
+   *  `procedureScope` defaults to -2 (all procedures). */
+  addDataBreakpoint(id: number, condition: string, procedureScope = -2): void {
+    const payload = encodeDataBreakpointPayload(id, condition);
+    this.write(OP_BREAKPOINTS, BP_ADD_DATA, procedureScope, 0, payload, payload.length);
+  }
+
+  /** `id` must be the exact numeric id assigned when the breakpoint was
+   *  added, and nothing else. The real PureBasic 6.41 GUI's own
+   *  DataBreakPoints.pb sends a GUI heap pointer here instead of the
+   *  breakpoint's ID field, so removal silently no-ops server-side while the
+   *  GUI row disappears locally (PLAN.md M9.6) -- do not reproduce that. */
+  removeDataBreakpoint(id: number): void {
+    this.write(OP_BREAKPOINTS, BP_REMOVE_DATA, id);
+  }
+
+  clearAllDataBreakpoints(): void {
+    this.write(OP_BREAKPOINTS, BP_CLEAR_ALL_DATA);
   }
 
   async stackTrace(): Promise<PbFrame[]> {
