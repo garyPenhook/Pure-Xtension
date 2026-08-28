@@ -15,6 +15,7 @@ export interface ResolvedSymbol extends WorkspaceSymbol {
 }
 
 const INCLUDE_LINE = /^\s*X?IncludeFile\s+"([^"]+)"/i;
+const INCLUDE_PATH_LINE = /^\s*IncludePath\s+"([^"]+)"/i;
 
 function uriToPath(uri: string): string {
   const decoded = decodeURIComponent(uri.replace(/^file:\/\//, ""));
@@ -49,11 +50,26 @@ function canonicalKey(uri: string): string {
   return caseInsensitive ? p.toLowerCase() : p;
 }
 
-function extractIncludePaths(text: string): string[] {
-  const includes: string[] = [];
+interface ParsedInclude {
+  /** The raw quoted path from the IncludeFile/XIncludeFile line. */
+  path: string;
+  /** The most recent `IncludePath "..."` value in effect earlier in this same
+   *  file, if any -- IncludePath only affects includes "after the call of
+   *  this command", so this is per-line, not file-wide. */
+  includePath?: string;
+}
+
+function extractIncludes(text: string): ParsedInclude[] {
+  const includes: ParsedInclude[] = [];
+  let activeIncludePath: string | undefined;
   for (const line of text.split(/\r?\n/)) {
+    const includePath = INCLUDE_PATH_LINE.exec(line);
+    if (includePath) {
+      activeIncludePath = includePath[1];
+      continue;
+    }
     const match = INCLUDE_LINE.exec(line);
-    if (match) includes.push(match[1]);
+    if (match) includes.push({ path: match[1], includePath: activeIncludePath });
   }
   return includes;
 }
@@ -64,7 +80,7 @@ interface ParsedFile {
   /** mtimeMs for an on-disk file (version === -1); unused otherwise. */
   mtimeMs: number;
   symbols: WorkspaceSymbol[];
-  includes: string[];
+  includes: ParsedInclude[];
 }
 
 // Keyed by URI. Open documents are cache-valid by version alone (bumped on
@@ -76,7 +92,7 @@ interface ParsedFile {
 const parseCache = new Map<string, ParsedFile>();
 
 function parse(text: string, version: number, mtimeMs: number): ParsedFile {
-  return { version, mtimeMs, symbols: extractWorkspaceSymbols(text), includes: extractIncludePaths(text) };
+  return { version, mtimeMs, symbols: extractWorkspaceSymbols(text), includes: extractIncludes(text) };
 }
 
 async function getParsedFile(uri: string, documents: TextDocuments<TextDocument>): Promise<ParsedFile | undefined> {
@@ -138,11 +154,50 @@ export async function resolveIncludeGraphSymbols(
 
     const dir = path.dirname(uriToPath(uri));
     for (const include of parsed.includes) {
-      const resolvedPath = path.isAbsolute(include) ? include : path.join(dir, include);
+      const resolvedPath = resolveIncludePath(dir, include);
       await visit(pathToUri(resolvedPath), depth + 1);
     }
   }
 
   await visit(entryUri, 0);
-  return result;
+  return dedupeForwardDeclarations(result);
+}
+
+/** An include's filename is normally relative to its own file's directory; an
+ *  `IncludePath` in effect at that point additionally tries that path first
+ *  (falling back to the plain relative resolution if nothing exists there) --
+ *  see extractIncludes. An absolute include filename ignores both. */
+function resolveIncludePath(fileDir: string, include: ParsedInclude): string {
+  if (path.isAbsolute(include.path)) return include.path;
+  if (include.includePath) {
+    const withIncludePath = path.join(fileDir, include.includePath, include.path);
+    if (fs.existsSync(withIncludePath)) return withIncludePath;
+  }
+  return path.join(fileDir, include.path);
+}
+
+/**
+ * Drops a `Declare`-only forward-declaration symbol whenever a real
+ * `Procedure`/`EndProcedure` body with the same (module, name) was also
+ * found somewhere in the graph -- otherwise the common DeclareModule/Module
+ * pairing registers every procedure twice, and callers like "go to
+ * definition" that just take the first same-named match would land on the
+ * bodyless stub instead of the real implementation whenever the
+ * DeclareModule section (as is idiomatic) appears before the Module section.
+ * A forward declaration with no matching body anywhere (e.g. genuinely
+ * external, or split across files not on this include path) is kept, since
+ * it's the only thing there is to find.
+ */
+function dedupeForwardDeclarations(symbols: ResolvedSymbol[]): ResolvedSymbol[] {
+  const hasImplementation = new Set<string>();
+  for (const s of symbols) {
+    if (s.kind === "procedure" && !s.isForwardDeclaration) {
+      hasImplementation.add(`${(s.module ?? "").toLowerCase()}::${s.name.toLowerCase()}`);
+    }
+  }
+  if (hasImplementation.size === 0) return symbols;
+  return symbols.filter(
+    (s) =>
+      !(s.kind === "procedure" && s.isForwardDeclaration && hasImplementation.has(`${(s.module ?? "").toLowerCase()}::${s.name.toLowerCase()}`)),
+  );
 }

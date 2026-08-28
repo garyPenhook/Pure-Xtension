@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { extractWorkspaceSymbols } from "../server/src/workspaceSymbols";
+import { extractWorkspaceSymbols, resolveStructureFields } from "../server/src/workspaceSymbols";
 
 test("interface methods are captured for hover", () => {
   const text = [
@@ -113,4 +113,159 @@ test("Dim's array-dimension commas don't get mistaken for separate declarations"
     vars.map((v) => v.name),
     ["grid", "other"],
   );
+});
+
+test("a constant name can carry the $ string-type suffix", () => {
+  const text = '#FerrariName$ = "458 Italia"';
+  const [symbol] = extractWorkspaceSymbols(text);
+  assert.equal(symbol.kind, "constant");
+  assert.equal(symbol.name, "FerrariName$");
+  assert.equal(symbol.detail, '"458 Italia"');
+});
+
+test("Declare registers a forward-declared procedure, but not DeclareModule", () => {
+  const text = ["Declare CreateFerrari()", "Declare.s Attach(String1$, String2$)", "DeclareModule Cars", "EndDeclareModule"].join(
+    "\n",
+  );
+  const symbols = extractWorkspaceSymbols(text);
+  const procs = symbols.filter((s) => s.kind === "procedure");
+  assert.deepEqual(
+    procs.map((p) => p.name),
+    ["CreateFerrari", "Attach"],
+  );
+  assert.ok(procs.every((p) => p.isForwardDeclaration));
+  const modules = symbols.filter((s) => s.kind === "module");
+  assert.deepEqual(
+    modules.map((m) => m.name),
+    ["Cars"],
+  );
+});
+
+test("symbols declared inside DeclareModule/Module are tagged with that module's name", () => {
+  const text = [
+    "DeclareModule Ferrari",
+    "  #FerrariName$ = 1",
+    "  Declare CreateFerrari()",
+    "EndDeclareModule",
+    "Module Ferrari",
+    "  Global Initialized",
+    "  Procedure Init()",
+    "    Protected ok.i",
+    "  EndProcedure",
+    "EndModule",
+    "Global Outside",
+  ].join("\n");
+  const symbols = extractWorkspaceSymbols(text);
+  const byName = new Map(symbols.map((s) => [s.name, s]));
+  assert.equal(byName.get("FerrariName$")?.module, "Ferrari");
+  assert.equal(byName.get("CreateFerrari")?.module, "Ferrari");
+  assert.equal(byName.get("Initialized")?.module, "Ferrari");
+  assert.equal(byName.get("Init")?.module, "Ferrari");
+  assert.equal(byName.get("ok")?.module, "Ferrari");
+  assert.equal(byName.get("Outside")?.module, undefined);
+});
+
+test("a structure's Extends clause is captured the same way an interface's is", () => {
+  const text = ["Structure MyPoint", "  x.l", "  y.l", "EndStructure", "Structure MyColoredPoint Extends MyPoint", "  color.l", "EndStructure"].join(
+    "\n",
+  );
+  const structs = extractWorkspaceSymbols(text).filter((s) => s.kind === "structure");
+  assert.equal(structs[0].extends, undefined);
+  assert.equal(structs[1].extends, "MyPoint");
+  assert.equal(structs[1].detail, "Structure Extends MyPoint");
+  assert.deepEqual(structs[1].fields, [{ name: "color", type: "l", isPointer: false, arraySize: undefined }]);
+});
+
+test("resolveStructureFields prepends inherited fields and falls back to a builtin base, cycle-safe", async () => {
+  const text = ["Structure MyPoint", "  x.l", "  y.l", "EndStructure", "Structure MyColoredPoint Extends MyPoint", "  color.l", "EndStructure"].join(
+    "\n",
+  );
+  const symbols = extractWorkspaceSymbols(text);
+  const getBuiltinFields = async () => [];
+
+  const fields = await resolveStructureFields(symbols, "MyColoredPoint", getBuiltinFields);
+  assert.deepEqual(
+    fields.map((f) => f.name),
+    ["x", "y", "color"],
+  );
+
+  // Extends a name that isn't among our own structures -- treated as a builtin base.
+  const builtinBase = await resolveStructureFields(
+    [{ kind: "structure", name: "Derived", fields: [{ name: "own", type: "l", isPointer: false }], extends: "RECT" }],
+    "Derived",
+    async (name) => (name === "RECT" ? [{ name: "left", type: "l", isPointer: false }] : []),
+  );
+  assert.deepEqual(
+    builtinBase.map((f) => f.name),
+    ["left", "own"],
+  );
+
+  // A extends B extends A must terminate instead of recursing forever.
+  const cyclic = await resolveStructureFields(
+    [
+      { kind: "structure", name: "A", fields: [{ name: "a", type: "l", isPointer: false }], extends: "B" },
+      { kind: "structure", name: "B", fields: [{ name: "b", type: "l", isPointer: false }], extends: "A" },
+    ],
+    "A",
+    getBuiltinFields,
+  );
+  assert.deepEqual(
+    cyclic.map((f) => f.name),
+    ["b", "a"],
+  );
+});
+
+test("resolveStructureFields disambiguates same-named structures declared in different modules", async () => {
+  // PB modules exist precisely so two modules (or a module and main code) can
+  // each declare their own "Point" without conflict -- a name-only lookup
+  // would silently resolve to whichever one happens to come first in the
+  // array instead of the one actually being asked about.
+  const symbols = [
+    { kind: "structure" as const, name: "Point", fields: [{ name: "mainX", type: "l", isPointer: false }] },
+    {
+      kind: "structure" as const,
+      name: "Point",
+      module: "Geometry",
+      fields: [{ name: "geoX", type: "l", isPointer: false }],
+    },
+    {
+      kind: "structure" as const,
+      name: "ColoredPoint",
+      module: "Geometry",
+      extends: "Point",
+      fields: [{ name: "color", type: "l", isPointer: false }],
+    },
+  ];
+  const getBuiltinFields = async () => [];
+
+  const mainFields = await resolveStructureFields(symbols, "Point", getBuiltinFields);
+  assert.deepEqual(mainFields.map((f) => f.name), ["mainX"]);
+
+  const geometryFields = await resolveStructureFields(symbols, "Point", getBuiltinFields, "Geometry");
+  assert.deepEqual(geometryFields.map((f) => f.name), ["geoX"]);
+
+  // Extends must also resolve "Point" within ColoredPoint's own module
+  // (Geometry), not main code's same-named structure.
+  const coloredFields = await resolveStructureFields(symbols, "ColoredPoint", getBuiltinFields, "Geometry");
+  assert.deepEqual(coloredFields.map((f) => f.name), ["geoX", "color"]);
+});
+
+test("dynamic Array/List/Map structure fields are parsed with their container kind", () => {
+  const text = [
+    "Structure Person",
+    "  Name$",
+    "  Age.l",
+    "  List Friends$()",
+    "  Array Scores.l(10)",
+    "  Map Lookup.Point()",
+    "EndStructure",
+  ].join("\n");
+  const [symbol] = extractWorkspaceSymbols(text);
+  assert.deepEqual(symbol.fields, [
+    { name: "Name$", type: "s", isPointer: false },
+    { name: "Age", type: "l", isPointer: false, arraySize: undefined },
+    { name: "Friends$", type: "s", isPointer: false, container: "list" },
+    { name: "Scores", type: "l", isPointer: false, container: "array" },
+    { name: "Lookup", type: "Point", isPointer: false, container: "map" },
+  ]);
 });

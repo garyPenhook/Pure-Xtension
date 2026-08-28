@@ -27,13 +27,13 @@ import {
 } from "vscode-languageserver/node";
 import { TextDocument } from "vscode-languageserver-textdocument";
 import { BuiltinIndex, loadOrBuildBuiltinIndex, queryStructureFields } from "./builtinIndex";
-import { WorkspaceSymbol } from "./workspaceSymbols";
+import { resolveStructureFields, WorkspaceSymbol } from "./workspaceSymbols";
 import { invalidateIncludeGraphCache, resolveIncludeGraphSymbols, ResolvedSymbol } from "./includeGraph";
-import { StructureField } from "./dumpParsers";
+import { formatStructureField, StructureField } from "./dumpParsers";
 import { HelpIndex, getHelpUrl, loadOrFetchHelpIndex } from "./onlineHelpIndex";
 import { getKeywordHelpUrl, isKeyword } from "./keywordHelp";
 import { RetryableLoader } from "./retryableLoader";
-import { isWordChar, maskStringsAndComments, wordAt } from "./textUtils";
+import { isWordChar, maskStringsAndComments, qualifiedWordAt, wordAt } from "./textUtils";
 import { findRenameRanges, IDENTIFIER_RE, RenameTarget, resolveRenameTargetFromSymbols } from "./rename";
 
 interface InitializationOptions {
@@ -232,15 +232,12 @@ async function structureFieldCompletions(
   const typeName = buildVariableTypeMap(text, structureNames).get(varWord.toLowerCase());
   if (!typeName) return [];
 
-  const userStruct = symbols.find(
-    (s) => s.kind === "structure" && s.name.toLowerCase() === typeName.toLowerCase(),
-  );
-  const fields = userStruct?.fields ?? (await getBuiltinStructureFields(typeName));
+  const fields = await resolveStructureFields(symbols, typeName, getBuiltinStructureFields);
 
   return fields.map((field) => ({
     label: field.name,
     kind: CompletionItemKind.Field,
-    detail: `${field.isPointer ? "*" : ""}${field.name}.${field.type}${field.arraySize ? `[${field.arraySize}]` : ""}`,
+    detail: formatStructureField(field),
   }));
 }
 
@@ -376,8 +373,9 @@ connection.onHover(async (params): Promise<Hover | undefined> => {
   if (!doc) return undefined;
 
   const offset = doc.offsetAt(params.position);
-  const word = wordAt(doc.getText(), offset);
-  if (!word) return undefined;
+  const qualified = qualifiedWordAt(doc.getText(), offset);
+  if (!qualified) return undefined;
+  const { module, name: word } = qualified;
 
   const index = await ensureBuiltinIndex();
 
@@ -390,15 +388,20 @@ connection.onHover(async (params): Promise<Hover | undefined> => {
     };
   }
 
-  const symbol = (await resolveIncludeGraphSymbols(doc.uri, documents)).find(
-    (s) => s.name.toLowerCase() === word.toLowerCase(),
+  const symbols = await resolveIncludeGraphSymbols(doc.uri, documents);
+  // A `Module::Name`-qualified reference must resolve to that module's own
+  // symbol, not just the first same-named symbol anywhere -- otherwise a
+  // name that's also used in a different module (or in main code) silently
+  // wins on lookup order alone.
+  const symbol = symbols.find(
+    (s) =>
+      s.name.toLowerCase() === word.toLowerCase() &&
+      (!module || (s.module ?? "").toLowerCase() === module.toLowerCase()),
   );
   if (symbol) {
-    const fieldList = symbol.fields?.length
-      ? `\n\n${symbol.fields
-          .map((f) => `- ${f.isPointer ? "*" : ""}${f.name}.${f.type}${f.arraySize ? `[${f.arraySize}]` : ""}`)
-          .join("\n")}`
-      : "";
+    const fields =
+      symbol.kind === "structure" ? await resolveStructureFields(symbols, symbol.name, getBuiltinStructureFields, symbol.module) : symbol.fields;
+    const fieldList = fields?.length ? `\n\n${fields.map((f) => `- ${formatStructureField(f)}`).join("\n")}` : "";
     const methodList = symbol.methods?.length
       ? `\n\n${symbol.methods.map((m) => `- ${m.name}${m.returnType ? `.${m.returnType}` : ""}(${m.params})`).join("\n")}`
       : "";
@@ -416,12 +419,8 @@ connection.onHover(async (params): Promise<Hover | undefined> => {
   if (builtinStructureOrInterface) {
     const url = getHelpUrl(helpIndex, builtinStructureOrInterface);
     const link = url ? `\n\n[Open documentation](${url})` : "";
-    const fields = await getBuiltinStructureFields(builtinStructureOrInterface);
-    const fieldList = fields.length
-      ? `\n\n${fields
-          .map((f) => `- ${f.isPointer ? "*" : ""}${f.name}.${f.type}${f.arraySize ? `[${f.arraySize}]` : ""}`)
-          .join("\n")}`
-      : "";
+    const fields = await resolveStructureFields(symbols, builtinStructureOrInterface, getBuiltinStructureFields);
+    const fieldList = fields.length ? `\n\n${fields.map((f) => `- ${formatStructureField(f)}`).join("\n")}` : "";
     return {
       contents: {
         kind: "markdown",
@@ -469,11 +468,13 @@ connection.onDefinition(async (params): Promise<Definition | undefined> => {
   if (!doc) return undefined;
 
   const offset = doc.offsetAt(params.position);
-  const word = wordAt(doc.getText(), offset);
-  if (!word) return undefined;
+  const qualified = qualifiedWordAt(doc.getText(), offset);
+  if (!qualified) return undefined;
 
   const symbol = (await resolveIncludeGraphSymbols(doc.uri, documents)).find(
-    (s) => s.name.toLowerCase() === word.toLowerCase(),
+    (s) =>
+      s.name.toLowerCase() === qualified.name.toLowerCase() &&
+      (!qualified.module || (s.module ?? "").toLowerCase() === qualified.module.toLowerCase()),
   );
   if (!symbol) return undefined;
 

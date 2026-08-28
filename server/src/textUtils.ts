@@ -30,6 +30,35 @@ export function wordRangeAt(text: string, offset: number): { start: number; end:
   return { start, end };
 }
 
+/**
+ * Like wordAt, but recognizes PureBasic's `Module::Symbol` qualification: if
+ * the cursor sits on either half of a `A::B` pair, returns both the module
+ * name and the bare symbol name so a caller can disambiguate a lookup
+ * instead of just matching the first same-named symbol anywhere. `module` is
+ * absent for a plain, unqualified word.
+ */
+export function qualifiedWordAt(text: string, offset: number): { module?: string; name: string } | undefined {
+  const range = wordRangeAt(text, offset);
+  if (!range) return undefined;
+  const name = text.slice(range.start, range.end);
+
+  if (text.slice(range.end, range.end + 2) === "::") {
+    const after = wordRangeAt(text, range.end + 2);
+    if (after && after.start === range.end + 2) {
+      return { module: name, name: text.slice(after.start, after.end) };
+    }
+  }
+
+  if (range.start >= 3 && text.slice(range.start - 2, range.start) === "::") {
+    const before = wordRangeAt(text, range.start - 3);
+    if (before && before.end === range.start - 2) {
+      return { module: text.slice(before.start, before.end), name };
+    }
+  }
+
+  return { name };
+}
+
 /** Blanks out `;`-comment and `"`-string contents (preserving offsets/newlines)
  *  so a word-boundary scan run over the result can't match inside them. */
 export function maskStringsAndComments(text: string): string {

@@ -17,6 +17,21 @@ export interface StructureField {
   type: string;
   isPointer: boolean;
   arraySize?: number;
+  /** Set when the field is a dynamic `Array`/`List`/`Map` container (workspace-parsed
+   *  structures only -- pbcompiler's `-qs` dump never reports these). */
+  container?: "array" | "list" | "map";
+}
+
+/** Shared hover/completion rendering for a structure field, e.g. `*Next.Window`,
+ *  `Name.s[10]`, or `Array Tab.pointF(3)`. A bare `Name$` field (implicitly
+ *  String, no `.Type` in the source at all) renders the same way it's
+ *  actually written, rather than as the redundant-looking `Name$.s`. */
+export function formatStructureField(field: StructureField): string {
+  const containerPrefix = field.container ? `${field.container[0].toUpperCase()}${field.container.slice(1)} ` : "";
+  const pointer = field.isPointer ? "*" : "";
+  const arraySuffix = field.arraySize ? `[${field.arraySize}]` : "";
+  const typeSuffix = field.name.endsWith("$") && field.type === "s" ? "" : `.${field.type}`;
+  return `${containerPrefix}${pointer}${field.name}${typeSuffix}${arraySuffix}`;
 }
 
 const FUNCTION_NAME_AND_OPEN_PAREN = /^(\S+)\s*\(/;
