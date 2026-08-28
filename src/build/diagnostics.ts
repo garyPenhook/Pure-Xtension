@@ -2,6 +2,7 @@ import { execFile } from "child_process";
 import * as path from "path";
 import * as vscode from "vscode";
 import { resolveBackendSilent, resolveCompilerPath } from "../config";
+import { DiagnosticGenerations, DiagnosticOwnership } from "./diagnosticOwnership";
 import { parseCompilerOutput, toDiagnostic } from "./problemMatcher";
 
 const CHECK_DEBOUNCE_MS = 400;
@@ -9,14 +10,14 @@ const CHECK_DEBOUNCE_MS = 400;
 export class PureBasicDiagnostics implements vscode.Disposable {
   private readonly collection: vscode.DiagnosticCollection;
   private readonly timers = new Map<string, ReturnType<typeof setTimeout>>();
-  /** Included-file URIs last populated for a given main-document URI, so a
-   * fixed include (or one that's no longer reachable) has its diagnostics
-   * cleared instead of lingering forever. */
-  private readonly relatedUris = new Map<string, Set<string>>();
+  /** Diagnostics remain attributable to their main document. This prevents
+   * one main file from clearing a shared include's diagnostics contributed by
+   * another still-open main file. */
+  private readonly ownership = new DiagnosticOwnership<vscode.Diagnostic>();
   /** Bumped per document on every check() call; lets a check detect a newer
    *  check for the same document started (and will finish) after it, so it
    *  can drop its own now-stale results instead of overwriting them. */
-  private readonly generations = new Map<string, number>();
+  private readonly generations = new DiagnosticGenerations();
 
   constructor() {
     this.collection = vscode.languages.createDiagnosticCollection("purebasic");
@@ -26,6 +27,7 @@ export class PureBasicDiagnostics implements vscode.Disposable {
     for (const timer of this.timers.values()) {
       clearTimeout(timer);
     }
+    this.ownership.clear();
     this.collection.dispose();
   }
 
@@ -51,12 +53,13 @@ export class PureBasicDiagnostics implements vscode.Disposable {
     const key = document.uri.toString();
     // Invalidate any check() still in flight for this document so it can't
     // land results after the document has closed.
-    this.generations.set(key, (this.generations.get(key) ?? 0) + 1);
-    this.collection.delete(document.uri);
-    for (const relatedUri of this.relatedUris.get(key) ?? []) {
-      this.collection.delete(vscode.Uri.parse(relatedUri));
+    this.generations.advance(key);
+    const timer = this.timers.get(key);
+    if (timer) {
+      clearTimeout(timer);
+      this.timers.delete(key);
     }
-    this.relatedUris.delete(key);
+    this.publish(this.ownership.remove(key));
   }
 
   async check(document: vscode.TextDocument): Promise<void> {
@@ -74,8 +77,7 @@ export class PureBasicDiagnostics implements vscode.Disposable {
     }
 
     const mainKey = document.uri.toString();
-    const generation = (this.generations.get(mainKey) ?? 0) + 1;
-    this.generations.set(mainKey, generation);
+    const generation = this.generations.advance(mainKey);
 
     let stdout = "";
     let stderr = "";
@@ -99,17 +101,11 @@ export class PureBasicDiagnostics implements vscode.Disposable {
     // A save during the execFile above may have started (and by now
     // finished) a newer check for this same document — if so, its results
     // are already current; don't let this older run overwrite them.
-    if (this.generations.get(mainKey) !== generation) {
+    if (!this.generations.isCurrent(mainKey, generation)) {
       return;
     }
 
     const problems = parseCompilerOutput(`${stdout}\n${stderr}`);
-    this.collection.delete(document.uri);
-    for (const staleUri of this.relatedUris.get(mainKey) ?? []) {
-      this.collection.delete(vscode.Uri.parse(staleUri));
-    }
-    this.relatedUris.delete(mainKey);
-
     const byFile = new Map<string, vscode.Diagnostic[]>();
     for (const problem of problems) {
       const targetPath = problem.file ?? document.fileName;
@@ -121,6 +117,11 @@ export class PureBasicDiagnostics implements vscode.Disposable {
         } catch {
           continue; // included file not readable — drop the diagnostic rather than guess a range
         }
+        // Loading an include is asynchronous too. Do not let an old compiler
+        // run publish after a save, close, or newer check while it was open.
+        if (!this.generations.isCurrent(mainKey, generation)) {
+          return;
+        }
       }
       const diagnostic = toDiagnostic(targetDoc, problem);
       const list = byFile.get(targetUri.toString()) ?? [];
@@ -128,15 +129,22 @@ export class PureBasicDiagnostics implements vscode.Disposable {
       byFile.set(targetUri.toString(), list);
     }
 
-    const related = new Set<string>();
-    for (const [uriString, diagnostics] of byFile) {
-      this.collection.set(vscode.Uri.parse(uriString), diagnostics);
-      if (uriString !== mainKey) {
-        related.add(uriString);
-      }
+    // A check could have become stale while converting the final problem.
+    if (!this.generations.isCurrent(mainKey, generation)) {
+      return;
     }
-    if (related.size > 0) {
-      this.relatedUris.set(mainKey, related);
+    this.publish(this.ownership.replace(mainKey, byFile));
+  }
+
+  private publish(uris: Iterable<string>): void {
+    for (const uriString of uris) {
+      const diagnostics = this.ownership.merged(uriString);
+      const uri = vscode.Uri.parse(uriString);
+      if (diagnostics.length === 0) {
+        this.collection.delete(uri);
+      } else {
+        this.collection.set(uri, diagnostics);
+      }
     }
   }
 }

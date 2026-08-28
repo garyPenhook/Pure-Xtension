@@ -7,7 +7,7 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import type { TextDocuments } from "vscode-languageserver/node";
-import type { TextDocument } from "vscode-languageserver-textdocument";
+import { TextDocument } from "vscode-languageserver-textdocument";
 import { extractWorkspaceSymbols, WorkspaceSymbol } from "./workspaceSymbols";
 
 export interface ResolvedSymbol extends WorkspaceSymbol {
@@ -126,6 +126,23 @@ export function invalidateIncludeGraphCache(uri: string): void {
   parseCache.delete(uri);
 }
 
+/** Returns the current open-document text when available, otherwise a fresh
+ * on-disk snapshot.  Rename uses this after resolving the same include graph
+ * so its WorkspaceEdit covers both unsaved buffers and included files that
+ * are not open in the editor. */
+export async function getIncludeGraphDocument(
+  uri: string,
+  documents: TextDocuments<TextDocument>,
+): Promise<TextDocument | undefined> {
+  const open = documents.get(uri);
+  if (open) return open;
+  try {
+    return TextDocument.create(uri, "purebasic", 0, await fs.promises.readFile(uriToPath(uri), "utf8"));
+  } catch {
+    return undefined;
+  }
+}
+
 /**
  * Walks the IncludeFile/XIncludeFile graph from `entryUri`, returning every
  * symbol reachable (including the entry document's own), each tagged with the
@@ -161,6 +178,29 @@ export async function resolveIncludeGraphSymbols(
 
   await visit(entryUri, 0);
   return dedupeForwardDeclarations(result);
+}
+
+/** Every reachable source URI, including files that declare no symbols of
+ * their own.  A rename needs this separately from symbol resolution: an
+ * include may contain only references to a declaration made elsewhere. */
+export async function resolveIncludeGraphUris(
+  entryUri: string,
+  documents: TextDocuments<TextDocument>,
+  maxDepth = 8,
+): Promise<string[]> {
+  const visited = new Set<string>();
+  const result: string[] = [];
+  async function visit(uri: string, depth: number): Promise<void> {
+    if (depth > maxDepth || visited.has(canonicalKey(uri))) return;
+    visited.add(canonicalKey(uri));
+    const parsed = await getParsedFile(uri, documents);
+    if (!parsed) return;
+    result.push(uri);
+    const dir = path.dirname(uriToPath(uri));
+    for (const include of parsed.includes) await visit(pathToUri(resolveIncludePath(dir, include)), depth + 1);
+  }
+  await visit(entryUri, 0);
+  return result;
 }
 
 /** An include's filename is normally relative to its own file's directory; an

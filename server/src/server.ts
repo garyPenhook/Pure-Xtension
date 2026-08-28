@@ -28,13 +28,13 @@ import {
 import { TextDocument } from "vscode-languageserver-textdocument";
 import { BuiltinIndex, loadOrBuildBuiltinIndex, queryStructureFields } from "./builtinIndex";
 import { resolveStructureFields, WorkspaceSymbol } from "./workspaceSymbols";
-import { invalidateIncludeGraphCache, resolveIncludeGraphSymbols, ResolvedSymbol } from "./includeGraph";
+import { getIncludeGraphDocument, invalidateIncludeGraphCache, resolveIncludeGraphSymbols, resolveIncludeGraphUris, ResolvedSymbol } from "./includeGraph";
 import { formatStructureField, StructureField } from "./dumpParsers";
 import { HelpIndex, getHelpUrl, loadOrFetchHelpIndex } from "./onlineHelpIndex";
 import { getKeywordHelpUrl, isKeyword } from "./keywordHelp";
 import { RetryableLoader } from "./retryableLoader";
 import { isWordChar, maskStringsAndComments, qualifiedWordAt, wordAt } from "./textUtils";
-import { findRenameRanges, IDENTIFIER_RE, RenameTarget, resolveRenameTargetFromSymbols } from "./rename";
+import { findRenameRangesForTarget, IDENTIFIER_RE, RenameTarget, resolveRenameTargetFromSymbols } from "./rename";
 
 interface InitializationOptions {
   compilerPath?: string;
@@ -542,7 +542,7 @@ connection.onReferences((params: ReferenceParams): Location[] => {
 
 async function resolveRenameTarget(doc: TextDocument, offset: number): Promise<RenameTarget | undefined> {
   const symbols = await resolveIncludeGraphSymbols(doc.uri, documents);
-  return resolveRenameTargetFromSymbols(doc.getText(), offset, symbols);
+  return resolveRenameTargetFromSymbols(doc.getText(), offset, symbols, doc.uri);
 }
 
 connection.onPrepareRename(
@@ -566,7 +566,8 @@ connection.onRenameRequest(async (params: RenameParams): Promise<WorkspaceEdit |
   const doc = documents.get(params.textDocument.uri);
   if (!doc) return undefined;
 
-  const target = await resolveRenameTarget(doc, doc.offsetAt(params.position));
+  const symbols = await resolveIncludeGraphSymbols(doc.uri, documents);
+  const target = resolveRenameTargetFromSymbols(doc.getText(), doc.offsetAt(params.position), symbols, doc.uri);
   if (!target) return undefined;
 
   // A user typing into the rename box may retype the `#` prefix out of
@@ -583,10 +584,36 @@ connection.onRenameRequest(async (params: RenameParams): Promise<WorkspaceEdit |
     );
   }
 
-  const edits: TextEdit[] = findRenameRanges(doc, target.bareName, target.sigil, target.scope).map((range) =>
-    TextEdit.replace(range, newBareName),
+  // A spelling is not a symbol identity.  If a second declaration shares the
+  // same namespace/name but wasn't module-qualified, we cannot safely decide
+  // which unqualified text occurrences belong to which declaration yet.
+  // Refuse instead of producing a half-correct WorkspaceEdit.
+  const conflicts = symbols.filter(
+    (s) =>
+      s !== target.symbol &&
+      s.kind === target.symbol.kind &&
+      s.name.toLowerCase() === target.symbol.name.toLowerCase() &&
+      (s.kind === "constant") === (target.sigil === "#") &&
+      (s.module ?? "").toLowerCase() === (target.symbol.module ?? "").toLowerCase() &&
+      (s.uri !== target.symbol.uri || s.line !== target.symbol.line),
   );
-  return { changes: { [doc.uri]: edits } };
+  if (conflicts.length && !target.symbol.module) {
+    throw new ResponseError(ErrorCodes.InvalidRequest, `Rename of "${target.bareName}" is ambiguous in this include graph.`);
+  }
+
+  const uris = await resolveIncludeGraphUris(doc.uri, documents);
+  const changes: Record<string, TextEdit[]> = {};
+  for (const uri of uris) {
+    // Procedure locals cannot escape their declaring document/scope.
+    if (target.scope && uri !== target.symbol.uri) continue;
+    const candidate = await getIncludeGraphDocument(uri, documents);
+    if (!candidate) {
+      throw new ResponseError(ErrorCodes.InternalError, `Couldn't read included source "${uri}" to complete rename safely.`);
+    }
+    const edits = findRenameRangesForTarget(candidate, target).map((range) => TextEdit.replace(range, newBareName));
+    if (edits.length) changes[uri] = edits;
+  }
+  return { changes };
 });
 
 documents.onDidClose((event) => invalidateIncludeGraphCache(event.document.uri));

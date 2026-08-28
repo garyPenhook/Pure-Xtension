@@ -6,7 +6,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { TextDocument } from "vscode-languageserver-textdocument";
-import { findRenameRanges, IDENTIFIER_RE, RenameSymbol, resolveRenameTargetFromSymbols } from "../server/src/rename";
+import { findRenameRanges, findRenameRangesForTarget, IDENTIFIER_RE, RenameSymbol, resolveRenameTargetFromSymbols } from "../server/src/rename";
 import { isKeyword } from "../server/src/keywordHelp";
 import { extractWorkspaceSymbols } from "../server/src/workspaceSymbols";
 
@@ -184,6 +184,36 @@ test("findRenameRanges doesn't cross the sigil boundary in either direction", ()
   const d = doc(text);
   assert.equal(findRenameRanges(d, "Foo", "").length, 1, "sigil-less search must not match #Foo");
   assert.equal(findRenameRanges(d, "Foo", "#").length, 1, "sigilled search must not match bare Foo");
+});
+
+test("module-qualified rename ranges stay in the selected module", () => {
+  const text = [
+    "DeclareModule A",
+    "  Declare Run()",
+    "EndDeclareModule",
+    "DeclareModule B",
+    "  Declare Run()",
+    "EndDeclareModule",
+    "Module A",
+    "  Procedure Run() : EndProcedure",
+    "EndModule",
+    "Module B",
+    "  Procedure Run() : EndProcedure",
+    "EndModule",
+    "A::Run() : B::Run()",
+  ].join("\n");
+  const symbols: RenameSymbol[] = [
+    { name: "Run", kind: "procedure", line: 1, module: "A", uri: "file:///t.pb" },
+    { name: "Run", kind: "procedure", line: 4, module: "B", uri: "file:///t.pb" },
+  ];
+  const target = resolveRenameTargetFromSymbols(text, text.lastIndexOf("A::Run") + 4, symbols, "file:///t.pb");
+  assert.ok(target);
+  assert.equal(target.symbol.module, "A");
+  const ranges = findRenameRangesForTarget(doc(text), target);
+  assert.equal(ranges.length, 3, "A declaration, implementation, and A::Run call only");
+  for (const range of ranges) {
+    assert.notEqual(doc(text).getText(range), "", "ranges remain valid document positions");
+  }
 });
 
 test("IDENTIFIER_RE accepts valid PureBasic identifiers and rejects invalid replacement names", () => {
