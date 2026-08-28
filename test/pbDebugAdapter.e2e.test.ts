@@ -120,7 +120,7 @@ after(() => {
 });
 
 /** Spawns a fresh adapter, launches the fixture, and resolves once the target is stopped at `line`. */
-async function launchToBreakpoint(line: number): Promise<DebugClient> {
+async function launchToBreakpoint(line: number, transport?: "fifo" | "tcp"): Promise<DebugClient> {
   const dc = new DebugClient("node", ADAPTER, "purebasic");
   // The first request triggers a full debug-build compile before the target
   // even starts — well above DebugClient's 5s default.
@@ -132,7 +132,7 @@ async function launchToBreakpoint(line: number): Promise<DebugClient> {
         .setBreakpointsRequest({ source: { path: program }, breakpoints: [{ line }], lines: [line] })
         .then(() => dc.configurationDoneRequest()),
     ),
-    dc.launch({ program, backend: "asm", stopOnEntry: false }),
+    dc.launch({ program, backend: "asm", stopOnEntry: false, transport }),
     dc.assertStoppedLocation("breakpoint", { path: program, line }),
   ]);
   return dc;
@@ -212,6 +212,31 @@ test("module-scope stop: synthesizes a main frame, reads module locals, and step
     // PB_DEBUGGER_EndExternal emits wire message type 1 before it tears down
     // the transport. The adapter must surface that as DAP termination without
     // requiring the user to press Stop.
+    await Promise.all([
+      dc.continueRequest({ threadId: MAIN_THREAD_ID }),
+      dc.waitForEvent("terminated"),
+    ]);
+  } finally {
+    await dc.stop();
+  }
+});
+
+test("TCP transport: the same breakpoint/locals/continue flow reproduces over NetworkServer", { skip }, async () => {
+  // There's no Windows machine available to verify the win32-only automatic
+  // selection actually works there -- this instead proves the thing that
+  // IS verifiable here: the identical wire protocol, driven through the
+  // real TCP handshake and PB_DEBUGGER_Communication=NetworkServer;<port>
+  // (PLAN.md M10), reproduces genuine breakpoint/locals/continue behavior
+  // on this Linux machine. It's a deliberately small subset of the FIFO
+  // test matrix above, not a full duplicate -- pbSession.test.ts already
+  // covers the handshake/framing edge cases in isolation.
+  const dc = await launchToBreakpoint(MODULE_BP, "tcp");
+  try {
+    const st = await frames(dc);
+    assert.equal(st.length, 1, "a module-scope stop should yield exactly the synthetic main frame");
+    const locals = await localsOf(dc, st[0].id);
+    assert.equal(locals.get("a"), "3", "module local a should be visible with its value over TCP");
+
     await Promise.all([
       dc.continueRequest({ threadId: MAIN_THREAD_ID }),
       dc.waitForEvent("terminated"),

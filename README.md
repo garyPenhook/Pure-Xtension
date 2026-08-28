@@ -9,10 +9,15 @@ and a debugger.
 
 Language support, IntelliSense, build/diagnostics, and help all work on
 Windows, macOS, and Linux (the extension auto-detects a PureBasic install on
-each). **Debugging is Linux-only for now** — it's built on POSIX FIFOs and a
-GDB/ptrace-backed Force Pause, neither of which the Windows/macOS ports
-implement yet; launching a debug session on another platform fails with a
-clear error instead of silently misbehaving.
+each). **Debugging is fully supported and verified on Linux**, built on
+POSIX FIFOs plus a GDB/ptrace-backed Force Pause for targets blocked in
+native calls. **On Windows, the same debugger wire protocol is implemented
+over a TCP transport instead** — PureBasic's `-d` builds support this
+natively — and has been verified end-to-end using the identical code path
+against a Linux PureBasic install (`NetworkServer` mode), but has not yet
+been run on a real Windows machine. macOS debugging isn't implemented yet;
+launching a debug session there fails with a clear error instead of silently
+misbehaving.
 
 ## Features
 
@@ -52,7 +57,7 @@ clear error instead of silently misbehaving.
 - Completion items carry full documentation (description + doc link) pulled
   from the same live index.
 
-### Debugging — ⚠️ Linux only (not yet supported on Windows or macOS)
+### Debugging — ⚠️ Linux fully verified; Windows implemented but not yet run on real Windows; macOS not yet supported
 Standard VS Code debugging for PureBasic programs, via a `purebasic` launch
 configuration:
 - Launch, line breakpoints, continue, step-over/into/out, and a real
@@ -92,7 +97,7 @@ configuration:
 
 ## Debugging a program
 
-**Linux only** — see the platform note above.
+**Linux is fully verified; Windows is implemented via TCP but unverified on real Windows hardware; macOS isn't supported yet** — see the platform note above.
 
 Add a launch configuration to your workspace's `.vscode/launch.json`:
 

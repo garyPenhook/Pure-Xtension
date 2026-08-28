@@ -5,11 +5,18 @@
 // next to each parser.
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import * as net from "net";
 import {
+  allocateFreeTcpPort,
+  type PbReadable,
+  type PbWritable,
+  buildConnectRequest,
   DBP_EVAL_ERROR,
   DBP_TRUE,
   encodeDataBreakpointPayload,
   MSG_DATA_BREAKPOINT,
+  parseCompilerVersionBanner,
+  parseHandshakeReply,
   PbDebugSession,
   parseArrayDecls,
   parseArrayElements,
@@ -23,6 +30,7 @@ import {
   parseMapDecls,
   parseMapElements,
   parseVariables,
+  splitHandshakeFrame,
   type PbMessage,
 } from "../src/debug/pbSession";
 
@@ -413,4 +421,219 @@ test("dispatch() routes MSG_DATA_BREAKPOINT to the dataBreakpoint event, never t
   const realReply: PbMessage = { type: 16, len: 0, f8: 0, f12: 0, f16: 0, payload: Buffer.alloc(0) };
   internals.dispatch(realReply);
   assert.equal(await pendingReply, realReply);
+});
+
+test("buildConnectRequest encodes the blank-line-terminated CONNECT text", () => {
+  assert.deepEqual(buildConnectRequest(641), Buffer.from("CONNECT 641 EXECUTABLE\n\n", "latin1"));
+  assert.deepEqual(buildConnectRequest(641, "DEBUGGER"), Buffer.from("CONNECT 641 DEBUGGER\n\n", "latin1"));
+});
+
+function wireMessageBytes(type: number, f8: number, f12: number, f16: number, payload: Buffer): Buffer {
+  const header = Buffer.alloc(20);
+  header.writeInt32LE(type, 0);
+  header.writeInt32LE(payload.length, 4);
+  header.writeInt32LE(f8, 8);
+  header.writeInt32LE(f12, 12);
+  header.writeInt32LE(f16, 16);
+  return Buffer.concat([header, payload]);
+}
+
+test("splitHandshakeFrame extracts the ACCEPT text and leaves the trailing MSG_HELLO bytes untouched", () => {
+  // Live-captured shape (PLAN.md M10.1): ACCEPT reply immediately followed
+  // by the binary MSG_HELLO, with no gap -- the parser must not consume a
+  // single byte of it.
+  const hello = wireMessageBytes(0, 0, 0, 0, Buffer.concat([nulString("/tmp/pbnet"), nulString("test.pb")]));
+  const buf = Buffer.concat([Buffer.from("ACCEPT 641 EXECUTABLE\n  Encryption: 0\n\n", "latin1"), hello]);
+  const frame = splitHandshakeFrame(buf);
+  assert.equal(frame?.text, "ACCEPT 641 EXECUTABLE\n  Encryption: 0");
+  assert.deepEqual(frame?.rest, hello);
+});
+
+test("splitHandshakeFrame returns undefined until the terminator has fully arrived", () => {
+  const partial = Buffer.from("ACCEPT 641 EXECUTABLE\n  Encryption: 0\n", "latin1"); // only one trailing \n so far
+  assert.equal(splitHandshakeFrame(partial), undefined);
+  const complete = Buffer.concat([partial, Buffer.from("\n", "latin1")]);
+  assert.equal(splitHandshakeFrame(complete)?.text, "ACCEPT 641 EXECUTABLE\n  Encryption: 0");
+});
+
+test("parseHandshakeReply decodes a successful ACCEPT", () => {
+  assert.deepEqual(parseHandshakeReply("ACCEPT 641 EXECUTABLE\n  Encryption: 0"), {
+    ok: true,
+    version: 641,
+    token: "EXECUTABLE",
+    error: undefined,
+  });
+});
+
+test("parseHandshakeReply decodes every documented ERROR keyword, with and without a Message line", () => {
+  for (const keyword of ["WrongVersion", "InvalidRequest", "NoService", "NoDebugger"]) {
+    assert.deepEqual(parseHandshakeReply(`ERROR 641 ${keyword}\n  Message: something went wrong`), {
+      ok: false,
+      version: 641,
+      token: keyword,
+      error: "something went wrong",
+    });
+  }
+  assert.deepEqual(parseHandshakeReply("ERROR 641 NoDebugger"), {
+    ok: false,
+    version: 641,
+    token: "NoDebugger",
+    error: undefined,
+  });
+});
+
+test("parseCompilerVersionBanner decodes the real live compiler banner into major*100+minor", () => {
+  assert.equal(
+    parseCompilerVersionBanner("PureBasic 6.41 (Linux - x64)\nLoading external modules...\nStarting compilation...\n"),
+    641,
+  );
+});
+
+test("parseCompilerVersionBanner returns undefined for unrecognizable text, never a guess", () => {
+  assert.equal(parseCompilerVersionBanner(""), undefined);
+  assert.equal(parseCompilerVersionBanner("some unrelated compiler output"), undefined);
+});
+
+test("allocateFreeTcpPort returns a port that can actually be bound", async () => {
+  const port = await allocateFreeTcpPort();
+  assert.ok(port > 0 && port < 65536);
+  const probe = net.createServer();
+  await new Promise<void>((resolve, reject) => {
+    probe.once("error", reject);
+    probe.listen(port, "127.0.0.1", resolve);
+  });
+  await new Promise<void>((resolve) => probe.close(() => resolve()));
+});
+
+/** `server.close()` alone only stops accepting *new* connections -- already
+ *  accepted sockets stay open (and keep the event loop alive) until
+ *  destroyed, so every fake-target test server here must track and destroy
+ *  its accepted sockets on teardown. */
+function closeServerAndSockets(server: net.Server, sockets: Set<net.Socket>): Promise<void> {
+  for (const socket of sockets) socket.destroy();
+  return new Promise((resolve) => server.close(() => resolve()));
+}
+
+test("connectTcp retries past an initial ECONNREFUSED instead of failing immediately (target not listening yet)", async () => {
+  // Unlike a FIFO open (which blocks until the target opens its end), a TCP
+  // connect attempt made before the target's own listen() call fails
+  // immediately with ECONNREFUSED -- live-confirmed: launching a real
+  // target and connecting right after spawn reliably refuses on the first
+  // attempt. connectTcp must retry rather than surface that as a launch
+  // failure.
+  const port = await allocateFreeTcpPort();
+  const hello = wireMessageBytes(0, 0, 0, 0, Buffer.alloc(0));
+  const sockets = new Set<net.Socket>();
+  const server = net.createServer((socket) => {
+    sockets.add(socket);
+    socket.once("data", () => {
+      socket.write(Buffer.concat([Buffer.from("ACCEPT 641 EXECUTABLE\n  Encryption: 0\n\n", "latin1"), hello]));
+    });
+  });
+  // Start listening only after a short delay, simulating the real
+  // spawn-to-listen() gap this retry loop exists to cover.
+  const session = new PbDebugSession();
+  const connectPromise = session.connectTcp(port, 641, 2000);
+  await new Promise((resolve) => setTimeout(resolve, 150));
+  try {
+    await new Promise<void>((resolve) => server.listen(port, "127.0.0.1", resolve));
+    const msg = await connectPromise;
+    assert.equal(msg.type, 0);
+  } finally {
+    session.close();
+    await closeServerAndSockets(server, sockets);
+  }
+});
+
+test("connectTcp resolves once ACCEPT and MSG_HELLO arrive in a single TCP write (the framing hazard, over a real socket)", async () => {
+  const port = await allocateFreeTcpPort();
+  const hello = wireMessageBytes(0, 0, 0, 0, Buffer.concat([nulString("/tmp/pbnet"), nulString("test.pb")]));
+  const sockets = new Set<net.Socket>();
+  const server = net.createServer((socket) => {
+    sockets.add(socket);
+    socket.once("data", () => {
+      socket.write(Buffer.concat([Buffer.from("ACCEPT 641 EXECUTABLE\n  Encryption: 0\n\n", "latin1"), hello]));
+    });
+  });
+  await new Promise<void>((resolve) => server.listen(port, "127.0.0.1", resolve));
+  const session = new PbDebugSession();
+  try {
+    const msg = await session.connectTcp(port, 641);
+    assert.equal(msg.type, 0, "connectTcp should resolve with the parsed MSG_HELLO, not just an ack");
+  } finally {
+    session.close();
+    await closeServerAndSockets(server, sockets);
+  }
+});
+
+test("connectTcp rejects with the target's error keyword on a version mismatch", async () => {
+  const port = await allocateFreeTcpPort();
+  const sockets = new Set<net.Socket>();
+  const server = net.createServer((socket) => {
+    sockets.add(socket);
+    socket.once("data", () => {
+      socket.write(Buffer.from("ERROR 641 WrongVersion\n  Message: version mismatch\n\n", "latin1"));
+    });
+  });
+  await new Promise<void>((resolve) => server.listen(port, "127.0.0.1", resolve));
+  try {
+    const session = new PbDebugSession();
+    await assert.rejects(session.connectTcp(port, 1), /WrongVersion/);
+  } finally {
+    await closeServerAndSockets(server, sockets);
+  }
+});
+
+test("attachTransport wires the error listener only once when read and write streams are the same object (TCP)", () => {
+  // Regression test: TCP hands the same net.Socket to both roles. Attaching
+  // the shared "error" handler to each field independently (as if they were
+  // always-distinct FIFO streams) would fire it twice for one real error.
+  const session = new PbDebugSession();
+  const internals = session as unknown as {
+    attachTransport(readStream: PbReadable, writeStream: PbWritable, timeoutMs: number, seed?: Buffer): Promise<PbMessage>;
+  };
+  let errorCount = 0;
+  session.on("error", () => errorCount++);
+
+  const listeners = new Map<string, Array<(...args: unknown[]) => void>>();
+  const fakeSocket: PbReadable & PbWritable = {
+    on(event: string, listener: (...args: unknown[]) => void) {
+      (listeners.get(event) ?? listeners.set(event, []).get(event)!).push(listener);
+      return fakeSocket;
+    },
+    write: () => true,
+    destroy: () => undefined,
+    end: () => undefined,
+  } as unknown as PbReadable & PbWritable;
+
+  // Reject the connect promise immediately after -- this test only cares
+  // about how many listeners attachTransport registers, not the HELLO wait.
+  internals.attachTransport(fakeSocket, fakeSocket, 5).catch(() => undefined);
+  for (const listener of listeners.get("error") ?? []) listener(new Error("boom"));
+
+  assert.equal(errorCount, 1, "a shared read/write stream must only fire the error handler once per real error");
+});
+
+test("connectTcp shares one overall timeout budget across connect/handshake/hello instead of tripling it", async () => {
+  // Regression test: each phase used to get a fresh `timeoutMs` of its own,
+  // so a target that never completes the handshake could take up to 3x the
+  // requested timeout to fail instead of respecting the caller's budget.
+  const port = await allocateFreeTcpPort();
+  const sockets = new Set<net.Socket>();
+  const server = net.createServer((socket) => {
+    sockets.add(socket);
+    // Accept the connection but never reply -- the handshake phase should
+    // be the one that times out, and it must do so within the shared
+    // budget, not a fresh 300ms window of its own.
+  });
+  await new Promise<void>((resolve) => server.listen(port, "127.0.0.1", resolve));
+  try {
+    const session = new PbDebugSession();
+    const start = Date.now();
+    await assert.rejects(session.connectTcp(port, 641, 300), /timed out/);
+    const elapsed = Date.now() - start;
+    assert.ok(elapsed < 600, `connectTcp should fail within roughly one timeout budget, took ${elapsed}ms`);
+  } finally {
+    await closeServerAndSockets(server, sockets);
+  }
 });

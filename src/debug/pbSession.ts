@@ -5,6 +5,7 @@
 // running target, not the still-unconfirmed parts (stepping, data
 // breakpoints, array/struct expansion).
 import * as fs from "fs";
+import * as net from "net";
 import { EventEmitter } from "events";
 
 const HEADER_SIZE = 20;
@@ -576,6 +577,108 @@ interface PendingWaiter {
   expectedType?: number | number[];
 }
 
+// Minimal surface PbDebugSession actually uses from its transport streams --
+// both fs.ReadStream/fs.WriteStream (FIFO) and net.Socket (TCP) satisfy
+// these structurally, so no casts are needed at any call site. Narrowed
+// (rather than typed as the concrete fs classes) specifically so a single
+// net.Socket can serve both the read and write roles for TCP.
+export interface PbReadable {
+  on(event: "data", listener: (chunk: Buffer) => void): this;
+  on(event: "close", listener: () => void): this;
+  on(event: "error", listener: (err: Error) => void): this;
+  destroy(): void;
+}
+export interface PbWritable {
+  write(chunk: Buffer): boolean;
+  on(event: "error", listener: (err: Error) => void): this;
+  end(): void;
+}
+
+// TCP handshake (PLAN.md M10.1, live-confirmed against a real PureBasic
+// 6.41 Linux build): a target started with
+// PB_DEBUGGER_Communication=NetworkServer;<port> expects a plain-text,
+// blank-line-terminated request before any binary protocol bytes.
+const MAX_HANDSHAKE_LEN = 4096; // sanity bound, same spirit as MAX_MESSAGE_LEN
+
+/** `<version>` must be the compiler's own major*100+minor (see
+ *  {@link parseCompilerVersionBanner}) -- a mismatch produces
+ *  `ERROR <version> WrongVersion`. `role` must be `EXECUTABLE`: the more
+ *  obvious-looking `DEBUGGER` token is a confirmed dead-end trap in the
+ *  target binary that always replies `ERROR <version> NoDebugger`. */
+export function buildConnectRequest(version: number, role = "EXECUTABLE"): Buffer {
+  return Buffer.from(`CONNECT ${version} ${role}\n\n`, "latin1");
+}
+
+export interface HandshakeFrame {
+  text: string;
+  /** Every byte received after the terminator, untouched -- may be part or
+   *  all of the first binary MSG_HELLO; never re-parsed as text. */
+  rest: Buffer;
+}
+
+/** Finds the blank-line terminator in an accumulating handshake buffer.
+ *  Returns `undefined` if it hasn't arrived yet -- callers must wait for
+ *  more data rather than guessing at a partial match. */
+export function splitHandshakeFrame(buf: Buffer): HandshakeFrame | undefined {
+  const idx = buf.indexOf("\n\n", 0, "latin1");
+  if (idx === -1) return undefined;
+  return { text: buf.toString("latin1", 0, idx), rest: Buffer.from(buf.subarray(idx + 2)) };
+}
+
+export interface HandshakeReply {
+  ok: boolean;
+  version: number;
+  /** EXECUTABLE/role echo on success; the error Keyword (WrongVersion,
+   *  InvalidRequest, NoService, NoDebugger) on failure. */
+  token: string;
+  error?: string;
+}
+
+/** Decodes `ACCEPT <version> <role>\n  Encryption: 0` or
+ *  `ERROR <version> <Keyword>\n  Message: <text>` (PLAN.md M10.1's live-
+ *  confirmed shapes). */
+export function parseHandshakeReply(text: string): HandshakeReply {
+  const lines = text.split("\n");
+  const [status, versionStr, token] = (lines[0] ?? "").trim().split(/\s+/);
+  const messageLine = lines.find((l) => l.trim().startsWith("Message:"));
+  const error = messageLine ? messageLine.slice(messageLine.indexOf(":") + 1).trim() : undefined;
+  return { ok: status === "ACCEPT", version: Number(versionStr), token: token ?? "", error };
+}
+
+/** Parses PureBasic's own compiler-stdout version banner (its first printed
+ *  line on every invocation, e.g. `"PureBasic 6.41 (Linux - x64)"`, already
+ *  captured by pbDebugAdapter.ts's launchRequest but unused on success)
+ *  into the `major*100+minor` form the TCP handshake's CONNECT request
+ *  requires. Returns `undefined` -- never a guessed fallback -- when the
+ *  banner doesn't match, so callers fail clearly instead of sending a bogus
+ *  version and getting a confusing target-side WrongVersion error. */
+export function parseCompilerVersionBanner(stdout: string): number | undefined {
+  const match = /PureBasic\s+(\d+)\.(\d+)/.exec(stdout);
+  if (!match) return undefined;
+  return Number(match[1]) * 100 + Number(match[2]);
+}
+
+/** Binds a throwaway server to port 0, lets the OS assign a free port,
+ *  then releases it for the caller to reuse -- the standard way to hand a
+ *  spawned target a free TCP port before it starts (it can't report one
+ *  back). Accepts the inherent small race window (something else could
+ *  claim the port before the target binds it). */
+export function allocateFreeTcpPort(): Promise<number> {
+  return new Promise((resolve, reject) => {
+    const probe = net.createServer();
+    probe.once("error", reject);
+    probe.listen(0, () => {
+      const address = probe.address();
+      if (!address || typeof address === "string") {
+        probe.close();
+        reject(new Error("could not determine an allocated TCP port"));
+        return;
+      }
+      probe.close(() => resolve(address.port));
+    });
+  });
+}
+
 /**
  * Live connection to a PureBasic `-d` build's embedded external debugger,
  * over the FIFO transport (`PB_DEBUGGER_Communication=FifoFiles;<out>;<in>`).
@@ -587,8 +690,8 @@ interface PendingWaiter {
  * `continue` against a poll.
  */
 export class PbDebugSession extends EventEmitter {
-  private writeStream?: fs.WriteStream;
-  private readStream?: fs.ReadStream;
+  private writeStream?: PbWritable;
+  private readStream?: PbReadable;
   private recvBuffer = Buffer.alloc(0);
   private pending: PendingWaiter[] = [];
   private unclaimed: PbMessage[] = [];
@@ -605,24 +708,211 @@ export class PbDebugSession extends EventEmitter {
    * otherwise hang forever. `timeoutMs` bounds that wait.
    */
   connect(outFifo: string, inFifo: string, timeoutMs = 10000): Promise<PbMessage> {
-    this.readStream = fs.createReadStream(outFifo);
-    this.readStream.on("data", (chunk) => {
-      this.recvBuffer = Buffer.concat([this.recvBuffer, chunk as Buffer]);
+    return this.attachTransport(fs.createReadStream(outFifo), fs.createWriteStream(inFifo), timeoutMs);
+  }
+
+  /**
+   * Opens a TCP connection to a target started with
+   * `PB_DEBUGGER_Communication=NetworkServer;<port>` (PLAN.md M10), performs
+   * the text handshake, and resolves once the `hello` message arrives —
+   * the TCP counterpart to {@link connect}. `version` must be the compiler's
+   * own `major*100+minor` (see {@link parseCompilerVersionBanner}); the
+   * target rejects a mismatched one with `ERROR <version> WrongVersion`.
+   *
+   * `timeoutMs` is one overall budget shared across all three phases
+   * (socket connect, text handshake, HELLO wait), matching {@link connect}'s
+   * single-budget FIFO behavior -- each phase gets only the time left, not
+   * a fresh `timeoutMs` of its own (which would let the worst case take up
+   * to 3x the requested timeout).
+   */
+  async connectTcp(port: number, version: number, timeoutMs = 10000, host = "127.0.0.1"): Promise<PbMessage> {
+    const deadline = Date.now() + timeoutMs;
+    const remaining = () => Math.max(0, deadline - Date.now());
+    const socket = await this.openTcpSocket(host, port, remaining());
+    socket.write(buildConnectRequest(version));
+    const leftover = await this.readHandshake(socket, remaining());
+    return this.attachTransport(socket, socket, remaining(), leftover);
+  }
+
+  /**
+   * A FIFO open() blocks until the target opens its end (see connect()'s
+   * doc comment) -- TCP has no equivalent rendezvous. The target needs a
+   * moment after spawning to reach its own `listen()` call, and connecting
+   * before then fails immediately with ECONNREFUSED (confirmed live: the
+   * very first attempt right after spawn reliably refuses), not by hanging
+   * the way a not-yet-open FIFO would. This retries on ECONNREFUSED/ECONNRESET
+   * with a short fixed delay until either a connection succeeds or the
+   * overall `timeoutMs` budget is exhausted, so TCP gets the same
+   * "wait for the target to be ready" behavior FIFO gets for free.
+   */
+  private openTcpSocket(host: string, port: number, timeoutMs: number): Promise<net.Socket> {
+    const deadline = Date.now() + timeoutMs;
+    const RETRY_DELAY_MS = 50;
+    // Settled once either the retry loop or the timeout below wins --
+    // guards against the two things a naive Promise.race between them would
+    // get wrong: a connection that completes *after* the timeout already
+    // rejected must be destroyed, not left as a live, unused, leaked socket
+    // (a real launch keeps the extension host process alive on that handle
+    // indefinitely); and the timeout timer itself must be cleared on the
+    // success path so it doesn't fire uselessly later. `currentSocket`
+    // additionally lets the timeout path destroy a connection attempt that
+    // is still pending (neither connected nor errored) when time runs out
+    // -- e.g. a firewall silently dropping the SYN rather than refusing it.
+    let settled = false;
+    let currentSocket: net.Socket | undefined;
+    const attempt = (): Promise<net.Socket> =>
+      new Promise((resolve, reject) => {
+        const socket = net.createConnection({ host, port });
+        currentSocket = socket;
+        socket.once("connect", () => resolve(socket));
+        socket.once("error", (err: NodeJS.ErrnoException) => {
+          socket.destroy();
+          reject(err);
+        });
+      });
+    const loop = async (): Promise<net.Socket> => {
+      for (;;) {
+        try {
+          const socket = await attempt();
+          if (settled) {
+            socket.destroy();
+            throw new Error("connectTcp: connection arrived after the overall timeout already gave up");
+          }
+          return socket;
+        } catch (err) {
+          const code = (err as NodeJS.ErrnoException).code;
+          if (settled || !(code === "ECONNREFUSED" || code === "ECONNRESET") || Date.now() >= deadline) {
+            throw err;
+          }
+          await new Promise((r) => setTimeout(r, RETRY_DELAY_MS));
+        }
+      }
+    };
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        if (settled) return;
+        settled = true;
+        currentSocket?.destroy();
+        reject(new Error(`timed out after ${timeoutMs}ms connecting to the debugger TCP port`));
+      }, timeoutMs);
+      loop().then(
+        (socket) => {
+          if (settled) return; // the timeout already rejected; loop() already destroyed this socket
+          settled = true;
+          clearTimeout(timer);
+          resolve(socket);
+        },
+        (err) => {
+          if (settled) return;
+          settled = true;
+          clearTimeout(timer);
+          reject(err);
+        },
+      );
+    });
+  }
+
+  /**
+   * Reads and validates the TCP handshake (PLAN.md M10.1's live-confirmed
+   * `CONNECT`/`ACCEPT`/`ERROR` text framing), then resolves with any bytes
+   * received past the terminator. Those bytes are not scratch/discardable —
+   * a single TCP `data` event can contain the handshake reply and part or
+   * all of the very first binary `MSG_HELLO` concatenated together, so the
+   * leftover must flow into {@link attachTransport}'s `seed`, never be
+   * dropped or re-parsed as text.
+   */
+  private readHandshake(socket: net.Socket, timeoutMs: number): Promise<Buffer> {
+    return new Promise((resolve, reject) => {
+      let buf = Buffer.alloc(0);
+      const cleanup = () => {
+        clearTimeout(timer);
+        socket.off("data", onData);
+        socket.off("close", onClose);
+        socket.off("error", onError);
+      };
+      // On every reject path the socket is not (yet) handed to
+      // attachTransport, so nothing else will ever destroy it -- an
+      // un-destroyed but still-connected socket keeps the event loop (and,
+      // in a real launch, the process) alive indefinitely.
+      const onData = (chunk: Buffer) => {
+        buf = Buffer.concat([buf, chunk]);
+        if (buf.length > MAX_HANDSHAKE_LEN) {
+          cleanup();
+          socket.destroy();
+          reject(new Error("debugger TCP handshake exceeded the sanity length bound before a terminator arrived"));
+          return;
+        }
+        const frame = splitHandshakeFrame(buf);
+        if (!frame) return; // terminator hasn't arrived yet -- wait for more data
+        cleanup();
+        const reply = parseHandshakeReply(frame.text);
+        if (!reply.ok) {
+          socket.destroy();
+          reject(new Error(`debugger TCP handshake rejected: ${reply.token}${reply.error ? ` (${reply.error})` : ""}`));
+          return;
+        }
+        resolve(frame.rest);
+      };
+      const onClose = () => {
+        cleanup();
+        reject(new Error("debugger connection closed during TCP handshake"));
+      };
+      const onError = (err: Error) => {
+        cleanup();
+        socket.destroy();
+        reject(err);
+      };
+      const timer = setTimeout(() => {
+        cleanup();
+        socket.destroy();
+        reject(new Error(`timed out after ${timeoutMs}ms waiting for the TCP handshake`));
+      }, timeoutMs);
+      socket.on("data", onData);
+      socket.on("close", onClose);
+      socket.on("error", onError);
+    });
+  }
+
+  /**
+   * Wires the data/close/error handling shared by every transport and
+   * resolves once the `hello` message arrives. `seed`, when given (TCP's
+   * handshake leftover bytes), is drained immediately, before waiting for
+   * the next message, since no further `data` event may arrive in time
+   * otherwise. For TCP, `readStream` and `writeStream` are the *same*
+   * socket object -- `close()`'s `.destroy()` then `.end()` stays a safe
+   * no-op sequence on one object (`Socket.end()` no-ops once destroyed), but
+   * this is a new invariant that wasn't true when the two fields were
+   * always independent FIFO streams.
+   */
+  private attachTransport(readStream: PbReadable, writeStream: PbWritable, timeoutMs: number, seed?: Buffer): Promise<PbMessage> {
+    this.readStream = readStream;
+    this.writeStream = writeStream;
+    readStream.on("data", (chunk) => {
+      this.recvBuffer = Buffer.concat([this.recvBuffer, chunk]);
       this.drainMessages();
     });
-    this.readStream.on("close", () => {
+    readStream.on("close", () => {
       this.rejectPending(new Error("debugger connection closed"));
       this.emit("close");
     });
-    this.readStream.on("error", (err: Error) => {
+    readStream.on("error", (err: Error) => {
       this.rejectPending(err);
       this.emit("error", err);
     });
-    this.writeStream = fs.createWriteStream(inFifo);
-    this.writeStream.on("error", (err: Error) => {
-      this.rejectPending(err);
-      this.emit("error", err);
-    });
+    // For TCP, readStream and writeStream are the *same* socket object --
+    // attaching a second "error" listener to it would fire this handler
+    // twice for one real error (double rejectPending/emit). Only wire it
+    // once when the two are already the same EventEmitter.
+    if ((writeStream as unknown) !== (readStream as unknown)) {
+      writeStream.on("error", (err: Error) => {
+        this.rejectPending(err);
+        this.emit("error", err);
+      });
+    }
+    if (seed && seed.length) {
+      this.recvBuffer = Buffer.concat([this.recvBuffer, seed]);
+      this.drainMessages();
+    }
 
     return this.nextMessageWithTimeout(timeoutMs, "the debugger to connect", MSG_HELLO);
   }

@@ -19,9 +19,11 @@ import {
 import { DebugProtocol } from "@vscode/debugprotocol";
 import { Backend, resolveBackendSilent, resolveCompilerPath } from "../config";
 import {
+  allocateFreeTcpPort,
   DBP_COULD_NOT_ADD,
   DBP_EVAL_ERROR,
   DBP_TRUE,
+  parseCompilerVersionBanner,
   PbDataBreakpointEvent,
   PbDebugSession,
   PbEvaluateResult,
@@ -93,6 +95,13 @@ interface LaunchArgs extends DebugProtocol.LaunchRequestArguments {
   stopOnEntry?: boolean;
   backend?: Backend;
   compilerArgs?: string[];
+  /** Internal/test-only override of the automatic FIFO(non-Windows)/
+   *  TCP(Windows) transport selection. Not declared in package.json's launch
+   *  config schema and never documented user-facing -- it exists purely so
+   *  the local e2e suite can exercise the TCP/NetworkServer path on Linux,
+   *  since there's no Windows machine here to make process.platform pick it
+   *  naturally. */
+  transport?: "fifo" | "tcp";
 }
 
 /**
@@ -393,30 +402,74 @@ export class PureBasicDebugSession extends DebugSession {
       this.logError(err);
     }
 
-    if (process.platform === "win32") {
-      // FIFOs (POSIX-only) are the only transport this adapter implements —
-      // fail clearly instead of letting execFileSync("mkfifo", ...) throw an
-      // uncaught ENOENT before any of the surrounding cleanup can run.
-      this.sendErrorResponse(
-        response,
-        1006,
-        "Pure Xtension: the FIFO-based debugger transport isn't supported on Windows yet.",
-      );
-      this.cleanupTempDirs();
-      return;
-    }
+    // Automatic selection is FIFO everywhere except Windows (where FIFOs
+    // don't exist); `args.transport` is an internal-only override so the
+    // e2e suite can exercise the TCP/NetworkServer path on this Linux
+    // machine too -- there's no Windows box available to verify against,
+    // so TCP's correctness is proven here by running the identical protocol
+    // over a real local NetworkServer connection, not by process.platform
+    // actually being "win32".
+    // Only an explicit "fifo" opts out of the platform default -- any other
+    // (e.g. mistyped) override value must not silently fall back to FIFO on
+    // Windows, where it would fail with a raw execFileSync("mkfifo") ENOENT
+    // instead of a clear error.
+    const useTcp = args.transport === "fifo" ? false : args.transport === "tcp" || process.platform === "win32";
 
-    this.fifoDir = fs.mkdtempSync(path.join(os.tmpdir(), "pure-xtension-fifo-"));
-    const outFifo = path.join(this.fifoDir, "pb_out");
-    const inFifo = path.join(this.fifoDir, "pb_in");
-    cp.execFileSync("mkfifo", [outFifo, inFifo]);
+    let transportEnv: Record<string, string>;
+    let doConnect: () => Promise<unknown>;
+
+    if (useTcp) {
+      if (!args.transport) {
+        // Auto-selected by platform detection, not the internal test
+        // override -- surface that this path is newer and has not been run
+        // on a real Windows machine (only verified via the identical
+        // protocol over TCP on Linux), since a Windows-specific failure
+        // here (firewall, antivirus interference) would otherwise look
+        // identical to the fully-proven Linux/FIFO path with no indication
+        // it's a different level of confidence.
+        this.sendEvent(new OutputEvent("Pure Xtension: debugging on Windows uses a TCP transport that has not yet been verified on a real Windows machine (see the README). Please report any issues.\n"));
+      }
+      // PureBasic's TCP handshake requires the compiler's own numeric
+      // version (PLAN.md M10.1) -- parsed from the version banner every
+      // compiler invocation already prints as its first stdout line, so no
+      // extra invocation is needed. Never guess a version: a wrong one
+      // produces a confusing target-side ERROR ... WrongVersion instead of
+      // this clear, adapter-side explanation.
+      const version = parseCompilerVersionBanner(compileResult.stdout ?? "");
+      if (version === undefined) {
+        this.sendErrorResponse(
+          response,
+          1007,
+          "Pure Xtension: could not determine the PureBasic compiler's version from its own build output; cannot perform the TCP debugger handshake.",
+        );
+        this.cleanupTempDirs();
+        return;
+      }
+      let port: number;
+      try {
+        port = await allocateFreeTcpPort();
+      } catch (err) {
+        this.sendErrorResponse(response, 1008, `Pure Xtension: could not allocate a free TCP port for the debugger connection (${String(err)}).`);
+        this.cleanupTempDirs();
+        return;
+      }
+      transportEnv = { PB_DEBUGGER_Communication: `NetworkServer;${port}` };
+      doConnect = () => this.pb.connectTcp(port, version);
+    } else {
+      this.fifoDir = fs.mkdtempSync(path.join(os.tmpdir(), "pure-xtension-fifo-"));
+      const outFifo = path.join(this.fifoDir, "pb_out");
+      const inFifo = path.join(this.fifoDir, "pb_in");
+      cp.execFileSync("mkfifo", [outFifo, inFifo]);
+      transportEnv = { PB_DEBUGGER_Communication: `FifoFiles;${outFifo};${inFifo}` };
+      doConnect = () => this.pb.connect(outFifo, inFifo);
+    }
 
     this.child = cp.spawn(outBinary, args.args ?? [], {
       cwd: args.cwd ?? path.dirname(args.program),
       env: {
         ...process.env,
         ...args.env,
-        PB_DEBUGGER_Communication: `FifoFiles;${outFifo};${inFifo}`,
+        ...transportEnv,
       },
     });
     this.child.stdout?.on("data", (d) => this.sendEvent(new OutputEvent(d.toString(), "stdout")));
@@ -427,7 +480,7 @@ export class PureBasicDebugSession extends DebugSession {
     });
 
     try {
-      await this.pb.connect(outFifo, inFifo);
+      await doConnect();
       await this.pb.drainStartupAnnouncement();
     } catch (err) {
       this.sendErrorResponse(
