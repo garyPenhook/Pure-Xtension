@@ -70,6 +70,9 @@ configuration:
   rather than being treated as generic integers.
 - Evaluate expressions in the Debug Console/hover/watch, including writing
   back to a variable.
+- Data breakpoints on simple scalar variables. Add them while execution is
+  paused at a PureBasic source breakpoint; they watch for the next value
+  change after that stop.
 
 ## Requirements
 

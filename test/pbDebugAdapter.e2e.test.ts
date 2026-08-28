@@ -494,13 +494,18 @@ test("evaluate on an unresolvable expression is quiet for hover/watch but a real
   }
 });
 
-test("a wire request after disconnect receives an error response instead of hanging", { skip }, async () => {
+test("requests after disconnect receive an error response instead of writing a closed session", { skip }, async () => {
   const dc = await launchToBreakpoint(MODULE_BP);
   try {
     await dc.disconnectRequest({});
     await assert.rejects(
       dc.stackTraceRequest({ threadId: MAIN_THREAD_ID }),
       /reading the stack trace failed: debugger session closed/,
+    );
+    await assert.rejects(
+      dc.setDataBreakpointsRequest({ breakpoints: [{ dataId: "g", accessType: "write" }] }),
+      /data breakpoints are unavailable because the debug session has ended/,
+      "data-breakpoint setup must fail before it writes through the disconnected transport",
     );
   } finally {
     await dc.stop();

@@ -146,6 +146,11 @@ export class PureBasicDebugSession extends DebugSession {
    * actual wire writes to `flushBreakpointsToWire()` once connected.
    */
   private pbConnected = false;
+  /** True only while the target is stopped at a PureBasic statement boundary.
+   * Data-breakpoint setup has to evaluate the current value before it can
+   * synthesize the target-side change condition, so it is not meaningful
+   * (and the target cannot service the request reliably) while executing. */
+  private targetStopped = false;
   /** 1-based line the target last stopped at (StoppedEvent's `line`/`msg.f8`), used as the innermost/main frame's current line since opcode 16 never carries it. */
   private lastStopLine = 0;
   private lastStopModuleId = 0;
@@ -241,6 +246,7 @@ export class PureBasicDebugSession extends DebugSession {
       // to the stack trace requested immediately after the stop event.
       this.lastStopLine = line;
       this.lastStopModuleId = moduleId;
+      this.targetStopped = true;
       this.compoundHandles.clear();
       this.frameHandles.clear();
       this.nextCompoundRef = COMPOUND_REF_BASE;
@@ -344,6 +350,8 @@ export class PureBasicDebugSession extends DebugSession {
   private notifyTerminated(): void {
     if (this.terminated) return;
     this.terminated = true;
+    this.pbConnected = false;
+    this.targetStopped = false;
     // A pending (not yet fired) Force Pause timer captured this.child's pid
     // by reading it fresh only when it fires, not at arm time -- without
     // this, a target that exits while the timer is still pending would leave
@@ -739,14 +747,31 @@ export class PureBasicDebugSession extends DebugSession {
    *  sense as a "value changed" watch target, so it's rejected too. */
   private static readonly DATA_BREAKPOINT_NAME_RE = /^[A-Za-z_]\w*$/;
 
+  /** Returns a DAP error instead of attempting a write through a transport
+   * that has already gone away. Unlike source breakpoints, data breakpoints
+   * require a live evaluation of the currently stopped target to establish
+   * their initial value. */
+  private requireStoppedDataBreakpointTarget(response: DebugProtocol.Response): boolean {
+    if (this.forcePauseActive) {
+      this.sendErrorResponse(response, 1094, "Pure Xtension: data breakpoints are unavailable during a forced pause (target is not at a PureBasic statement boundary). Continue to resume.");
+      return false;
+    }
+    if (!this.pbConnected || this.terminated) {
+      this.sendErrorResponse(response, 1095, "Pure Xtension: data breakpoints are unavailable because the debug session has ended. Start a new session and pause at a source breakpoint before adding one.");
+      return false;
+    }
+    if (!this.targetStopped) {
+      this.sendErrorResponse(response, 1096, "Pure Xtension: data breakpoints can only be added while execution is paused at a PureBasic source breakpoint. Pause the target, then add the data breakpoint from Variables.");
+      return false;
+    }
+    return true;
+  }
+
   protected async dataBreakpointInfoRequest(
     response: DebugProtocol.DataBreakpointInfoResponse,
     args: DebugProtocol.DataBreakpointInfoArguments,
   ): Promise<void> {
-    if (this.forcePauseActive) {
-      this.sendErrorResponse(response, 1094, "Pure Xtension: data breakpoints are unavailable during a forced pause (target is not at a PureBasic statement boundary). Continue to resume.");
-      return;
-    }
+    if (!this.requireStoppedDataBreakpointTarget(response)) return;
     // `variablesReference`, per the DAP spec, is the *containing* variable
     // container -- for a plain top-level local that's just the scope's own
     // reference (scopesRequest's `frameId + 1`, always below
@@ -787,10 +812,7 @@ export class PureBasicDebugSession extends DebugSession {
     response: DebugProtocol.SetDataBreakpointsResponse,
     args: DebugProtocol.SetDataBreakpointsArguments,
   ): Promise<void> {
-    if (this.forcePauseActive) {
-      this.sendErrorResponse(response, 1095, "Pure Xtension: data breakpoints are unavailable during a forced pause (target is not at a PureBasic statement boundary). Continue to resume.");
-      return;
-    }
+    if (!this.requireStoppedDataBreakpointTarget(response)) return;
     try {
       this.pb.clearAllDataBreakpoints();
       this.dataBreakpointsByWireId.clear();
@@ -912,6 +934,7 @@ export class PureBasicDebugSession extends DebugSession {
     try {
       if (this.forcePauseActive) await this.resumeFromForcePauseIfActive();
       else this.pb.continue();
+      this.targetStopped = false;
       this.sendResponse(response);
     } catch (err) {
       this.sendAsyncRequestError(response, "continuing execution", err);
@@ -1014,6 +1037,7 @@ export class PureBasicDebugSession extends DebugSession {
     if (!this.forcePauseActive) return;
     this.pauseGeneration++;
     this.forcePauseActive = false;
+    this.targetStopped = false;
     const engine = this.forcePauseEngine;
     this.forcePauseEngine = undefined;
     // pauseRequest's wire pause() (opcode 0) left the target's cooperative
@@ -1084,6 +1108,7 @@ export class PureBasicDebugSession extends DebugSession {
       if (mode === "in") this.pb.stepInto();
       else if (mode === "over") this.pb.stepOver();
       else this.pb.stepOut();
+      this.targetStopped = false;
       this.sendResponse(response);
     } catch (err) {
       this.stepInProgress = false;
