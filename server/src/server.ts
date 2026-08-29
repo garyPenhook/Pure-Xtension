@@ -45,8 +45,6 @@ interface InitializationOptions {
 const connection = createConnection(ProposedFeatures.all);
 const documents = new TextDocuments(TextDocument);
 
-let builtinIndex: BuiltinIndex | undefined;
-let builtinIndexPromise: Promise<BuiltinIndex | undefined> | undefined;
 let compilerPath = "";
 let cacheDir = "";
 const structureFieldsCache = new Map<string, StructureField[]>();
@@ -68,24 +66,25 @@ function ensureHelpIndex(forceRefresh = false): Promise<HelpIndex | undefined> {
   return helpIndexLoader.get(forceRefresh);
 }
 
-/** Memoizes on the in-flight promise (not just the resolved index) so concurrent
- *  completion/hover/signatureHelp calls on activation share one compiler build
- *  instead of each spawning pbcompiler and racing to write the same cache file. */
-function ensureBuiltinIndex(forceRebuild = false): Promise<BuiltinIndex | undefined> {
-  if (builtinIndex) return Promise.resolve(builtinIndex);
-  if (!compilerPath) return Promise.resolve(undefined);
-  if (!builtinIndexPromise) {
-    builtinIndexPromise = loadOrBuildBuiltinIndex(compilerPath, cacheDir, forceRebuild)
-      .then((index) => (builtinIndex = index))
-      .catch((error) => {
-        connection.console.error(`Pure Xtension: failed to build symbol index: ${String(error)}`);
-        return undefined;
-      })
-      .finally(() => {
-        builtinIndexPromise = undefined;
-      });
+// L8: a forced rebuild used to clear a shared builtinIndex/builtinIndexPromise
+// pair directly, without cancelling or sequencing behind an already-running
+// ordinary load — whichever of the two finished last silently won, so a slow
+// forced rebuild could be overwritten by a stale load that happened to still
+// be in flight. RetryableLoader (already proven correct by helpIndexLoader
+// above and its own tests) queues a forced call behind any in-flight ordinary
+// one instead, so the forced result always lands last.
+const builtinIndexLoader = new RetryableLoader<BuiltinIndex>(async (forceRebuild) => {
+  if (!compilerPath) return undefined;
+  try {
+    return await loadOrBuildBuiltinIndex(compilerPath, cacheDir, forceRebuild);
+  } catch (error) {
+    connection.console.error(`Pure Xtension: failed to build symbol index: ${String(error)}`);
+    return undefined;
   }
-  return builtinIndexPromise;
+});
+
+function ensureBuiltinIndex(forceRebuild = false): Promise<BuiltinIndex | undefined> {
+  return builtinIndexLoader.get(forceRebuild);
 }
 
 async function getBuiltinStructureFields(name: string): Promise<StructureField[]> {
@@ -245,8 +244,6 @@ connection.onInitialize((params: InitializeParams): InitializeResult => {
 });
 
 connection.onRequest("pureXtension/rebuildSymbolCache", async () => {
-  builtinIndex = undefined;
-  builtinIndexPromise = undefined;
   structureFieldsCache.clear();
   await ensureBuiltinIndex(true);
 });

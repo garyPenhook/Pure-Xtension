@@ -1,5 +1,6 @@
 import { execFile } from "node:child_process";
-import { mkdtemp, readFile, rm, mkdir, writeFile } from "node:fs/promises";
+import { randomUUID } from "node:crypto";
+import { mkdtemp, readFile, rename, rm, mkdir, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -100,7 +101,52 @@ function cacheFile(cacheDir: string, version: string): string {
   return join(cacheDir, `symbol-cache-${safeVersion}.json`);
 }
 
-/** Loads the built-in index from disk cache, rebuilding via the compiler if missing/stale. */
+function isBuiltinFunction(value: unknown): value is BuiltinFunction {
+  if (!value || typeof value !== "object") return false;
+  const f = value as Record<string, unknown>;
+  return (
+    typeof f.name === "string" &&
+    typeof f.signature === "string" &&
+    typeof f.params === "string" &&
+    typeof f.description === "string"
+  );
+}
+
+function isStringArray(value: unknown): value is string[] {
+  return Array.isArray(value) && value.every((v) => typeof v === "string");
+}
+
+// L8: a valid-JSON cache was previously accepted after checking only
+// compilerVersion — a malformed functions/structures/interfaces shape (e.g.
+// truncated by an interrupted write, or from some future/incompatible schema
+// change) would parse fine here and only throw later, deep inside
+// completion/hover, instead of triggering a rebuild.
+function isValidBuiltinIndex(value: unknown, expectedVersion: string): value is BuiltinIndex {
+  if (!value || typeof value !== "object") return false;
+  const v = value as Record<string, unknown>;
+  return (
+    v.compilerVersion === expectedVersion &&
+    Array.isArray(v.functions) &&
+    v.functions.every(isBuiltinFunction) &&
+    isStringArray(v.structures) &&
+    isStringArray(v.interfaces)
+  );
+}
+
+/** Writes `index` to `file` atomically: a reader (or a crash/interrupted
+ *  process) can never observe a partially-written cache file. */
+async function writeCacheAtomic(file: string, index: BuiltinIndex): Promise<void> {
+  const tmp = `${file}.${randomUUID()}.tmp`;
+  try {
+    await writeFile(tmp, JSON.stringify(index), "utf8");
+    await rename(tmp, file);
+  } catch (err) {
+    await rm(tmp, { force: true });
+    throw err;
+  }
+}
+
+/** Loads the built-in index from disk cache, rebuilding via the compiler if missing/stale/invalid. */
 export async function loadOrBuildBuiltinIndex(
   compilerPath: string,
   cacheDir: string,
@@ -111,8 +157,8 @@ export async function loadOrBuildBuiltinIndex(
 
   if (!forceRebuild) {
     try {
-      const cached = JSON.parse(await readFile(file, "utf8")) as BuiltinIndex;
-      if (cached.compilerVersion === version) return cached;
+      const cached: unknown = JSON.parse(await readFile(file, "utf8"));
+      if (isValidBuiltinIndex(cached, version)) return cached;
     } catch {
       // no cache yet, or unreadable — fall through and rebuild.
     }
@@ -120,6 +166,6 @@ export async function loadOrBuildBuiltinIndex(
 
   const index = await buildBuiltinIndex(compilerPath, version);
   await mkdir(cacheDir, { recursive: true });
-  await writeFile(file, JSON.stringify(index), "utf8");
+  await writeCacheAtomic(file, index);
   return index;
 }

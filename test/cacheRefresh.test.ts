@@ -50,6 +50,97 @@ fs.writeFileSync(out, args.includes("-lf") ? name + " () - test\\n" : "\\n");
   }
 });
 
+async function findCacheFile(dir: string): Promise<string> {
+  const entries = await readdir(dir);
+  const found = entries.find((f) => f.startsWith("symbol-cache-"));
+  if (!found) throw new Error(`no symbol-cache-*.json in ${dir} (saw: ${entries.join(", ")})`);
+  return path.join(dir, found);
+}
+
+test("a malformed built-in cache (bad functions/structures/interfaces shape) is rejected and rebuilt", async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), "pure-xtension-builtin-schema-test-"));
+  const compiler = path.join(dir, "fake-compiler.cjs");
+  const countFile = path.join(dir, "count.txt");
+  const script = `#!/usr/bin/env node
+const fs = require("node:fs");
+const args = process.argv.slice(2);
+if (args.includes("-v")) { process.stdout.write("PureBasic Test 1.0"); process.exit(1); }
+const out = args[args.indexOf("-o") + 1];
+const count = Number(fs.readFileSync(${JSON.stringify(countFile)}, "utf8")) + 1;
+fs.writeFileSync(${JSON.stringify(countFile)}, String(count));
+fs.writeFileSync(out, args.includes("-lf") ? "Rebuilt () - test\\n" : "\\n");
+`;
+
+  try {
+    await writeFile(compiler, script, "utf8");
+    await chmod(compiler, 0o755);
+    await writeFile(countFile, "0", "utf8");
+
+    const first = await loadOrBuildBuiltinIndex(compiler, dir);
+    assert.equal(await readFile(countFile, "utf8"), "3", "one build == one -lf/-ls/-li invocation each");
+    assert.equal(first.compilerVersion, "PureBasic Test 1.0");
+
+    const cacheFile = await findCacheFile(dir);
+    const good = JSON.parse(await readFile(cacheFile, "utf8"));
+
+    for (const corrupted of [
+      { ...good, functions: "not-an-array" },
+      { ...good, functions: [{ name: "onlyName" }] }, // missing signature/params/description
+      { ...good, structures: [1, 2, 3] }, // must be string[]
+      { ...good, interfaces: null },
+    ]) {
+      await writeFile(cacheFile, JSON.stringify(corrupted), "utf8");
+      const result = await loadOrBuildBuiltinIndex(compiler, dir);
+      assert.equal(result.functions[0]?.name, "Rebuilt", `malformed cache (${JSON.stringify(Object.keys(corrupted))}) must be rejected, not trusted`);
+    }
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("a built-in cache write that fails partway through leaves the previous good cache file intact", async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), "pure-xtension-builtin-write-test-"));
+  const compiler = path.join(dir, "fake-compiler.cjs");
+  const countFile = path.join(dir, "count.txt");
+  const script = `#!/usr/bin/env node
+const fs = require("node:fs");
+const args = process.argv.slice(2);
+if (args.includes("-v")) { process.stdout.write("PureBasic Test 1.0"); process.exit(1); }
+const out = args[args.indexOf("-o") + 1];
+const count = Number(fs.readFileSync(${JSON.stringify(countFile)}, "utf8")) + 1;
+fs.writeFileSync(${JSON.stringify(countFile)}, String(count));
+fs.writeFileSync(out, args.includes("-lf") ? "First () - test\\n" : "\\n");
+`;
+
+  try {
+    await writeFile(compiler, script, "utf8");
+    await chmod(compiler, 0o755);
+    await writeFile(countFile, "0", "utf8");
+
+    const first = await loadOrBuildBuiltinIndex(compiler, dir);
+    assert.equal(first.functions[0]?.name, "First");
+    const cacheFile = await findCacheFile(dir);
+    const beforeBytes = await readFile(cacheFile, "utf8");
+
+    // Make the cache directory unwritable so the atomic tmp-file write fails
+    // partway through, simulating an interrupted/failed write.
+    await chmod(dir, 0o500);
+    try {
+      await assert.rejects(loadOrBuildBuiltinIndex(compiler, dir, true));
+    } finally {
+      await chmod(dir, 0o700);
+    }
+
+    const afterBytes = await readFile(cacheFile, "utf8");
+    assert.equal(afterBytes, beforeBytes, "the on-disk cache must be untouched by the failed write");
+    const leftovers = (await readdir(dir)).filter((f) => f.endsWith(".tmp"));
+    assert.deepEqual(leftovers, [], "no partial tmp file should remain");
+  } finally {
+    await chmod(dir, 0o700).catch(() => {});
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 test("forced help refresh bypasses a fresh disk cache", async () => {
   const dir = await mkdtemp(path.join(tmpdir(), "pure-xtension-help-test-"));
   const originalFetch = globalThis.fetch;
