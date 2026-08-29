@@ -8,6 +8,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import type { TextDocuments } from "vscode-languageserver/node";
 import { TextDocument } from "vscode-languageserver-textdocument";
+import { URI } from "vscode-uri";
 import { extractWorkspaceSymbols, WorkspaceSymbol } from "./workspaceSymbols";
 
 export interface ResolvedSymbol extends WorkspaceSymbol {
@@ -17,21 +18,22 @@ export interface ResolvedSymbol extends WorkspaceSymbol {
 const INCLUDE_LINE = /^\s*X?IncludeFile\s+"([^"]+)"/i;
 const INCLUDE_PATH_LINE = /^\s*IncludePath\s+"([^"]+)"/i;
 
+// L7: the hand-rolled encodeURI()/decodeURIComponent() pair this replaced
+// left URI delimiters such as `#` and `?` unescaped in a filename (encodeURI
+// treats them as reserved/already-meaningful characters, not something to
+// escape), so a real path containing one produced a URI that pointed at the
+// wrong resource (everything from the `#`/`?` onward was read as a
+// fragment/query, not part of the path) — and didn't robustly cover Windows
+// drive letters or UNC paths either. vscode-uri is the same implementation
+// VS Code and vscode-languageserver's own clients use for this exact
+// conversion, so it agrees with how a real `file://...` URI from the client
+// (e.g. in didOpen/didChange) decodes.
 function uriToPath(uri: string): string {
-  const decoded = decodeURIComponent(uri.replace(/^file:\/\//, ""));
-  // A Windows drive-letter path arrives as "/C:/foo/bar" (the file:///C:/...
-  // URI convention's leading slash survives decoding) — strip it so fs/path
-  // see a real Windows path ("C:/foo/bar"), not one path.win32/fs.* would
-  // resolve wrong (or documents.get would fail to match against).
-  return /^\/[A-Za-z]:/.test(decoded) ? decoded.slice(1) : decoded;
+  return URI.parse(uri).fsPath;
 }
 
 function pathToUri(p: string): string {
-  const normalized = p.replace(/\\/g, "/");
-  // Mirror uriToPath: a Windows drive-letter path needs its leading slash
-  // put back before encoding ("C:/foo" -> "file:///C:/foo").
-  const withLeadingSlash = /^[A-Za-z]:/.test(normalized) ? `/${normalized}` : normalized;
-  return "file://" + encodeURI(withLeadingSlash);
+  return URI.file(p).toString();
 }
 
 /** Canonicalizes a URI's underlying path for de-dup purposes: resolves
@@ -143,15 +145,26 @@ export async function getIncludeGraphDocument(
   }
 }
 
+// L7: cycles are already made safe by the canonicalKey-keyed `visited` set
+// below (a repeated file, including through a symlink loop, is only ever
+// visited once, regardless of depth) — the depth cap's only remaining job is
+// bounding a pathologically wide/deep *acyclic* graph. 8 was low enough that
+// a legitimate project nesting IncludeFile a few directories deep could
+// silently lose symbols with no indication anything was cut off. This is
+// exported so a caller can override it, but the default is now high enough
+// that no real PureBasic project should ever hit it.
+export const DEFAULT_MAX_INCLUDE_DEPTH = 1000;
+
 /**
  * Walks the IncludeFile/XIncludeFile graph from `entryUri`, returning every
  * symbol reachable (including the entry document's own), each tagged with the
- * URI it was declared in. Cycles and a depth cap keep this bounded.
+ * URI it was declared in. Cycles are cut by canonicalKey de-duplication, not
+ * by `maxDepth` — see DEFAULT_MAX_INCLUDE_DEPTH's doc comment.
  */
 export async function resolveIncludeGraphSymbols(
   entryUri: string,
   documents: TextDocuments<TextDocument>,
-  maxDepth = 8,
+  maxDepth = DEFAULT_MAX_INCLUDE_DEPTH,
 ): Promise<ResolvedSymbol[]> {
   const visited = new Set<string>();
   const result: ResolvedSymbol[] = [];
@@ -186,7 +199,7 @@ export async function resolveIncludeGraphSymbols(
 export async function resolveIncludeGraphUris(
   entryUri: string,
   documents: TextDocuments<TextDocument>,
-  maxDepth = 8,
+  maxDepth = DEFAULT_MAX_INCLUDE_DEPTH,
 ): Promise<string[]> {
   const visited = new Set<string>();
   const result: string[] = [];
