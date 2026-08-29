@@ -13,13 +13,19 @@ each). **Debugging is fully supported and verified on Linux**, built on
 POSIX FIFOs plus a GDB/ptrace-backed Force Pause for targets blocked in
 native calls. **On Windows, the debugger wire protocol has also been
 implemented, over a TCP transport instead** — PureBasic's `-d` builds
-support this natively — and it has been protocol-verified end-to-end using
-the identical code path against a Linux PureBasic install (`NetworkServer`
-mode). It has not yet been run on a real Windows machine, so launching a
-debug session on Windows still fails with a clear error until that
-validation pass happens, the same as macOS (where debugging isn't
-implemented at all yet) — neither platform silently gets an unverified
-debugger.
+support this natively. It's been validated past the protocol level: a real
+Windows PureBasic 6.41 install, running under Wine (there's no Windows
+machine available for this project), compiles real programs and drives full
+launch → breakpoint → locals → evaluate → step sessions through the exact
+same production code path a real Windows launch uses. That process already
+found and fixed two genuine Windows-specific compiler differences: the
+`-ds` (debug symbols) flag doesn't exist there, and a normal build prints no
+version banner to stdout at all (Linux does). It has still not been run on
+real Windows hardware, so launching a debug session on Windows still fails
+with a clear error until that final pass happens — Wine can't validate real
+process-termination semantics, or anything GDB/ptrace-based (Force Pause is
+Linux-only) — the same as macOS (where debugging isn't implemented at all
+yet); neither platform silently gets an unverified debugger.
 
 ## Features
 
@@ -59,7 +65,7 @@ debugger.
 - Completion items carry full documentation (description + doc link) pulled
   from the same live index.
 
-### Debugging — ⚠️ Linux fully verified; not yet enabled on Windows or macOS (see below)
+### Debugging — ⚠️ Linux fully verified; Windows Wine-validated but not yet enabled; not yet implemented on macOS (see below)
 Standard VS Code debugging for PureBasic programs, via a `purebasic` launch
 configuration:
 - Launch, line breakpoints, continue, step-over/into/out, and a real
@@ -115,7 +121,7 @@ suite cannot be mistaken for Electron's successful exit.
 
 ## Debugging a program
 
-**Linux is fully verified.** Windows has a protocol-verified TCP transport implemented, but launching still fails with a clear error there until it's been validated end-to-end on real Windows hardware; macOS debugging isn't implemented yet — see the platform note above.
+**Linux is fully verified.** Windows has a TCP transport implemented and validated against a real Windows PureBasic install under Wine, but launching still fails with a clear error there until it's been run end-to-end on real Windows hardware; macOS debugging isn't implemented yet — see the platform note above.
 
 Add a launch configuration to your workspace's `.vscode/launch.json`:
 
