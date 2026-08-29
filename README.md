@@ -53,7 +53,8 @@ yet); neither platform silently gets an unverified debugger.
   Problems panel, including errors reported inside `XIncludeFile`d files.
 - Status bar items for Build / Run / backend toggle.
 - Supports both of PureBasic's compiler backends — the self-contained ASM
-  backend (via bundled `fasm`) and the C backend (via a system C toolchain) —
+  backend (via bundled `fasm`) and the C backend (via a C toolchain, bundled
+  with PureBasic on Windows, a system gcc/clang on Linux/macOS) —
   auto-detected, with a one-time prompt if both are available.
 
 ### Deep help integration
@@ -87,8 +88,9 @@ configuration:
   install on those platforms). The extension auto-detects `purebasic*`
   installs under common locations, or you can set
   `pureXtension.purebasicHome` explicitly.
-- The C backend additionally requires a system C toolchain (gcc/clang) if
-  you choose it over the self-contained ASM backend.
+- The C backend additionally requires a system C toolchain if you choose it
+  over the self-contained ASM backend. PureBasic for Windows bundles its own
+  (MinGW); on Linux/macOS you need gcc/clang on `PATH` yourself.
 
 ## Release validation
 

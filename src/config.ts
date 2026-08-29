@@ -137,7 +137,15 @@ function commandExistsOnPath(cmd: string): boolean {
   return false;
 }
 
+/**
+ * Whether a C toolchain is available for the C backend. PureBasic for
+ * Windows bundles its own (MinGW) rather than depending on the system
+ * `PATH`, so only Linux/macOS need a `PATH` probe.
+ */
 export function hasCToolchain(): boolean {
+  if (process.platform === "win32") {
+    return true;
+  }
   return commandExistsOnPath("gcc") || commandExistsOnPath("clang") || commandExistsOnPath("cc");
 }
 
