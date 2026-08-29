@@ -17,7 +17,7 @@ import {
   Variable,
 } from "@vscode/debugadapter";
 import { DebugProtocol } from "@vscode/debugprotocol";
-import { Backend, resolveBackendSilent, resolveCompilerPath } from "../config";
+import { Backend, resolveBackend, resolveCompilerPath } from "../config";
 import {
   allocateFreeTcpPort,
   compileAsync,
@@ -471,7 +471,21 @@ export class PureBasicDebugSession extends DebugSession {
       return;
     }
 
-    const backend = args.backend ?? resolveBackendSilent() ?? "asm";
+    // M13: an unspecified backend used to fall back to a silent "asm" default
+    // whenever auto mode was ambiguous, so a debug launch could silently use
+    // a different backend than the build tasks the user already configured.
+    // resolveBackend() matches build tasks' own flow: it prompts once and
+    // persists the choice when ambiguous, and returns undefined only when
+    // there is genuinely no usable backend or the user cancelled the prompt.
+    const backend = args.backend ?? (await resolveBackend());
+    if (!backend) {
+      this.sendErrorResponse(
+        response,
+        1001,
+        "Pure Xtension: no PureBasic compiler backend selected — debug launch cancelled.",
+      );
+      return;
+    }
     const compiler = resolveCompilerPath(backend);
     if (!compiler) {
       this.sendErrorResponse(response, 1001, "Pure Xtension: no PureBasic compiler found for the selected backend.");
@@ -486,7 +500,18 @@ export class PureBasicDebugSession extends DebugSession {
     // and no way to cancel a stalled compiler. compileAsync() hands back the
     // child immediately so disconnectRequest can kill it if the user stops
     // the session mid-compile (see this.compileChild).
-    const { child: compileChild, result: compileResultPromise } = compileAsync(compiler, compileArgs);
+    // The C backend unconditionally writes its intermediate "purebasic.c"
+    // into the compiler process's cwd, with no flag to relocate it (verified
+    // against pbcompilerc --help); running it inside workDir instead of
+    // inheriting the extension host's own cwd means that leftover file is
+    // cleaned up by cleanupTempDirs() like every other debug-build artifact,
+    // rather than appearing in whatever directory the extension host started in.
+    const { child: compileChild, result: compileResultPromise } = compileAsync(
+      compiler,
+      compileArgs,
+      DEFAULT_COMPILE_TIMEOUT_MS,
+      this.workDir,
+    );
     this.compileChild = compileChild;
     const compileResult = await compileResultPromise;
     this.compileChild = undefined;

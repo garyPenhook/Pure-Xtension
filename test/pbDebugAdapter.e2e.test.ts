@@ -29,20 +29,24 @@ const MAIN_THREAD_ID = 1;
 const ADAPTER = path.join(__dirname, "..", "adapter.cjs");
 
 /** Mirrors config.ts's env/PATH compiler resolution enough to decide whether the live target is even runnable here. */
-function findPbCompiler(): string | undefined {
+function findPbCompiler(binary: "pbcompiler" | "pbcompilerc"): string | undefined {
   const home = process.env.PUREBASIC_HOME;
   if (home) {
-    const candidate = path.join(home, "compilers", "pbcompiler");
+    const candidate = path.join(home, "compilers", binary);
     if (fs.existsSync(candidate)) return candidate;
   }
   for (const dir of (process.env.PATH ?? "").split(path.delimiter)) {
-    if (dir && fs.existsSync(path.join(dir, "pbcompiler"))) return path.join(dir, "pbcompiler");
+    if (dir && fs.existsSync(path.join(dir, binary))) return path.join(dir, binary);
   }
   return undefined;
 }
 
-const compiler = findPbCompiler();
+const compiler = findPbCompiler("pbcompiler");
+const compilerC = findPbCompiler("pbcompilerc");
 const skip = compiler ? false : "PureBasic compiler not found";
+// M13's ambiguous-auto/cancelled-prompt path only triggers when both backends
+// resolve; most CI/dev installs only have the ASM compiler.
+const skipAmbiguousBackend = compiler && compilerC ? false : "requires both the ASM and C PureBasic backends installed";
 
 // Line-numbered fixture (1-indexed). Two interesting stop points: the module
 // body's Add(a, b) call at line 20 (where the target is stopped *at module
@@ -171,7 +175,7 @@ after(() => {
 });
 
 /** Spawns a fresh adapter, launches the fixture, and resolves once the target is stopped at `line`. */
-async function launchToBreakpoint(line: number, transport?: "fifo" | "tcp"): Promise<DebugClient> {
+async function launchToBreakpoint(line: number, transport?: "fifo" | "tcp", backend: "asm" | "c" = "asm"): Promise<DebugClient> {
   const dc = new DebugClient("node", ADAPTER, "purebasic");
   // The first request triggers a full debug-build compile before the target
   // even starts — well above DebugClient's 5s default.
@@ -183,7 +187,7 @@ async function launchToBreakpoint(line: number, transport?: "fifo" | "tcp"): Pro
         .setBreakpointsRequest({ source: { path: program }, breakpoints: [{ line }], lines: [line] })
         .then(() => dc.configurationDoneRequest()),
     ),
-    dc.launch({ program, backend: "asm", stopOnEntry: false, transport }),
+    dc.launch({ program, backend, stopOnEntry: false, transport }),
     dc.assertStoppedLocation("breakpoint", { path: program, line }),
   ]);
   return dc;
@@ -366,6 +370,40 @@ test("launch surfaces a spawn failure (nonexistent cwd) as a clean DAP error, no
     // The adapter process must still be alive and responsive afterwards --
     // an unhandled 'error' event would have crashed it instead.
     await dc.threadsRequest();
+  } finally {
+    await dc.stop();
+  }
+});
+
+test("an unspecified backend in ambiguous auto mode prompts and cleanly cancels the launch when dismissed", { skip: skipAmbiguousBackend }, async () => {
+  // M13: launchRequest used to fall back to a silent "asm" default whenever
+  // auto mode was ambiguous, instead of using the same resolveBackend() flow
+  // build tasks already use. This sandbox has both pbcompiler and pbcompilerc
+  // installed (genuinely ambiguous), and the adapter's vscode stub always
+  // resolves showQuickPick() to undefined -- i.e. a dismissed picker -- so a
+  // launch with no explicit `backend` must now fail cleanly instead of
+  // silently compiling with ASM.
+  const dc = new DebugClient("node", ADAPTER, "purebasic");
+  dc.defaultTimeout = 30000;
+  await dc.start();
+  try {
+    await dc.initializeRequest();
+    await assert.rejects(
+      dc.launch({ program }),
+      /no PureBasic compiler backend selected/,
+      "an ambiguous auto backend with a dismissed prompt must reject the launch, not default to asm",
+    );
+    // The adapter process must still be alive and responsive afterwards.
+    await dc.threadsRequest();
+  } finally {
+    await dc.stop();
+  }
+});
+
+test("an explicit C backend launch compiles and stops at a breakpoint without prompting", { skip: skipAmbiguousBackend }, async () => {
+  const dc = await launchToBreakpoint(MODULE_BP, undefined, "c");
+  try {
+    await Promise.all([dc.continueRequest({ threadId: MAIN_THREAD_ID }), dc.waitForEvent("terminated")]);
   } finally {
     await dc.stop();
   }

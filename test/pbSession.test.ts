@@ -940,6 +940,26 @@ test("compileAsync's returned child can be killed externally (cancellation) and 
   assert.ok(Date.now() - start < 2000);
 });
 
+test("compileAsync runs the compiler in the given cwd instead of inheriting the caller's", async () => {
+  // M13 follow-up: pbcompilerc (the C backend) always writes its
+  // intermediate "purebasic.c" into the compiler process's own cwd, with no
+  // flag to relocate it -- so launchRequest now passes its per-session
+  // workDir as compileAsync's cwd, letting cleanupTempDirs() sweep that
+  // leftover file up with everything else instead of it landing wherever
+  // the extension host process happened to start (e.g. the workspace root).
+  // This proves the plumbing actually reaches child_process.spawn(), not
+  // just that the parameter is accepted and ignored.
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pure-xtension-cwd-test-"));
+  try {
+    const { result } = compileAsync(process.execPath, ["-e", "require('fs').writeFileSync('marker.txt', 'x')"], undefined, dir);
+    const r = await result;
+    assert.equal(r.status, 0, r.stderr);
+    assert.ok(fs.existsSync(path.join(dir, "marker.txt")), "child process should have run with the given cwd");
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 // M2: every ordinary in-session protocol request must be bounded, and a
 // timeout must leave the session in a defined (unusable, not corrupted)
 // state rather than risk a stale reply corrupting whichever request comes

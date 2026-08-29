@@ -60,7 +60,7 @@ function outputPathFor(sourceFile: string): string {
  * real argv array — never through a shell — so paths containing shell
  * metacharacters (`$()`, backticks, `;`, quotes...) can't be interpreted.
  */
-class CompileExecution implements vscode.Pseudoterminal {
+export class CompileExecution implements vscode.Pseudoterminal {
   private readonly writeEmitter = new vscode.EventEmitter<string>();
   private readonly closeEmitter = new vscode.EventEmitter<number>();
   onDidWrite = this.writeEmitter.event;
@@ -97,13 +97,25 @@ class CompileExecution implements vscode.Pseudoterminal {
   private run(command: string, args: string[], onExit: (code: number | null) => void): void {
     const child = spawn(command, args, { cwd: this.cwd });
     this.child = child;
+    // A failed spawn (e.g. ENOENT) emits both "error" and "close" — Node
+    // guarantees "close" fires even when the process never started — so this
+    // guard is required to avoid running onExit (and firing closeEmitter,
+    // which may itself start the "run after build" step) twice.
+    let exited = false;
+    const finish = (code: number | null) => {
+      if (exited) {
+        return;
+      }
+      exited = true;
+      onExit(code);
+    };
     child.stdout.on("data", (chunk: Buffer) => this.write(chunk.toString()));
     child.stderr.on("data", (chunk: Buffer) => this.write(chunk.toString()));
     child.on("error", (err) => {
       this.write(`${err.message}\r\n`);
-      onExit(1);
+      finish(1);
     });
-    child.on("close", (code) => onExit(code));
+    child.on("close", (code) => finish(code));
   }
 
   private write(text: string): void {

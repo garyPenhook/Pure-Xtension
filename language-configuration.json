@@ -20,8 +20,14 @@
     ["\"", "\""]
   ],
   "indentationRules": {
-    "increaseIndentPattern": "^\\s*(If|ElseIf|Else|ForEach|For|While|Repeat|Select|Case|Procedure(C|DLL|CDLL)?|Structure|Interface|Enumeration|EnumerationBinary|With|DataSection|Macro|Import|ImportC)\\b",
-    "decreaseIndentPattern": "^\\s*(EndIf|Else|ElseIf|Next|Wend|Until|EndSelect|Case|EndProcedure|EndStructure|EndInterface|EndEnumeration|EndWith|EndDataSection|EndMacro|EndImport)\\b"
+    "increaseIndentPattern": {
+      "pattern": "^\\s*(If|ElseIf|Else|ForEach|For|While|Repeat|Select|Case|Procedure(C|DLL|CDLL)?|Structure|Interface|Enumeration|EnumerationBinary|With|DataSection|Macro|Import|ImportC)\\b",
+      "flags": "i"
+    },
+    "decreaseIndentPattern": {
+      "pattern": "^\\s*(EndIf|Else|ElseIf|Next|Wend|Until|EndSelect|Case|EndProcedure|EndStructure|EndInterface|EndEnumeration|EndWith|EndDataSection|EndMacro|EndImport)\\b",
+      "flags": "i"
+    }
   },
   "folding": {
     "markers": {

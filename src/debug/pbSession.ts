@@ -1076,8 +1076,9 @@ export function compileAsync(
   compiler: string,
   args: string[],
   timeoutMs = DEFAULT_COMPILE_TIMEOUT_MS,
+  cwd?: string,
 ): { child: cp.ChildProcess; result: Promise<CompileResult> } {
-  const child = cp.spawn(compiler, args);
+  const child = cp.spawn(compiler, args, cwd ? { cwd } : undefined);
   const result = new Promise<CompileResult>((resolve) => {
     let stdout = "";
     let stderr = "";
