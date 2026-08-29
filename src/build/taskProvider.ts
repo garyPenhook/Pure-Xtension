@@ -2,7 +2,7 @@ import { ChildProcessWithoutNullStreams, spawn } from "child_process";
 import * as os from "os";
 import * as path from "path";
 import * as vscode from "vscode";
-import { Backend, resolveBackend, resolveCompilerPath } from "../config";
+import { Backend, resolveBackend, resolveBackendSilent, resolveCompilerPath } from "../config";
 import { PROBLEM_MATCHER_INCLUDE_NAME, PROBLEM_MATCHER_NAME } from "./problemMatcher";
 
 export const TASK_TYPE = "purebasic";
@@ -123,16 +123,8 @@ export class CompileExecution implements vscode.Pseudoterminal {
   }
 }
 
-async function buildTask(spec: TaskSpec, backend?: Backend, file?: string): Promise<vscode.Task | undefined> {
-  const sourceFile = file ?? activeFile();
-  if (!sourceFile) {
-    return undefined;
-  }
-  const resolvedBackend = backend ?? (await resolveBackend());
-  if (!resolvedBackend) {
-    return undefined;
-  }
-  const compilerPath = resolveCompilerPath(resolvedBackend);
+function buildTask(spec: TaskSpec, backend: Backend, sourceFile: string): vscode.Task | undefined {
+  const compilerPath = resolveCompilerPath(backend);
   if (!compilerPath) {
     return undefined;
   }
@@ -140,11 +132,11 @@ async function buildTask(spec: TaskSpec, backend?: Backend, file?: string): Prom
   const definition: PureBasicTaskDefinition = {
     type: TASK_TYPE,
     mode: spec.mode,
-    backend: resolvedBackend,
+    backend,
     file: sourceFile,
   };
 
-  const backendSuffix = resolvedBackend === "c" ? " (C backend)" : "";
+  const backendSuffix = backend === "c" ? " (C backend)" : "";
   const cwd = path.dirname(sourceFile);
   const task = new vscode.Task(
     definition,
@@ -161,10 +153,27 @@ async function buildTask(spec: TaskSpec, backend?: Backend, file?: string): Prom
 }
 
 export class PureBasicTaskProvider implements vscode.TaskProvider {
+  /**
+   * L6: VS Code calls provideTasks() for ordinary task discovery (e.g.
+   * populating the Run Task list) well before the user has asked to build
+   * anything, and used to call the interactive resolveBackend() once per
+   * task spec -- up to five consecutive backend-selection prompts on every
+   * cancelled pick, and an unsolicited prompt on plain discovery. Discovery
+   * now resolves the backend once, silently: an ambiguous auto-mode
+   * workspace with no persisted choice yet simply contributes no tasks here
+   * until the user resolves it explicitly, via pureXtension.selectBackend or
+   * the interactive build/run/check commands (see runTask() in
+   * extension.ts, which prompts at most once and then re-queries this).
+   */
   async provideTasks(): Promise<vscode.Task[]> {
+    const sourceFile = activeFile();
+    const backend = resolveBackendSilent();
+    if (!sourceFile || !backend) {
+      return [];
+    }
     const tasks: vscode.Task[] = [];
     for (const spec of TASK_SPECS) {
-      const task = await buildTask(spec);
+      const task = buildTask(spec, backend, sourceFile);
       if (task) {
         tasks.push(task);
       }
@@ -175,9 +184,18 @@ export class PureBasicTaskProvider implements vscode.TaskProvider {
   async resolveTask(task: vscode.Task): Promise<vscode.Task | undefined> {
     const definition = task.definition as PureBasicTaskDefinition;
     const spec = TASK_SPECS.find((s) => s.mode === (definition.mode ?? "build"));
-    if (!spec) {
+    const file = definition.file ?? activeFile();
+    if (!spec || !file) {
       return undefined;
     }
-    return buildTask(spec, definition.backend, definition.file);
+    // resolveTask() only fires for a task the user referenced directly (e.g.
+    // from tasks.json) -- an appropriate, one-shot moment to prompt if the
+    // definition didn't pin a backend, matching the debug launch's own
+    // resolveBackend() flow (CODE_REVIEW_TODO.md M13).
+    const backend = definition.backend ?? (await resolveBackend());
+    if (!backend) {
+      return undefined;
+    }
+    return buildTask(spec, backend, file);
   }
 }

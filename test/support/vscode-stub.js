@@ -45,7 +45,21 @@ module.exports = {
     showWarningMessage: async () => undefined,
     showErrorMessage: async () => undefined,
     showInformationMessage: async () => undefined,
-    showQuickPick: async () => undefined,
+    // L6 regression coverage (test/taskProvider.test.ts) counts calls here
+    // via globalThis -- shared with this same-process bundle even though
+    // esbuild inlines a separate copy of this file's source per bundle,
+    // because it's still one Node process/one V8 isolate at test run time.
+    showQuickPick: async () => {
+      globalThis.__pureXtensionTestQuickPickCalls = (globalThis.__pureXtensionTestQuickPickCalls ?? 0) + 1;
+      return undefined;
+    },
+    // Lets taskProvider.test.ts simulate an active editor (this bundle has
+    // no real one) without needing a full VS Code host: set
+    // globalThis.__pureXtensionTestActiveFile before calling in.
+    get activeTextEditor() {
+      const fsPath = globalThis.__pureXtensionTestActiveFile;
+      return fsPath ? { document: { uri: { fsPath } } } : undefined;
+    },
   },
   ConfigurationTarget: { Global: 1, Workspace: 2, WorkspaceFolder: 3 },
   EventEmitter,

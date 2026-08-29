@@ -1,5 +1,5 @@
 import * as vscode from "vscode";
-import { invalidateHomeCache, selectBackendCommand } from "./config";
+import { invalidateHomeCache, resolveBackend, selectBackendCommand } from "./config";
 import { PureBasicDiagnostics } from "./build/diagnostics";
 import { createStatusBar } from "./build/statusBar";
 import { PureBasicTaskProvider, TASK_TYPE } from "./build/taskProvider";
@@ -52,8 +52,23 @@ async function openHelpForSymbol(): Promise<void> {
 }
 
 async function runTask(mode: "build" | "buildRun" | "check"): Promise<void> {
-  const tasks = await vscode.tasks.fetchTasks({ type: TASK_TYPE });
-  const task = tasks.find((t) => (t.definition as { mode?: string }).mode === mode);
+  let tasks = await vscode.tasks.fetchTasks({ type: TASK_TYPE });
+  let task = tasks.find((t) => (t.definition as { mode?: string }).mode === mode);
+  if (!task) {
+    // L6: provideTasks() only resolves the backend silently now, so an
+    // ambiguous auto-mode workspace with nothing persisted yet won't have
+    // contributed any tasks for fetchTasks() to find above. This is the
+    // right place for the one interactive prompt build/run/check promise --
+    // an explicit user action, not passive task discovery. resolveBackend()
+    // persists a real choice to workspace settings, so the re-fetch below
+    // picks it up the same way debug launches already do (M13).
+    const backend = await resolveBackend();
+    if (!backend) {
+      return;
+    }
+    tasks = await vscode.tasks.fetchTasks({ type: TASK_TYPE });
+    task = tasks.find((t) => (t.definition as { mode?: string }).mode === mode);
+  }
   if (!task) {
     vscode.window.showErrorMessage(
       "Pure Xtension: no PureBasic compiler found. Set pureXtension.purebasicHome or pureXtension.compilerPath.*.",
