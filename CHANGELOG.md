@@ -1,5 +1,40 @@
 # Changelog
 
+## 0.1.15
+
+- Fixed: a debug session that ran to completion on its own (without the user
+  explicitly stopping it) left its compiled binary and FIFO pair behind on
+  disk -- cleanup now runs on every termination path, not just an explicit
+  disconnect.
+- Fixed: a debug launch with an ambiguous auto-detected compiler backend
+  silently defaulted to the ASM backend instead of prompting, so a debug
+  build could use a different backend than the rest of the workspace.
+- Fixed: the online-help command index cache could be overwritten with an
+  empty or truncated result if purebasic.com's page layout changed or a
+  refresh was interrupted -- a bad refresh now falls back to the last known
+  -good cache, and cache writes are atomic.
+- Fixed: the built-in symbol cache was trusted after checking only its
+  compiler version, so a corrupted cache file could later throw inside
+  completion or hover instead of triggering a rebuild -- the full cache
+  shape is now validated, cache writes are atomic, and a forced rebuild no
+  longer races an already-running load.
+- Fixed: an `IncludeFile` path containing `#`, `?`, or other URI-reserved
+  characters could resolve go-to-definition/hover to the wrong file, due to
+  a hand-rolled URI encoder -- now uses the same URI library VS Code itself
+  relies on. A legitimately deep include chain (more than 8 files) no
+  longer silently loses symbols either.
+- Fixed: cancelling the compiler-backend picker during ordinary task
+  discovery (not just an explicit build) could show up to five consecutive
+  prompts, and discovery itself could prompt unsolicited before the user
+  asked to build anything -- task discovery is now silent, and the
+  interactive picker appears at most once, only when actually building.
+- Fixed: a task whose compiler failed to spawn (e.g. a missing executable)
+  could report its own exit twice.
+- Fixed: editor auto-indent for `If`/`EndIf`, `Procedure`/`EndProcedure`,
+  etc. only matched exact-case keywords; matching is now case-insensitive.
+- Security: bumped transitive `diff`/`serialize-javascript` (pulled in by
+  the dev-only `mocha` dependency) past their known advisories.
+
 ## 0.1.14
 
 - Fixed: a compiler error reported inside an `XIncludeFile`d file could be
