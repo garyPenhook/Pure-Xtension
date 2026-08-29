@@ -78,6 +78,7 @@ suite("Configuration-change language client restart", () => {
 
     const config = vscode.workspace.getConfiguration("pureXtension");
     const original = config.get<string>("compilerPath.asm");
+    const originalBackend = config.get<string>("backend");
 
     // fs.existsSync() is all resolveCompilerPath() checks -- these don't need
     // to be real compilers, just present on disk, so the test doesn't depend
@@ -90,6 +91,16 @@ suite("Configuration-change language client restart", () => {
 
     try {
       const before = exports.getRestartCount();
+
+      // Pin the backend explicitly: on a machine with both the ASM and C
+      // backends actually installed (live-confirmed on this runner),
+      // overriding only compilerPath.asm still leaves resolveBackendSilent()
+      // ambiguous (the real, auto-detected C compiler is still resolvable),
+      // so the client's compilerPath came back undefined instead of either
+      // fake path -- the launch/build backend-selection ambiguity (M13)
+      // has nothing to do with this restart-queue's own logic, so pin it
+      // out rather than let it depend on what happens to be installed.
+      await config.update("backend", "asm", vscode.ConfigurationTarget.Workspace);
 
       // Deliberately not awaited between the two updates: the second change
       // should land while the restart triggered by the first is still
@@ -119,6 +130,7 @@ suite("Configuration-change language client restart", () => {
       );
     } finally {
       await config.update("compilerPath.asm", original, vscode.ConfigurationTarget.Workspace);
+      await config.update("backend", originalBackend, vscode.ConfigurationTarget.Workspace);
       fs.rmSync(dir, { recursive: true, force: true });
     }
   });
