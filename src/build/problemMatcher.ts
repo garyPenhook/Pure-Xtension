@@ -70,3 +70,8 @@ export function toDiagnostic(document: vscode.TextDocument, problem: ParsedProbl
 
 /** Shell-facing problem matcher name, must match the one declared in package.json. */
 export const PROBLEM_MATCHER_NAME = "$purebasic";
+
+/** Matches the two-line `Error: in included file '...'` / `Line N - message`
+ * form (see INCLUDE_HEADER_PATTERN above); PureBasic never emits it on the
+ * same line as the message, so it needs its own contributed matcher. */
+export const PROBLEM_MATCHER_INCLUDE_NAME = "$purebasic-include";

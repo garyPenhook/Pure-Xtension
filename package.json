@@ -2,7 +2,7 @@
   "name": "pure-xtension",
   "displayName": "Pure Xtension",
   "description": "PureBasic language support for VS Code: syntax highlighting, IntelliSense, build tasks, deep help integration, and debugging.",
-  "version": "0.1.12",
+  "version": "0.1.13",
   "publisher": "local",
   "icon": "images/icon.png",
   "private": true,
@@ -225,6 +225,24 @@
             "loop": true
           }
         ]
+      },
+      {
+        "name": "purebasic-include",
+        "owner": "purebasic",
+        "applyTo": "allDocuments",
+        "fileLocation": "absolute",
+        "pattern": [
+          {
+            "regexp": "^(Error|Warning): in included file '(.*)'$",
+            "severity": 1,
+            "file": 2
+          },
+          {
+            "regexp": "^Line (\\d+) - (.*)$",
+            "line": 1,
+            "message": 2
+          }
+        ]
       }
     ],
     "breakpoints": [
@@ -288,6 +306,10 @@
                   "type": "string"
                 },
                 "default": []
+              },
+              "noDebug": {
+                "type": "boolean",
+                "description": "Set by VS Code when launching via 'Run Without Debugging'. Not currently supported by this debugger; the target always runs under the debug protocol."
               }
             }
           }

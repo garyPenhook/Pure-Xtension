@@ -7,8 +7,8 @@ const { problemMatchersForTask } = nodeRequire("../../out-test/taskProvider.cjs"
   problemMatchersForTask(mode: "build" | "buildRun" | "check" | "buildDebug" | "buildConsole"): string[];
 };
 
-test("every compiler task mode attaches the PureBasic problem matcher", () => {
+test("every compiler task mode attaches both the main-file and included-file problem matchers", () => {
   for (const mode of ["build", "buildRun", "check", "buildDebug", "buildConsole"] as const) {
-    assert.deepEqual(problemMatchersForTask(mode), ["$purebasic"], mode);
+    assert.deepEqual(problemMatchersForTask(mode), ["$purebasic", "$purebasic-include"], mode);
   }
 });

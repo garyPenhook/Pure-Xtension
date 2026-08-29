@@ -4,6 +4,7 @@ import { PureBasicDiagnostics } from "./build/diagnostics";
 import { createStatusBar } from "./build/statusBar";
 import { PureBasicTaskProvider, TASK_TYPE } from "./build/taskProvider";
 import {
+  getLastCompilerPath,
   HelpEntry,
   rebuildHelpIndexCommand,
   rebuildSymbolCacheCommand,
@@ -66,6 +67,7 @@ async function runTask(mode: "build" | "buildRun" | "check"): Promise<void> {
  *  internal restart behavior without reaching into module-private state. */
 export interface PureXtensionExports {
   getRestartCount(): number;
+  getLastCompilerPath(): string | undefined;
 }
 
 export function activate(context: vscode.ExtensionContext): PureXtensionExports {
@@ -83,12 +85,33 @@ export function activate(context: vscode.ExtensionContext): PureXtensionExports 
   // and startLanguageClient() races on module-level state in client.ts
   // (stop the old client, then set the shared `client` var) — two concurrent
   // calls can interleave and leave a second, orphaned server running.
+  //
+  // configGeneration tracks every requested restart. If a new request comes
+  // in while one is already running, startLanguageClient() has already read
+  // the pre-change configuration, so the in-flight restart loops once more
+  // after it finishes instead of leaving the server on stale settings.
   let restartInFlight: Promise<void> | undefined;
+  let configGeneration = 0;
   async function restartLanguageClient(): Promise<void> {
+    configGeneration++;
     if (restartInFlight) return restartInFlight;
     restartInFlight = (async () => {
-      await startLanguageClient(context);
-      helpTree.refresh();
+      for (;;) {
+        const generation = configGeneration;
+        try {
+          await startLanguageClient(context);
+          helpTree.refresh();
+        } catch (error) {
+          // A newer request already arrived (e.g. client.stop()'s own
+          // shutdown timeout tripped) -- surface the failure but keep
+          // looping so that generation isn't dropped on the floor. Only
+          // reject the caller when nothing newer is queued behind us.
+          if (generation === configGeneration) throw error;
+          vscode.window.showErrorMessage(`Pure Xtension: ${String(error)}`);
+          continue;
+        }
+        if (generation === configGeneration) return;
+      }
     })().finally(() => {
       restartInFlight = undefined;
     });
@@ -149,9 +172,11 @@ export function activate(context: vscode.ExtensionContext): PureXtensionExports 
     diagnostics.scheduleCheck(editor.document);
   }
 
-  void restartLanguageClient();
+  restartLanguageClient().catch((error) =>
+    vscode.window.showErrorMessage(`Pure Xtension: ${String(error)}`),
+  );
 
-  return { getRestartCount: () => restartCount };
+  return { getRestartCount: () => restartCount, getLastCompilerPath };
 }
 
 export async function deactivate(): Promise<void> {

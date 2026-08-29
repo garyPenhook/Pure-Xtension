@@ -9,12 +9,24 @@ export function getClient(): LanguageClient | undefined {
   return client;
 }
 
+// Tracks the compilerPath computed on the most recent startLanguageClient()
+// call, i.e. what the last-constructed client's initializationOptions carried
+// (or would have, had a compiler resolved). Exposed for integration tests
+// that need to confirm a queued restart converges on the latest configuration
+// rather than a superseded one (see CODE_REVIEW_TODO.md M11).
+let lastCompilerPath: string | undefined;
+
+export function getLastCompilerPath(): string | undefined {
+  return lastCompilerPath;
+}
+
 /** Starts (or restarts) the PureBasic language server, if a compiler is resolvable. */
 export async function startLanguageClient(context: vscode.ExtensionContext): Promise<void> {
   await stopLanguageClient();
 
   const backend = resolveBackendSilent();
   const compilerPath = backend ? resolveCompilerPath(backend) : undefined;
+  lastCompilerPath = compilerPath;
   if (!compilerPath) {
     // No compiler resolved yet (or backend choice is ambiguous) — IntelliSense
     // stays off until a build/check picks a backend; language basics still work.

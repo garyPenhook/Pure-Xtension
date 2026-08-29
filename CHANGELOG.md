@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.1.13
+
+- Fixed: launching via "Run Without Debugging" (or any launch config carrying
+  `noDebug`) was rejected with "Property noDebug is not allowed" -- the
+  `purebasic` launch schema now declares it, since this debugger always runs
+  under the debug protocol regardless of that flag.
+- Fixed: a compiler error reported inside an `XIncludeFile`d file during a
+  build/check/debug/console task was silently dropped from the Problems
+  panel instead of being attached to that included file, because the
+  contributed task problem matcher only understood the single-line format
+  used for errors in the file actually passed to the compiler. A second
+  matcher now covers PureBasic's two-line included-file error format.
+- Changed: language-server restarts triggered by rapid, back-to-back
+  configuration changes (compiler path, PureBasic home, backend) no longer
+  risk leaving the server on a superseded configuration -- a restart that
+  arrives while one is already in flight is now queued instead of dropped.
+
 ## 0.1.12
 
 - Fixed: a hung or unresponsive `gdb` process could freeze "Force Pause"

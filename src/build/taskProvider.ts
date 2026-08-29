@@ -3,7 +3,7 @@ import * as os from "os";
 import * as path from "path";
 import * as vscode from "vscode";
 import { Backend, resolveBackend, resolveCompilerPath } from "../config";
-import { PROBLEM_MATCHER_NAME } from "./problemMatcher";
+import { PROBLEM_MATCHER_INCLUDE_NAME, PROBLEM_MATCHER_NAME } from "./problemMatcher";
 
 export const TASK_TYPE = "purebasic";
 
@@ -26,11 +26,15 @@ interface TaskSpec {
 }
 
 /** Every contributed task invokes the compiler, so all compiler output must
- * be routed through the same matcher regardless of whether it also runs the
- * resulting executable. Kept as a function to make the task-mode contract
- * directly testable without executing a compiler. */
+ * be routed through the same matchers regardless of whether it also runs the
+ * resulting executable. Two matchers are attached because PureBasic reports a
+ * problem in the compiled file on one line but a problem in an XIncludeFile'd
+ * file as its own two-line block (see problemMatcher.ts); each format needs
+ * its own contributed pattern; VS Code applies both to the same output and
+ * only the one that matches produces a diagnostic. Kept as a function to make
+ * the task-mode contract directly testable without executing a compiler. */
 export function problemMatchersForTask(_mode: NonNullable<PureBasicTaskDefinition["mode"]>): string[] {
-  return [PROBLEM_MATCHER_NAME];
+  return [PROBLEM_MATCHER_NAME, PROBLEM_MATCHER_INCLUDE_NAME];
 }
 
 const TASK_SPECS: TaskSpec[] = [

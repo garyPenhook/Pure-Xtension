@@ -10,6 +10,7 @@ export async function run(): Promise<void> {
   mocha.addFile(path.resolve(__dirname, "hoverFirstRequest.test.js"));
   mocha.addFile(path.resolve(__dirname, "debugSession.test.js"));
   mocha.addFile(path.resolve(__dirname, "configRestart.test.js"));
+  mocha.addFile(path.resolve(__dirname, "taskProblemMatcher.test.js"));
 
   try {
     await new Promise<void>((resolve, reject) => {
