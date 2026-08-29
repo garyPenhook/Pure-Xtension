@@ -79,6 +79,16 @@ suite("Real VS Code debug session (purebasic)", () => {
         name: "integration test launch",
         program: programPath,
         stopOnEntry: false,
+        // Explicit, not auto: on a machine with both the ASM and C backends
+        // installed (this runner included) and no persisted
+        // pureXtension.backend setting, an unspecified backend hits
+        // launchRequest()'s interactive resolveBackend() picker (M13) --
+        // which the real test extension host's DialogService refuses to
+        // show, resolving to undefined and cleanly cancelling the launch
+        // instead of ever reaching a breakpoint. Live-confirmed on this
+        // runner: "Pure Xtension: no PureBasic compiler backend selected —
+        // debug launch cancelled."
+        backend: "asm",
       });
       assert.ok(started, "vscode.debug.startDebugging returned false");
 
