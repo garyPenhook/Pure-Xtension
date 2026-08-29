@@ -105,6 +105,16 @@ const DATA_BREAKPOINT_FIXTURE_LINES = [
   'Debug "done"', // 7
 ];
 
+// Fixture for the L4 natural-termination cleanup test below: stops once so
+// the test can confirm the temp dirs exist while the session is live, then
+// runs straight to `End` so the target exits on its own -- no disconnect.
+const NATURAL_EXIT_FIXTURE_LINES = [
+  "Global x.i = 1", // 1 <-- breakpoint
+  "x = x + 1", // 2
+  "End", // 3
+];
+const NATURAL_EXIT_BP = 1;
+
 // Fixture for the per-type decode test below (PLAN.md M12): one Protected
 // local of several different PureBasic scalar types, deliberately with a
 // String in the middle rather than last -- before the per-type fix, a
@@ -153,6 +163,7 @@ let dataBreakpointProgram = "";
 let typesProgram = "";
 let includeMainProgram = "";
 let includeSourceProgram = "";
+let naturalExitProgram = "";
 if (compiler) {
   fixtureDir = fs.mkdtempSync(path.join(os.tmpdir(), "pure-xtension-e2e-"));
   program = path.join(fixtureDir, "fixture.pb");
@@ -168,6 +179,8 @@ if (compiler) {
   fs.mkdirSync(path.dirname(includeSourceProgram), { recursive: true });
   fs.writeFileSync(includeMainProgram, INCLUDE_MAIN_LINES.join("\n") + "\n");
   fs.writeFileSync(includeSourceProgram, INCLUDE_SOURCE_LINES.join("\n") + "\n");
+  naturalExitProgram = path.join(fixtureDir, "natural-exit.pb");
+  fs.writeFileSync(naturalExitProgram, NATURAL_EXIT_FIXTURE_LINES.join("\n") + "\n");
 }
 
 after(() => {
@@ -527,6 +540,58 @@ test("evaluate on an unresolvable expression is quiet for hover/watch but a real
     // A user deliberately typing an expression into the Debug Console
     // still gets a real error response.
     await assert.rejects(dc.evaluateRequest({ expression: "notAVariable", context: "repl" }), /not found/i);
+  } finally {
+    await dc.stop();
+  }
+});
+
+test("temp binary and FIFO dirs are removed when the target exits naturally, without an explicit disconnect", { skip }, async () => {
+  const artifactDirs = () =>
+    fs
+      .readdirSync(os.tmpdir())
+      .filter((f) => f.startsWith("pure-xtension-debug-") || f.startsWith("pure-xtension-fifo-"));
+  const before = new Set(artifactDirs());
+
+  const dc = new DebugClient("node", ADAPTER, "purebasic");
+  dc.defaultTimeout = 30000;
+  await dc.start();
+  try {
+    await Promise.all([
+      dc.waitForEvent("initialized").then(() =>
+        dc
+          .setBreakpointsRequest({
+            source: { path: naturalExitProgram },
+            breakpoints: [{ line: NATURAL_EXIT_BP }],
+            lines: [NATURAL_EXIT_BP],
+          })
+          .then(() => dc.configurationDoneRequest()),
+      ),
+      dc.launch({ program: naturalExitProgram, backend: "asm", stopOnEntry: false }),
+      dc.assertStoppedLocation("breakpoint", { path: naturalExitProgram, line: NATURAL_EXIT_BP }),
+    ]);
+
+    // Confirm the compile-output/FIFO temp dirs this launch created actually
+    // exist while the session is live -- otherwise the "gone after exit"
+    // check below would trivially pass for the wrong reason.
+    const created = artifactDirs().filter((f) => !before.has(f));
+    assert.ok(
+      created.length >= 2,
+      `expected a debug-build dir and a FIFO dir to exist while stopped at a breakpoint (saw: ${created.join(", ") || "none"})`,
+    );
+
+    // No disconnectRequest here -- Continue runs the target straight into
+    // `End`, so the child process exits on its own. Before L4, only
+    // disconnectRequest (and pre-connect launch failures) ever cleaned these
+    // up, so a session that simply finished running leaked its compiled
+    // binary and FIFO pair on every run.
+    await Promise.all([dc.continueRequest({ threadId: MAIN_THREAD_ID }), dc.waitForEvent("terminated")]);
+
+    for (const dir of created) {
+      assert.ok(
+        !fs.existsSync(path.join(os.tmpdir(), dir)),
+        `${dir} should have been removed once the target exited naturally`,
+      );
+    }
   } finally {
     await dc.stop();
   }

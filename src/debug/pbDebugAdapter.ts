@@ -373,6 +373,17 @@ export class PureBasicDebugSession extends DebugSession {
     // this, a target that exits while the timer is still pending would leave
     // it to fire later against a dead (or, worse, OS-reused) pid.
     this.cancelForcePauseFallback();
+    // L4: this is the single choke point every termination path funnels
+    // through -- the target exiting on its own (child "exit"), the wire
+    // closing (pb "terminated"/"close"), and an explicit disconnectRequest
+    // all reach here exactly once thanks to the guard above. Before this,
+    // only disconnectRequest and the pre-connect launch error paths cleaned
+    // up workDir/fifoDir, so a target that simply ran to completion (never
+    // disconnected) leaked its compiled binary and FIFO pair on every run.
+    // Safe to unlink here even though this.child may still be mid-exit: on
+    // Linux, removing a directory entry doesn't disturb a process's already
+    // -open file descriptors into it.
+    this.cleanupTempDirs();
     this.sendEvent(new TerminatedEvent());
   }
 
@@ -1708,7 +1719,8 @@ export class PureBasicDebugSession extends DebugSession {
     // Without this, that compiler process would keep running orphaned after
     // the session it belongs to is gone.
     this.compileChild?.kill("SIGKILL");
-    this.cleanupTempDirs();
+    // notifyTerminated() above already ran cleanupTempDirs(); no separate
+    // call needed here.
     this.sendResponse(response);
   }
 }
