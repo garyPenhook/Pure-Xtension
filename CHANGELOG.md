@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.1.14
+
+- Fixed: a compiler error reported inside an `XIncludeFile`d file could be
+  duplicated in the Problems panel, or briefly flicker between one and two
+  entries, because opening that included file (purely to compute the
+  diagnostic's range) fired VS Code's own document-open event, which
+  recursively scheduled a second, independent check that treated the
+  include as its own main file and reported the same problem again under a
+  separate ownership record.
+
 ## 0.1.13
 
 - Fixed: launching via "Run Without Debugging" (or any launch config carrying

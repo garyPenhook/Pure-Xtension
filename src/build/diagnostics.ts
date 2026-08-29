@@ -18,6 +18,19 @@ export class PureBasicDiagnostics implements vscode.Disposable {
    *  check for the same document started (and will finish) after it, so it
    *  can drop its own now-stale results instead of overwriting them. */
   private readonly generations = new DiagnosticGenerations();
+  /** URIs currently being opened by check() itself, purely to read an
+   * included file's text for diagnostic-range placement (via toDiagnostic()).
+   * vscode.workspace.openTextDocument() fires onDidOpenTextDocument
+   * synchronously before its own returned promise settles, and
+   * extension.ts's listener forwards that straight into scheduleCheck() --
+   * without this guard, opening an errored include here recursively schedules
+   * a second, independent check that treats the include as its own main
+   * document, misattributing a duplicate diagnostic under a second ownership
+   * key that this class's own merge-by-owner logic then concatenates rather
+   * than dedupes. Reference-counted so two concurrent check() calls opening
+   * the same shared include don't let one's cleanup unsuppress the other's
+   * still-pending open. */
+  private readonly openingForDiagnostics = new Map<string, number>();
 
   constructor() {
     this.collection = vscode.languages.createDiagnosticCollection("purebasic");
@@ -33,6 +46,9 @@ export class PureBasicDiagnostics implements vscode.Disposable {
 
   scheduleCheck(document: vscode.TextDocument): void {
     if (document.languageId !== "purebasic" || document.uri.scheme !== "file") {
+      return;
+    }
+    if (this.openingForDiagnostics.has(document.uri.toString())) {
       return;
     }
     const key = document.uri.toString();
@@ -112,10 +128,19 @@ export class PureBasicDiagnostics implements vscode.Disposable {
       const targetUri = vscode.Uri.file(targetPath);
       let targetDoc = document;
       if (targetPath !== document.fileName) {
+        const targetKey = targetUri.toString();
+        this.openingForDiagnostics.set(targetKey, (this.openingForDiagnostics.get(targetKey) ?? 0) + 1);
         try {
           targetDoc = await vscode.workspace.openTextDocument(targetUri);
         } catch {
           continue; // included file not readable — drop the diagnostic rather than guess a range
+        } finally {
+          const count = (this.openingForDiagnostics.get(targetKey) ?? 1) - 1;
+          if (count <= 0) {
+            this.openingForDiagnostics.delete(targetKey);
+          } else {
+            this.openingForDiagnostics.set(targetKey, count);
+          }
         }
         // Loading an include is asynchronous too. Do not let an old compiler
         // run publish after a save, close, or newer check while it was open.
