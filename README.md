@@ -51,7 +51,7 @@ debugger.
   auto-detected, with a one-time prompt if both are available.
 
 ### Deep help integration
-- Hover cards and `F1` open the matching page on purebasic.com for the
+- Hover cards and `Shift+F1` open the matching page on purebasic.com for the
   built-in function, structure, interface, or language keyword under the
   cursor, rendered in a sandboxed in-editor webview.
 - A searchable **Help browser** in the Explorer sidebar, organized by library
@@ -110,7 +110,7 @@ suite cannot be mistaken for Electron's successful exit.
 - **Pure Xtension: Select Compiler Backend**
 - **Pure Xtension: Rebuild Symbol Cache**
 - **Pure Xtension: Refresh Help Index from purebasic.com**
-- **Pure Xtension: Open Help for Symbol Under Cursor** (bound to `F1`)
+- **Pure Xtension: Open Help for Symbol Under Cursor** (bound to `Shift+F1`)
 - **Pure Xtension: Search Help**
 
 ## Debugging a program

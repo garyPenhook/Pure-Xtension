@@ -100,7 +100,7 @@ export async function resolveHelpUrl(symbol: string): Promise<string | undefined
     return result.url;
   } catch {
     // A crashed/restarting server shouldn't surface a raw error toast for a
-    // hover/F1 lookup — callers already treat undefined as "no docs found".
+    // hover/Shift+F1 lookup — callers already treat undefined as "no docs found".
     return undefined;
   }
 }
