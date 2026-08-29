@@ -40,6 +40,9 @@ import {
   makeDebuggerLine,
   splitDebuggerLine,
   shouldRefuseUnvalidatedPlatformLaunch,
+  debugCompileFlags,
+  shouldUseTcpTransport,
+  toWinePath,
   splitHandshakeFrame,
   unstickFifoRendezvous,
   type PbMessage,
@@ -695,6 +698,33 @@ test("shouldRefuseUnvalidatedPlatformLaunch refuses normal Windows and macOS lau
 test("shouldRefuseUnvalidatedPlatformLaunch retains the internal transport override", () => {
   assert.equal(shouldRefuseUnvalidatedPlatformLaunch("win32", "tcp"), false);
   assert.equal(shouldRefuseUnvalidatedPlatformLaunch("darwin", "fifo"), false);
+});
+
+test("debugCompileFlags includes -ds only on Linux, where the compiler actually accepts it", () => {
+  // Confirmed against a real Windows PureBasic 6.41 install (under Wine):
+  // -ds is rejected there ("-ds: Unknown switch"), unlike Linux's compiler,
+  // which lists it as a cross-platform flag.
+  assert.deepEqual(debugCompileFlags("linux"), ["-d", "-ds", "-l"]);
+  assert.deepEqual(debugCompileFlags("win32"), ["-d", "-l"]);
+  assert.deepEqual(debugCompileFlags("darwin"), ["-d", "-l"]);
+});
+
+test("shouldUseTcpTransport selects TCP on Windows and FIFO elsewhere by default", () => {
+  assert.equal(shouldUseTcpTransport("win32", undefined), true);
+  assert.equal(shouldUseTcpTransport("linux", undefined), false);
+  assert.equal(shouldUseTcpTransport("darwin", undefined), false);
+});
+
+test("shouldUseTcpTransport still honors an explicit test-only override on any platform", () => {
+  assert.equal(shouldUseTcpTransport("linux", "tcp"), true);
+  assert.equal(shouldUseTcpTransport("win32", "fifo"), false);
+});
+
+test("toWinePath converts a Linux absolute path to Wine's Z: drive form", () => {
+  // Live-confirmed against a real Wine + Windows PureBasic install: the
+  // compiler's own Init message reports its source root back in exactly
+  // this form (e.g. "Z:\\home\\gary\\pb-windows-test\\").
+  assert.equal(toWinePath("/home/gary/project/test.pb"), "Z:\\home\\gary\\project\\test.pb");
 });
 
 test("allocateFreeTcpPort returns a port that can actually be bound", async () => {

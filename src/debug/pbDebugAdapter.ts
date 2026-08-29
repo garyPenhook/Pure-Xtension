@@ -24,6 +24,7 @@ import {
   DBP_COULD_NOT_ADD,
   DBP_EVAL_ERROR,
   DBP_TRUE,
+  debugCompileFlags,
   DEFAULT_COMPILE_TIMEOUT_MS,
   parseCompilerVersionBanner,
   PbDataBreakpointEvent,
@@ -34,13 +35,21 @@ import {
   PbVariable,
   parseIncludedSources,
   shouldRefuseUnvalidatedPlatformLaunch,
+  shouldUseTcpTransport,
   STOP_REASON_DATA_BREAKPOINT,
   STRING_TYPE_TAG,
+  toWinePath,
   unstickFifoRendezvous,
 } from "./pbSession";
 import { GdbMiPtraceEngine, gdbEngineAvailable } from "./ptraceEngine";
 
 const MAIN_THREAD_ID = 1;
+/** A `-v` version probe should return almost instantly (confirmed on both
+ *  Linux and under a real Windows install via Wine); bounding it far below
+ *  DEFAULT_COMPILE_TIMEOUT_MS (a real multi-file build's budget) means a
+ *  hung compiler/exeRunner fails fast here instead of stalling the launch
+ *  for up to two full build timeouts back to back. */
+const VERSION_PROBE_TIMEOUT_MS = 10_000;
 /** Bounded wait for the cooperative wire pause (opcode 0) before falling back
  * to a GDB attach (see armForcePauseFallback()). The launch/dispose and
  * attach/detach regression tests in test/ptraceEngine.test.ts complete in
@@ -103,13 +112,56 @@ interface LaunchArgs extends DebugProtocol.LaunchRequestArguments {
   stopOnEntry?: boolean;
   backend?: Backend;
   compilerArgs?: string[];
-  /** Internal/test-only override of the automatic FIFO(non-Windows)/
-   *  TCP(Windows) transport selection. Not declared in package.json's launch
-   *  config schema and never documented user-facing -- it exists purely so
-   *  the local e2e suite can exercise the TCP/NetworkServer path on Linux,
-   *  since there's no Windows machine here to make process.platform pick it
-   *  naturally. */
+  /** Internal/test-only override of the automatic FIFO(POSIX)/TCP(Windows)
+   *  transport selection (see shouldUseTcpTransport()). Not declared in
+   *  package.json's launch config schema and never documented user-facing
+   *  -- it exists purely so the local e2e suite can exercise the
+   *  TCP/NetworkServer path on Linux too, not just on a real win32 host.
+   *  Only honored when testOnlyLaunchHooks() gates it on -- see there. */
   transport?: "fifo" | "tcp";
+  /** Internal/test-only: prefixes both the compiler invocation and the
+   *  compiled target's own invocation with this command (e.g. "wine"). Not
+   *  declared in package.json's launch config schema and never documented
+   *  user-facing -- it exists purely so the e2e suite can exercise a real
+   *  Windows PureBasic install (compiler + compiled target binary) under
+   *  Wine from this non-Windows host, without this codebase ever needing to
+   *  know about Wine on a genuine Windows or Linux launch. Only honored
+   *  when testOnlyLaunchHooks() gates it on -- see there. */
+  exeRunner?: string;
+  /** Internal/test-only override of the resolved compiler path. Not declared
+   *  in package.json's launch config schema and never documented
+   *  user-facing -- the standalone e2e adapter build's vscode-stub always
+   *  returns resolveCompilerPath()'s caller-supplied default for any
+   *  configuration lookup, so it has no way to point at a specific compiler
+   *  (e.g. a real Windows PureBasic install under Wine) other than through
+   *  this. Only honored when testOnlyLaunchHooks() gates it on -- see there. */
+  compilerPath?: string;
+}
+
+/**
+ * These three launch args exist purely for this repo's own e2e test harness
+ * and were never meant to be reachable from a real launch.json -- but
+ * nothing about DebugConfigurationProvider.resolveDebugConfiguration()
+ * strips unknown properties, and VS Code passes a workspace's launch.json
+ * through to the adapter as-is. Once a user has granted Workspace Trust
+ * (this extension doesn't declare untrustedWorkspaces support, so it's
+ * disabled by default until then), a launch.json committed by a third party
+ * could otherwise set `exeRunner`/`compilerPath` to spawn an arbitrary
+ * command via an ordinary debug launch. Gating all three behind an env var
+ * only this repo's own test runs ever set closes that gap without touching
+ * the (undocumented but pre-existing) exposure any other way.
+ */
+function testOnlyLaunchHooks(args: LaunchArgs): Pick<LaunchArgs, "transport" | "exeRunner" | "compilerPath"> {
+  if (process.env.PURE_XTENSION_E2E_TEST_HOOKS !== "1") return {};
+  return { transport: args.transport, exeRunner: args.exeRunner, compilerPath: args.compilerPath };
+}
+
+/** exeRunner (test-only) prefixes a command with a wrapper (e.g. "wine")
+ *  and shifts the real command down into argv[0] -- used identically for
+ *  the compile, version-probe, and target-spawn invocations below so none
+ *  of the three has to know about Wine on a genuine launch. */
+function wrapForExeRunner(exeRunner: string | undefined, command: string, args: string[]): { command: string; args: string[] } {
+  return exeRunner ? { command: exeRunner, args: [command, ...args] } : { command, args };
 }
 
 /**
@@ -470,10 +522,11 @@ export class PureBasicDebugSession extends DebugSession {
     let responseSent = false;
     try {
     this.sourcePath = this.canonicalSourcePath(args.program);
+    const testHooks = testOnlyLaunchHooks(args);
     // Linux is the only platform with a complete, real-machine debugger
     // validation pass. `transport` is deliberately an undocumented test hook
     // (used to exercise NetworkServer on Linux); it may opt out of this gate.
-    if (shouldRefuseUnvalidatedPlatformLaunch(process.platform, args.transport)) {
+    if (shouldRefuseUnvalidatedPlatformLaunch(process.platform, testHooks.transport)) {
       this.sendErrorResponse(
         response,
         1006,
@@ -497,7 +550,7 @@ export class PureBasicDebugSession extends DebugSession {
       );
       return;
     }
-    const compiler = resolveCompilerPath(backend);
+    const compiler = testHooks.compilerPath ?? resolveCompilerPath(backend);
     if (!compiler) {
       this.sendErrorResponse(response, 1001, "Pure Xtension: no PureBasic compiler found for the selected backend.");
       return;
@@ -505,7 +558,18 @@ export class PureBasicDebugSession extends DebugSession {
 
     this.workDir = fs.mkdtempSync(path.join(os.tmpdir(), "pure-xtension-debug-"));
     const outBinary = path.join(this.workDir, "target.bin");
-    const compileArgs = ["-d", "-ds", "-l", "-o", outBinary, ...(args.compilerArgs ?? []), args.program];
+    // exeRunner (test-only) means the compiler and target are a genuine
+    // Windows PureBasic install running under Wine on this non-Windows
+    // host -- the Windows-specific compile flags apply regardless of the
+    // real process.platform in that case. The compiler's own -o/source-file
+    // arguments (parsed by the Windows PE compiler process itself) need
+    // Wine's Z: path form; outBinary/args.program stay plain Linux paths
+    // everywhere else this adapter uses them (source identity, breakpoints,
+    // frames) -- see toWinePath()'s doc comment.
+    const effectivePlatform = testHooks.exeRunner ? "win32" : process.platform;
+    const outBinaryArg = testHooks.exeRunner ? toWinePath(outBinary) : outBinary;
+    const programArg = testHooks.exeRunner ? toWinePath(args.program) : args.program;
+    const compileArgs = [...debugCompileFlags(effectivePlatform), "-o", outBinaryArg, ...(args.compilerArgs ?? []), programArg];
     // H4: spawnSync used to block the entire extension host -- all UI, all
     // other requests -- for however long the compile took, with no timeout
     // and no way to cancel a stalled compiler. compileAsync() hands back the
@@ -517,9 +581,10 @@ export class PureBasicDebugSession extends DebugSession {
     // inheriting the extension host's own cwd means that leftover file is
     // cleaned up by cleanupTempDirs() like every other debug-build artifact,
     // rather than appearing in whatever directory the extension host started in.
+    const compileInvocation = wrapForExeRunner(testHooks.exeRunner, compiler, compileArgs);
     const { child: compileChild, result: compileResultPromise } = compileAsync(
-      compiler,
-      compileArgs,
+      compileInvocation.command,
+      compileInvocation.args,
       DEFAULT_COMPILE_TIMEOUT_MS,
       this.workDir,
     );
@@ -545,9 +610,7 @@ export class PureBasicDebugSession extends DebugSession {
       this.logError(err);
     }
 
-    // The transport override is internal-only. Only an explicit "fifo" opts
-    // out of TCP; any other value falls back to FIFO.
-    const useTcp = args.transport === "fifo" ? false : args.transport === "tcp";
+    const useTcp = shouldUseTcpTransport(effectivePlatform, testHooks.transport);
 
     let transportEnv: Record<string, string>;
     let doConnect: () => Promise<PbMessage>;
@@ -555,13 +618,34 @@ export class PureBasicDebugSession extends DebugSession {
 
     if (useTcp) {
       // PureBasic's TCP handshake requires the compiler's own numeric
-      // version (PLAN.md M10.1) -- parsed from the version banner every
-      // compiler invocation already prints as its first stdout line, so no
-      // extra invocation is needed. Never guess a version: a wrong one
-      // produces a confusing target-side ERROR ... WrongVersion instead of
-      // this clear, adapter-side explanation.
-      const version = parseCompilerVersionBanner(compileResult.stdout);
+      // version (PLAN.md M10.1). A normal compile's own stdout carries the
+      // version banner as its first line on Linux, but a real Windows
+      // PureBasic install (confirmed under Wine) prints nothing at all on a
+      // normal build, -q or not -- so a dedicated -v probe is the only
+      // cross-platform-reliable source; it exits non-zero (confirmed on
+      // both platforms) but still prints the banner to stdout. Never guess
+      // a version: a wrong one produces a confusing target-side
+      // ERROR ... WrongVersion instead of this clear, adapter-side
+      // explanation. Tracked in this.compileChild (same as the main compile
+      // above) so disconnectRequest can kill it if the user stops the
+      // session while this is in flight; a short dedicated timeout since a
+      // -v probe should return almost instantly, not the full build budget;
+      // and the same workDir cwd as the main compile so a C-backend probe's
+      // own stray "purebasic.c" (if it emits one) is cleaned up the same way.
+      const versionInvocation = wrapForExeRunner(testHooks.exeRunner, compiler, ["-v"]);
+      const { child: versionChild, result: versionResult } = compileAsync(
+        versionInvocation.command,
+        versionInvocation.args,
+        VERSION_PROBE_TIMEOUT_MS,
+        this.workDir,
+      );
+      this.compileChild = versionChild;
+      const versionOutput = await versionResult;
+      this.compileChild = undefined;
+      const version = parseCompilerVersionBanner(versionOutput.stdout);
       if (version === undefined) {
+        this.sendEvent(new OutputEvent(versionOutput.stdout, "stdout"));
+        this.sendEvent(new OutputEvent(versionOutput.stderr, "stderr"));
         this.sendErrorResponse(
           response,
           1007,
@@ -590,14 +674,19 @@ export class PureBasicDebugSession extends DebugSession {
       fifoPaths = { outFifo, inFifo };
     }
 
-    this.child = cp.spawn(outBinary, args.args ?? [], {
-      cwd: args.cwd ?? path.dirname(args.program),
-      env: {
-        ...process.env,
-        ...args.env,
-        ...transportEnv,
+    const targetInvocation = wrapForExeRunner(testHooks.exeRunner, outBinary, args.args ?? []);
+    this.child = cp.spawn(
+      targetInvocation.command,
+      targetInvocation.args,
+      {
+        cwd: args.cwd ?? path.dirname(args.program),
+        env: {
+          ...process.env,
+          ...args.env,
+          ...transportEnv,
+        },
       },
-    });
+    );
     // Node never throws synchronously for a bad cwd, missing executable, or
     // permission failure here -- spawn() reports those asynchronously via
     // this 'error' event instead. An EventEmitter with no 'error' listener

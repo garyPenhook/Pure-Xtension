@@ -28,6 +28,13 @@ import { gdbEngineAvailableSync } from "../src/debug/ptraceEngine";
 const MAIN_THREAD_ID = 1;
 const ADAPTER = path.join(__dirname, "..", "adapter.cjs");
 
+// The adapter only honors transport/exeRunner/compilerPath (test-only launch
+// args) when this is set -- closes a real gap where a workspace's own
+// launch.json could otherwise reach them (see testOnlyLaunchHooks() in
+// pbDebugAdapter.ts). Set here, in the test *process*, so every adapter
+// child DebugClient spawns below inherits it.
+process.env.PURE_XTENSION_E2E_TEST_HOOKS = "1";
+
 /** Mirrors config.ts's env/PATH compiler resolution enough to decide whether the live target is even runnable here. */
 function findPbCompiler(binary: "pbcompiler" | "pbcompilerc"): string | undefined {
   const home = process.env.PUREBASIC_HOME;
@@ -312,14 +319,18 @@ test("module-scope stop: synthesizes a main frame, reads module locals, and step
 });
 
 test("TCP transport: the same breakpoint/locals/continue flow reproduces over NetworkServer", { skip }, async () => {
-  // There's no Windows machine available to verify the win32-only automatic
-  // selection actually works there -- this instead proves the thing that
-  // IS verifiable here: the identical wire protocol, driven through the
-  // real TCP handshake and PB_DEBUGGER_Communication=NetworkServer;<port>
-  // (PLAN.md M10), reproduces genuine breakpoint/locals/continue behavior
-  // on this Linux machine. It's a deliberately small subset of the FIFO
-  // test matrix above, not a full duplicate -- pbSession.test.ts already
-  // covers the handshake/framing edge cases in isolation.
+  // Proves the identical wire protocol, driven through the real TCP
+  // handshake and PB_DEBUGGER_Communication=NetworkServer;<port> (PLAN.md
+  // M10), reproduces genuine breakpoint/locals/continue behavior on this
+  // Linux machine, against the real Linux compiler. It's a deliberately
+  // small subset of the FIFO test matrix above, not a full duplicate --
+  // pbSession.test.ts already covers the handshake/framing edge cases in
+  // isolation. There's still no real Windows machine here to validate
+  // win32's automatic transport selection or process-termination semantics
+  // -- see pbDebugAdapterWindows.e2e.test.ts, which validates the same
+  // wire protocol against a genuine Windows PureBasic install under Wine
+  // (compile, breakpoint, locals, continue, terminate), the closest
+  // approximation available without one.
   const dc = await launchToBreakpoint(MODULE_BP, "tcp");
   try {
     const st = await frames(dc);
@@ -385,6 +396,47 @@ test("launch surfaces a spawn failure (nonexistent cwd) as a clean DAP error, no
     await dc.threadsRequest();
   } finally {
     await dc.stop();
+  }
+});
+
+test("transport/exeRunner/compilerPath launch args are silently ignored unless the test-only env gate is set", { skip }, async () => {
+  // These three exist purely for this repo's own e2e harness (see
+  // testOnlyLaunchHooks() in pbDebugAdapter.ts) -- but nothing strips
+  // unknown properties from a workspace's launch.json before it reaches the
+  // adapter, so without this gate they'd be reachable from a real (if
+  // undocumented) launch config once a workspace is trusted. Proves the
+  // gate actually holds: a launch carrying an exeRunner that would
+  // guaranteed-fail if honored (a nonexistent command) must still succeed
+  // normally with the env gate unset, exactly as if exeRunner had never
+  // been provided at all.
+  const originalGate = process.env.PURE_XTENSION_E2E_TEST_HOOKS;
+  delete process.env.PURE_XTENSION_E2E_TEST_HOOKS;
+  const dc = new DebugClient("node", ADAPTER, "purebasic");
+  dc.defaultTimeout = 30000;
+  await dc.start();
+  try {
+    await Promise.all([
+      dc.waitForEvent("initialized").then(() =>
+        dc
+          .setBreakpointsRequest({ source: { path: program }, breakpoints: [{ line: MODULE_BP }], lines: [MODULE_BP] })
+          .then(() => dc.configurationDoneRequest()),
+      ),
+      dc.launch({
+        program,
+        backend: "asm",
+        stopOnEntry: false,
+        // If honored, this would make every spawn in launchRequest fail
+        // immediately; if ignored (the required behavior), the launch
+        // proceeds as a completely normal FIFO launch.
+        exeRunner: "/definitely/not/a/real/executable-xyz-12345",
+      }),
+      dc.assertStoppedLocation("breakpoint", { path: program, line: MODULE_BP }),
+    ]);
+    await Promise.all([dc.continueRequest({ threadId: MAIN_THREAD_ID }), dc.waitForEvent("terminated")]);
+  } finally {
+    await dc.stop();
+    if (originalGate === undefined) delete process.env.PURE_XTENSION_E2E_TEST_HOOKS;
+    else process.env.PURE_XTENSION_E2E_TEST_HOOKS = originalGate;
   }
 });
 

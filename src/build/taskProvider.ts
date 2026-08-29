@@ -3,6 +3,7 @@ import * as os from "os";
 import * as path from "path";
 import * as vscode from "vscode";
 import { Backend, resolveBackend, resolveBackendSilent, resolveCompilerPath } from "../config";
+import { debugCompileFlags } from "../debug/pbSession";
 import { PROBLEM_MATCHER_INCLUDE_NAME, PROBLEM_MATCHER_NAME } from "./problemMatcher";
 
 export const TASK_TYPE = "purebasic";
@@ -41,7 +42,13 @@ const TASK_SPECS: TaskSpec[] = [
   { mode: "build", label: "Build", extraArgs: [], runAfter: false },
   { mode: "buildRun", label: "Build and Run", extraArgs: [], runAfter: true },
   { mode: "check", label: "Syntax Check", extraArgs: ["-k"], runAfter: false },
-  { mode: "buildDebug", label: "Build (debug)", extraArgs: ["-d", "-ds", "-l"], runAfter: false },
+  // -ds (--debugsymbols) is a valid cross-platform flag on Linux but is
+  // rejected outright by the Windows compiler ("-ds: Unknown switch",
+  // confirmed against a real Windows PureBasic 6.41 install) -- passing it
+  // there fails the whole compile, not just a warning. debugCompileFlags()
+  // (src/debug/pbSession.ts) is the single source of truth for this, shared
+  // with the debug adapter's own launch-time compile.
+  { mode: "buildDebug", label: "Build (debug)", extraArgs: debugCompileFlags(os.platform()), runAfter: false },
   { mode: "buildConsole", label: "Build (console)", extraArgs: ["-cl"], runAfter: false },
 ];
 

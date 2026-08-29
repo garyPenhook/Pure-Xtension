@@ -978,6 +978,47 @@ export function shouldRefuseUnvalidatedPlatformLaunch(platform: string, transpor
   return platform !== "linux" && transport === undefined;
 }
 
+/**
+ * -ds (--debugsymbols) is a valid cross-platform flag on Linux but is
+ * rejected outright by the Windows compiler ("-ds: Unknown switch",
+ * confirmed against a real Windows PureBasic 6.41 install under Wine) --
+ * it fails the whole compile there, not just a warning. It's orthogonal to
+ * the wire debugger protocol itself (-d alone enables that): a debug build
+ * compiled without it still connects, breaks, and steps identically,
+ * confirmed live over the same TCP transport Windows launches use.
+ */
+export function debugCompileFlags(platform: string): string[] {
+  return platform === "linux" ? ["-d", "-ds", "-l"] : ["-d", "-l"];
+}
+
+/**
+ * Real (non-test-override) launches select FIFO on POSIX platforms (where
+ * `mkfifo` exists) and TCP on Windows, which has no FIFO equivalent this
+ * codebase uses. An explicit `transport` remains an internal/test-only
+ * override so protocol tests can exercise the non-native transport on
+ * Linux (see pbDebugAdapter.e2e.test.ts's "TCP transport" case) -- this
+ * pure function keeps the choice unit-testable the same way
+ * shouldRefuseUnvalidatedPlatformLaunch() is.
+ */
+export function shouldUseTcpTransport(platform: string, transport?: "fifo" | "tcp"): boolean {
+  return transport ? transport === "tcp" : platform === "win32";
+}
+
+/**
+ * Converts a Linux absolute path to the Windows-style path Wine's own `Z:`
+ * drive mapping exposes it as (e.g. `/home/gary/x.pb` ->
+ * `Z:\home\gary\x.pb`) -- test-only, for compiler command-line arguments
+ * (`-o <output>`, `<source file>`) specifically, since those are parsed by
+ * the Windows PE compiler process itself and must be paths it understands.
+ * Nothing else in the adapter needs this: the exeRunner-wrapped spawn calls
+ * themselves already accept a plain Linux path (Wine resolves it), and
+ * every other path the adapter tracks (source identity, breakpoints,
+ * frames) stays a normal Linux path used only on the Node.js host side.
+ */
+export function toWinePath(linuxPath: string): string {
+  return `Z:${linuxPath.replace(/\//g, "\\")}`;
+}
+
 /** Parses PureBasic's own compiler-stdout version banner (its first printed
  *  line on every invocation, e.g. `"PureBasic 6.41 (Linux - x64)"`, already
  *  captured by pbDebugAdapter.ts's launchRequest but unused on success)
