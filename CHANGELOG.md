@@ -1,5 +1,26 @@
 # Changelog
 
+## 0.1.16
+
+- Fixed: `-ds` (debug symbols) is a valid cross-platform compiler flag on
+  Linux but is rejected outright on Windows ("-ds: Unknown switch") --
+  would have failed every debug-build compile there. Now Linux-only,
+  shared between the debug launch and the "Build (debug)" task via one
+  function instead of two duplicated copies.
+- Fixed: a normal compile's stdout carries the version banner PureBasic's
+  TCP handshake needs on Linux, but a real Windows install prints nothing
+  at all on a normal build -- the handshake would never have worked
+  there. Version detection is now a dedicated `-v` probe on every
+  platform, tracked for disconnect cleanup, cwd-matched to the main
+  compile, given a short dedicated timeout, and surfacing its own
+  stdout/stderr on failure.
+- Debug launches now auto-select TCP transport on win32 (mkfifo has no
+  Windows equivalent) instead of always defaulting to FIFO.
+- Added a Wine-hosted end-to-end test that compiles and runs the real
+  Windows adapter/target binaries against a genuine Windows PureBasic
+  install, exercising breakpoints, locals, evaluate, and native stepping
+  through the production code path.
+
 ## 0.1.15
 
 - Fixed: a debug session that ran to completion on its own (without the user
