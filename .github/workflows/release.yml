@@ -14,7 +14,7 @@ jobs:
     # and TCP debugger coverage cannot self-skip.
     runs-on: [self-hosted, linux, purebasic-6.41]
     env:
-      PUREBASIC_HOME: /opt/purebasic-6.41
+      PUREBASIC_HOME: /home/gary/Apps/purebasic-v6.41
       VSCODE_EXECUTABLE_PATH: /usr/share/code-insiders/code-insiders
     steps:
       - uses: actions/checkout@v4
