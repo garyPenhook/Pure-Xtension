@@ -1,10 +1,17 @@
 import assert from "node:assert/strict";
-import { chmod, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { loadOrBuildBuiltinIndex } from "../server/src/builtinIndex";
 import { loadOrFetchHelpIndex } from "../server/src/onlineHelpIndex";
+
+/** A page with `n` valid command links, shaped like the real commandindex.html. */
+function pageWithCommands(n: number): string {
+  let html = "<html><body>";
+  for (let i = 0; i < n; i++) html += `<a href=../test/cmd${i}.html>Cmd${i}</a>`;
+  return html + "</body></html>";
+}
 
 test("forced symbol rebuild bypasses a valid same-version disk cache", async () => {
   const dir = await mkdtemp(path.join(tmpdir(), "pure-xtension-cache-test-"));
@@ -48,7 +55,9 @@ test("forced help refresh bypasses a fresh disk cache", async () => {
   const originalFetch = globalThis.fetch;
   let command = "First";
   globalThis.fetch = async () =>
-    new Response(`<a href=../test/${command.toLowerCase()}.html>${command}</a>`, { status: 200 });
+    new Response(`<a href=../test/${command.toLowerCase()}.html>${command}</a>${pageWithCommands(600)}`, {
+      status: 200,
+    });
 
   try {
     const first = await loadOrFetchHelpIndex(dir);
@@ -61,6 +70,76 @@ test("forced help refresh bypasses a fresh disk cache", async () => {
     const refreshed = await loadOrFetchHelpIndex(dir, true);
     assert.equal(refreshed?.commands.second?.name, "Second");
   } finally {
+    globalThis.fetch = originalFetch;
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("a page-layout change that parses too few commands keeps serving the last known-good cache", async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), "pure-xtension-help-layout-test-"));
+  const originalFetch = globalThis.fetch;
+
+  try {
+    globalThis.fetch = async () => new Response(pageWithCommands(600), { status: 200 });
+    const good = await loadOrFetchHelpIndex(dir);
+    assert.equal(Object.keys(good?.commands ?? {}).length, 600);
+
+    // Simulate the live page's markup changing so LINK_RE stops matching
+    // almost everything, instead of the command reference actually shrinking.
+    globalThis.fetch = async () => new Response(pageWithCommands(3), { status: 200 });
+    const stillGood = await loadOrFetchHelpIndex(dir, true);
+    assert.equal(Object.keys(stillGood?.commands ?? {}).length, 600, "must not adopt the truncated parse");
+
+    const onDisk = JSON.parse(await readFile(path.join(dir, "help-index-v2.json"), "utf8"));
+    assert.equal(Object.keys(onDisk.commands).length, 600, "must not persist the truncated parse either");
+  } finally {
+    globalThis.fetch = originalFetch;
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("an empty parse is rejected and does not overwrite or get cached as a good index", async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), "pure-xtension-help-empty-test-"));
+  const originalFetch = globalThis.fetch;
+
+  try {
+    globalThis.fetch = async () => new Response("<html><body>no commands here</body></html>", { status: 200 });
+    const result = await loadOrFetchHelpIndex(dir);
+    assert.equal(result, undefined, "an empty parse with no prior cache must not be treated as a good index");
+
+    const entries = await readdir(dir).catch(() => []);
+    assert.equal(entries.length, 0, "an empty/invalid parse must not be written to disk");
+  } finally {
+    globalThis.fetch = originalFetch;
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("a cache write that fails partway through leaves the previous good cache file intact", async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), "pure-xtension-help-write-test-"));
+  const originalFetch = globalThis.fetch;
+
+  try {
+    globalThis.fetch = async () => new Response(pageWithCommands(600), { status: 200 });
+    const good = await loadOrFetchHelpIndex(dir);
+    assert.equal(Object.keys(good?.commands ?? {}).length, 600);
+    const beforeBytes = await readFile(path.join(dir, "help-index-v2.json"), "utf8");
+
+    // Make the cache directory unwritable so the atomic tmp-file write fails
+    // partway through, simulating an interrupted/failed write.
+    await chmod(dir, 0o500);
+    globalThis.fetch = async () => new Response(pageWithCommands(700), { status: 200 });
+    const fallback = await loadOrFetchHelpIndex(dir, true);
+    assert.equal(Object.keys(fallback?.commands ?? {}).length, 600, "must fall back to the last good cache");
+
+    await chmod(dir, 0o700);
+    const afterBytes = await readFile(path.join(dir, "help-index-v2.json"), "utf8");
+    assert.equal(afterBytes, beforeBytes, "the on-disk cache must be untouched by the failed write");
+
+    const leftovers = (await readdir(dir)).filter((f) => f.endsWith(".tmp"));
+    assert.deepEqual(leftovers, [], "no partial tmp file should remain");
+  } finally {
+    await chmod(dir, 0o700).catch(() => {});
     globalThis.fetch = originalFetch;
     await rm(dir, { recursive: true, force: true });
   }

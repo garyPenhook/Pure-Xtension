@@ -1,4 +1,5 @@
-import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { randomUUID } from "node:crypto";
+import { mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 
 export interface HelpEntry {
@@ -19,6 +20,10 @@ const DOC_BASE = "https://www.purebasic.com/documentation/";
 // `<a href=../lib/name.html>Name</a>` link, no exceptions found in the 1888 entries.
 const LINK_RE = /<a href=(\.\.\/[a-z0-9_]+\/[a-z0-9_]+\.html)>([^<]+)<\/a>/gi;
 const CACHE_TTL_MS = 30 * 24 * 60 * 60 * 1000;
+// The live page currently has ~1888 entries (see LINK_RE's comment). A count
+// far below that means the page layout changed and LINK_RE stopped matching,
+// not that PureBasic actually shipped a much smaller command reference.
+const MIN_PLAUSIBLE_COMMANDS = 500;
 
 // Bump this filename whenever HelpIndex's on-disk shape changes, so a stale
 // cache from an older schema (e.g. `commands` used to map name -> url string,
@@ -36,15 +41,36 @@ export async function fetchHelpIndex(): Promise<HelpIndex> {
     const [, href, name] = match;
     commands[name.toLowerCase()] = { name, url: DOC_BASE + href.replace(/^\.\.\//, "") };
   }
+  const count = Object.keys(commands).length;
+  if (count < MIN_PLAUSIBLE_COMMANDS) {
+    throw new Error(
+      `commandindex.html parsed only ${count} command(s); the page layout may have changed`,
+    );
+  }
   return { fetchedAt: Date.now(), commands };
+}
+
+async function writeCacheAtomic(cacheDir: string, index: HelpIndex): Promise<void> {
+  await mkdir(cacheDir, { recursive: true });
+  const target = cacheFile(cacheDir);
+  const tmp = `${target}.${randomUUID()}.tmp`;
+  try {
+    await writeFile(tmp, JSON.stringify(index), "utf8");
+    await rename(tmp, target);
+  } catch (err) {
+    await rm(tmp, { force: true });
+    throw err;
+  }
 }
 
 async function readCache(cacheDir: string): Promise<HelpIndex | undefined> {
   try {
     const parsed = JSON.parse(await readFile(cacheFile(cacheDir), "utf8")) as Partial<HelpIndex>;
-    // Valid JSON but a missing/malformed `commands` (e.g. `{}`) shouldn't be
-    // treated as a real index — getHelpUrl would throw indexing into it.
+    // Valid JSON but a missing/malformed/implausibly-small `commands` shouldn't
+    // be treated as a real index — getHelpUrl would throw indexing into it, or
+    // silently serve a near-empty index for up to CACHE_TTL_MS.
     if (!parsed || typeof parsed.commands !== "object" || parsed.commands === null) return undefined;
+    if (Object.keys(parsed.commands).length < MIN_PLAUSIBLE_COMMANDS) return undefined;
     return parsed as HelpIndex;
   } catch {
     return undefined;
@@ -62,8 +88,7 @@ export async function loadOrFetchHelpIndex(
 
   try {
     const fresh = await fetchHelpIndex();
-    await mkdir(cacheDir, { recursive: true });
-    await writeFile(cacheFile(cacheDir), JSON.stringify(fresh), "utf8");
+    await writeCacheAtomic(cacheDir, fresh);
     return fresh;
   } catch {
     return cached;
