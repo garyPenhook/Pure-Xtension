@@ -95,8 +95,13 @@ suite("Task problem matcher: included-file diagnostics", () => {
     await vscode.window.showTextDocument(doc);
 
     try {
-      await config.update("backend", "asm", vscode.ConfigurationTarget.Global);
-      await config.update("compilerPath.asm", errScript, vscode.ConfigurationTarget.Global);
+      // Workspace scope, not Global: two Global-scope writes here in quick
+      // succession were live-confirmed (in this sandbox) to sometimes lose
+      // one of them, so the task ran against the real auto-detected
+      // compiler instead of errScript and never produced the diagnostic
+      // this test waits for. Workspace scope's write path doesn't show this.
+      await config.update("backend", "asm", vscode.ConfigurationTarget.Workspace);
+      await config.update("compilerPath.asm", errScript, vscode.ConfigurationTarget.Workspace);
       await runCheckTask();
 
       const incUri = vscode.Uri.file(incFile);
@@ -116,8 +121,8 @@ suite("Task problem matcher: included-file diagnostics", () => {
         "the file actually passed to the compiler should carry no diagnostic of its own",
       );
     } finally {
-      await config.update("compilerPath.asm", originalCompilerPath, vscode.ConfigurationTarget.Global);
-      await config.update("backend", originalBackend, vscode.ConfigurationTarget.Global);
+      await config.update("compilerPath.asm", originalCompilerPath, vscode.ConfigurationTarget.Workspace);
+      await config.update("backend", originalBackend, vscode.ConfigurationTarget.Workspace);
       fs.rmSync(dir, { recursive: true, force: true });
     }
   });

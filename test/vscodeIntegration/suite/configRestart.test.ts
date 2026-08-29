@@ -95,11 +95,16 @@ suite("Configuration-change language client restart", () => {
       // should land while the restart triggered by the first is still
       // in-flight (the language server is a real spawned process, so
       // startLanguageClient() takes long enough for this to race reliably).
-      await config.update("compilerPath.asm", fakeCompilerA, vscode.ConfigurationTarget.Global);
+      // Workspace scope, not Global: two rapid-succession Global-scope
+      // writes to the same key were live-confirmed (in this sandbox) to
+      // sometimes lose one of them -- the client fell back to its
+      // auto-detected real compiler, meaning the setting read back empty,
+      // not just slow. Workspace scope's write path doesn't show this.
+      await config.update("compilerPath.asm", fakeCompilerA, vscode.ConfigurationTarget.Workspace);
       const secondUpdate = config.update(
         "compilerPath.asm",
         fakeCompilerB,
-        vscode.ConfigurationTarget.Global,
+        vscode.ConfigurationTarget.Workspace,
       );
 
       await secondUpdate;
@@ -113,7 +118,7 @@ suite("Configuration-change language client restart", () => {
           `saw ${String(exports.getLastCompilerPath())}`,
       );
     } finally {
-      await config.update("compilerPath.asm", original, vscode.ConfigurationTarget.Global);
+      await config.update("compilerPath.asm", original, vscode.ConfigurationTarget.Workspace);
       fs.rmSync(dir, { recursive: true, force: true });
     }
   });
